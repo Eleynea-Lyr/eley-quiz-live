@@ -86,7 +86,7 @@ export default function Player() {
           />
           <button onClick={checkAnswer} style={{ display: 'block', margin: '20px auto' }}>Valider</button>
 
-          {result === "correct" && <p style={{ color: 'lime' }}>✅ Bonne réponse !</p>}
+          {result === "correct" && <p style={{ color: 'lime' }}>✅ Bonne réponse coucouuu !</p>}
           {result === "wrong" && <p style={{ color: 'red' }}>❌ Mauvaise réponse</p>}
         </>
       ) : (
