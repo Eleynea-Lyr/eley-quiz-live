@@ -64,7 +64,16 @@ export default function Player() {
       setResult(null);
       setAnswer('');
       setCurrentIndex(prev => (prev + 1 < questionsList.length ? prev + 1 : prev));
-    }, 3000);
+    }, 3000); // garde 3s comme dans ton code actuel
+  };
+
+  // ✅ Définir la fonction de soumission avant le return
+  const handleSubmit = (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    const trimmed = (answer ?? '').trim();
+    if (!trimmed) return;
+    // Appelle la logique existante
+    checkAnswer();
   };
 
   return (
@@ -77,16 +86,29 @@ export default function Player() {
             <img src={currentQuestion.imageUrl} alt="illustration" style={{ width: '80%', margin: '20px auto' }} />
           )}
 
-          <input
-            type="text"
-            value={answer}
-            onChange={(e) => setAnswer(e.target.value)}
-            placeholder="Votre réponse"
-            style={{ width: '80%', padding: '10px', marginTop: '20px' }}
-          />
-          <button onClick={checkAnswer} style={{ display: 'block', margin: '20px auto' }}>Valider</button>
+          {/* 👉 Entrée valide naturellement le formulaire */}
+          <form onSubmit={handleSubmit}>
+            <input
+              type="text"
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value)}
+              placeholder="Votre réponse"
+              style={{ width: '80%', padding: '10px', marginTop: '20px' }}
+              autoFocus
+              inputMode="text"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+            />
 
-          {result === "correct" && <p style={{ color: 'lime' }}>✅ Bonne réponse coucouuu !</p>}
+            {/*
+            <button type="submit" onClick={handleSubmit} style={{ display: 'block', margin: '20px auto' }}>
+              Valider
+            </button>
+            */}
+          </form>
+
+          {result === "correct" && <p style={{ color: 'lime' }}>✅ Bonne réponse !</p>}
           {result === "wrong" && <p style={{ color: 'red' }}>❌ Mauvaise réponse</p>}
         </>
       ) : (
