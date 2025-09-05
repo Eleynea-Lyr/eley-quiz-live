@@ -1,8 +1,23 @@
 // /pages/player.js
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { db } from '../lib/firebase';
 import { collection, getDocs, orderBy, query, doc, onSnapshot } from 'firebase/firestore';
 
+// --- Anti-spam mauvaises réponses ---
+const RATE_LIMIT_ENABLED = true;     // ← passe à false pour désactiver facilement
+const MAX_WRONG_ATTEMPTS = 5;        // nb de tentatives avant blocage
+const RATE_LIMIT_WINDOW_MS = 15_000; // fenêtre glissante: 15 s (mets 30_000 pour 30 s)
+const COOLDOWN_MS = 10_000;          // durée du blocage en ms (10 s)
+
+
+// Phrases affichées pendant le blocage (anti-spam)
+const LOCK_PHRASES = [
+  "Eh, arrête de spammer ! Ecoute et réfléchis plutôt !",
+  "Le spam c'est mal, m'voyez !",
+  "Tu penses vraiment y arriver de cette façon ?",
+  "Tu veux faire exploser l'appli ou quoi ?",
+  "Calme toi, tout doux..."
+];
 
 function normalize(str) {
   return str
@@ -41,6 +56,33 @@ function getTimeSec(q) {
   return Infinity; // pas de timecode -> tout à la fin
 }
 
+// --- Phrases de révélation (fallback) ---
+const DEFAULT_REVEAL_PHRASES = [
+  "La réponse était :",
+  "Il fallait trouver :",
+  "C'était :",
+  "La bonne réponse :",
+  "Réponse :"
+];
+
+// Sélection déterministe (même phrase sur Player & Screen pour une question donnée)
+function pickRevealPhrase(q) {
+  const custom = Array.isArray(q?.revealPhrases)
+    ? q.revealPhrases.filter(p => typeof p === 'string' && p.trim() !== '')
+    : [];
+  const pool = custom.length ? custom : DEFAULT_REVEAL_PHRASES;
+  if (!pool.length) return "Réponse :";
+
+  const seedStr = String(q?.id || '');
+  let hash = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
+  }
+  const idx = hash % pool.length;
+  return pool[idx];
+}
+
+
 function formatHMS(sec) {
   if (!Number.isFinite(sec) || sec < 0) return "00:00:00";
   const h = Math.floor(sec / 3600);
@@ -53,12 +95,19 @@ function formatHMS(sec) {
 export default function Player() {
   const [questionsList, setQuestionsList] = useState([]);
   const [answer, setAnswer] = useState('');
+  const answerInputRef = useRef(null);
+  const [wrongTimes, setWrongTimes] = useState([]); // array de timestamps (ms)
+  const [cooldownUntilMs, setCooldownUntilMs] = useState(null);
+  // petit tick pour rafraîchir l'affichage du compte à rebours
+  const [cooldownTick, setCooldownTick] = useState(0);
+  const [lockPhraseIndex, setLockPhraseIndex] = useState(null);
   const [result, setResult] = useState(null);
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
+
 
 
   useEffect(() => {
@@ -154,10 +203,52 @@ export default function Player() {
 
   // reset champ et feedback quand la question active change
   const currentQuestionId = currentQuestion?.id ?? null;
+  const revealPhrase = useMemo(() => {
+    return currentQuestion ? pickRevealPhrase(currentQuestion) : "";
+  }, [currentQuestionId]);
+
+  const primaryAnswer = useMemo(() => {
+    const a = currentQuestion?.answers;
+    return Array.isArray(a) && a.length ? String(a[0]) : "";
+  }, [currentQuestionId]);
+
+  // --- Révélation = les 20s AVANT la prochaine question planifiée ---
+  const REVEAL_DURATION_SEC = 20;
+  const secondsToNext = (nextTimeSec != null) ? (nextTimeSec - elapsedSec) : null;
+
+  const isRevealing = Boolean(
+    currentQuestion &&
+    nextTimeSec != null &&
+    secondsToNext > 0 &&
+    secondsToNext <= REVEAL_DURATION_SEC
+  );
+
+
+
+
   useEffect(() => {
     setResult(null);
     setAnswer('');
+    setWrongTimes([]);
+    setCooldownUntilMs(null);
+    setLockPhraseIndex(null);
   }, [currentQuestionId]);
+
+
+  // Blocage temporaire après trop de mauvaises réponses
+  const nowMs = Date.now();
+  const isLocked = RATE_LIMIT_ENABLED && cooldownUntilMs != null && nowMs < cooldownUntilMs;
+  const lockRemainingSec = isLocked ? Math.max(0, Math.ceil((cooldownUntilMs - nowMs) / 1000)) : 0;
+  const lockText = (lockPhraseIndex != null && LOCK_PHRASES[lockPhraseIndex])
+    ? LOCK_PHRASES[lockPhraseIndex]
+    : "Eh, arrête de spammer ! Ecoute et réfléchis plutôt !";
+
+
+  // On interdit la saisie pendant la révélation et pendant le blocage
+  const answersOpen = Boolean(currentQuestion && !isRevealing && !isLocked);
+
+  // On masque complètement l'input si la réponse est correcte
+  const showInput = Boolean(answersOpen && result !== "correct");
 
 
   const checkAnswer = () => {
@@ -167,24 +258,66 @@ export default function Player() {
     const accepted = currentQuestion.answers.map(normalize);
 
     const isCorrect = accepted.some(acc => acc === userInput || isCloseEnough(userInput, acc));
-    setResult(isCorrect ? "correct" : "wrong");
 
-    setTimeout(() => {
-      setResult(null);
-      setAnswer('');
-      // L’enchaînement est maintenant piloté par le timecode (elapsedSec).
-    }, 3000);
+    if (isCorrect) {
+      setResult("correct");
+      setAnswer("");
+    } else {
+      setResult("wrong");
+      setAnswer("");
 
+      // incrémente le compteur et déclenche le blocage si seuil atteint
+      setWrongTimes(prev => {
+        const now = Date.now();
+        // ne garder que les tentatives dans la fenêtre (15s par défaut)
+        const pruned = prev.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+        const nextArr = [...pruned, now];
+
+        if (RATE_LIMIT_ENABLED && nextArr.length >= MAX_WRONG_ATTEMPTS && !isLocked) {
+          setCooldownUntilMs(now + COOLDOWN_MS);
+          setLockPhraseIndex(() => Math.floor(Math.random() * LOCK_PHRASES.length));
+          return []; // reset après blocage
+        }
+        return nextArr;
+      });
+
+      // refocus + animation visuelle
+      setTimeout(() => {
+        const el = answerInputRef.current;
+        if (el) {
+          el.focus();
+          el.classList.remove('shake');
+          el.classList.remove('flashWrong');
+          void el.offsetWidth;
+          el.classList.add('shake');
+          el.classList.add('flashWrong');
+        }
+      }, 0);
+
+      setTimeout(() => setResult(null), 400);
+    }
   };
 
   // ✅ Définir la fonction de soumission avant le return
   const handleSubmit = (e) => {
     if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (isLocked) return; // bloqué temporairement
     const trimmed = (answer ?? '').trim();
     if (!trimmed) return;
-    // Appelle la logique existante
     checkAnswer();
   };
+
+
+  const PLAYER_IMG_MAX = 220; // px
+
+  // --- Préchargement de l'image pour éviter le lag au moment d'afficher ---
+  useEffect(() => {
+    if (currentQuestion?.imageUrl) {
+      const img = new Image();
+      img.src = currentQuestion.imageUrl;
+    }
+  }, [currentQuestion?.imageUrl]);
+
 
   return (
     <div style={{ background: '#0a0a1a', color: 'white', padding: '20px', height: '100vh', textAlign: 'center', position: 'relative' }}>
@@ -204,13 +337,21 @@ export default function Player() {
 
       {currentQuestion ? (
         <>
-          <h2 style={{ fontSize: '1.5rem' }}>{currentQuestion.text}</h2>
+          {!isRevealing ? (
+            <h2 style={{ fontSize: '1.5rem' }}>{currentQuestion.text}</h2>
+          ) : (
+            <div style={{ marginTop: 8, marginBottom: 4 }}>
+              <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>{revealPhrase}</div>
+              <h2 style={{ fontSize: '1.6rem', margin: 0 }}>{primaryAnswer}</h2>
+            </div>
+          )}
 
-          {currentQuestion.imageUrl && (
+          {isRevealing && currentQuestion?.imageUrl ? (
             <div
               style={{
-                width: 100,
-                height: 100,
+                width: PLAYER_IMG_MAX,
+                height: PLAYER_IMG_MAX,
+                maxWidth: '100%',
                 margin: '16px auto',
                 display: 'flex',
                 alignItems: 'center',
@@ -222,29 +363,39 @@ export default function Player() {
             >
               <img
                 src={currentQuestion.imageUrl}
-                alt="illustration"
+                alt="Réponse visuelle — œuvre"
                 style={{ width: '100%', height: '100%', objectFit: 'contain', imageRendering: 'auto' }}
                 loading="lazy"
                 decoding="async"
               />
             </div>
-          )}
+          ) : null}
+
 
           {/* 👉 Entrée valide naturellement le formulaire */}
           <form onSubmit={handleSubmit}>
-            <input
-              type="text"
-              value={answer}
-              onChange={(e) => setAnswer(e.target.value)}
-              placeholder="Votre réponse"
-              style={{ width: '80%', padding: '10px', marginTop: '20px' }}
-              autoFocus
-              inputMode="text"
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="none"
-            />
-
+            {showInput ? (
+              <input
+                ref={answerInputRef}
+                className="answerInput"
+                type="text"
+                value={answer}
+                onChange={(e) => setAnswer(e.target.value)}
+                placeholder="Votre réponse"
+                style={{ width: '80%', padding: '10px', marginTop: '20px' }}
+                autoFocus
+                inputMode="text"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+              />
+            ) : (
+              isLocked && !isRevealing ? (
+                <p style={{ color: '#f59e0b', fontWeight: 800, fontSize: '1.2rem', marginTop: 16 }}>
+                  {lockText} ({lockRemainingSec}s)
+                </p>
+              ) : null
+            )}
             {/*
             <button type="submit" onClick={handleSubmit} style={{ display: 'block', margin: '20px auto' }}>
               Valider
@@ -252,8 +403,12 @@ export default function Player() {
             */}
           </form>
 
-          {result === "correct" && <p style={{ color: 'lime' }}>✅ Bonne réponse !</p>}
-          {result === "wrong" && <p style={{ color: 'red' }}>❌ Mauvaise réponse</p>}
+          {result === "correct" && !isRevealing && (
+            <p style={{ color: 'lime', fontSize: '2.2rem', fontWeight: 800, marginTop: 20 }}>
+              Bonne réponse
+            </p>
+          )}
+          {/* message "mauvaise réponse" supprimé – on utilise le flash rouge de l'input */}
         </>
       ) : (
         <>
@@ -269,6 +424,50 @@ export default function Player() {
           )}
         </>
       )}
+      <style jsx>{`
+  .answerInput.shake {
+    animation: shake 250ms ease-in-out;
+  }
+  @keyframes shake {
+    0%   { transform: translateX(0); }
+    20%  { transform: translateX(-6px); }
+    40%  { transform: translateX(6px); }
+    60%  { transform: translateX(-4px); }
+    80%  { transform: translateX(4px); }
+    100% { transform: translateX(0); }
+  }
+
+  /* Rouge bien vif : overlay interne + liseré rouge, très court */
+  .answerInput.flashWrong {
+    animation: flashWrong 220ms ease-out;
+  }
+  @keyframes flashWrong {
+    /* Départ : rouge saturé très visible, même sur fond sombre */
+    0% {
+      box-shadow:
+        0 0 0 3px rgba(255, 0, 0, 0.95) inset,   /* liseré rouge interne épais */
+        0 0 0 9999px rgba(255, 0, 0, 0.28) inset,/* overlay rouge interne */
+        0 0 10px rgba(255, 0, 0, 0.85);          /* halo externe léger */
+      background-color: rgba(255, 0, 0, 0.35);   /* petit voile rouge */
+      border-color: rgba(255, 0, 0, 1);
+      color: inherit;
+    }
+    60% {
+      box-shadow:
+        0 0 0 2px rgba(255, 0, 0, 0.75) inset,
+        0 0 0 9999px rgba(255, 0, 0, 0.18) inset,
+        0 0 6px rgba(255, 0, 0, 0.6);
+      background-color: rgba(255, 0, 0, 0.18);
+    }
+    /* Fin : revient à l'état normal (pas de fill-mode) */
+    100% {
+      box-shadow: none;
+      background-color: inherit;
+      border-color: inherit;
+    }
+  }
+`}</style>
+
     </div>
   );
 }

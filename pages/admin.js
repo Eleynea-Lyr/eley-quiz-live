@@ -90,6 +90,33 @@ export default function Admin() {
     () => items.map(getTimeSec).filter((t) => Number.isFinite(t)).sort((a, b) => a - b),
     [items]
   );
+  const [revealPhrases, setRevealPhrases] = useState(["", "", "", "", ""]);
+
+  const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
+  const [editingQuestion, setEditingQuestion] = useState(null);
+
+  // (optionnel – juste utile pour placeholders côté UI création)
+  const DEFAULT_REVEAL_PHRASES = [
+    "La réponse était :",
+    "Il fallait trouver :",
+    "C'était :",
+    "La bonne réponse :",
+    "Réponse :"
+  ];
+
+  // Quand tu charges une question en édition :
+  useEffect(() => {
+    if (!editingQuestion) return;
+    const arr = Array.isArray(editingQuestion.revealPhrases) ? editingQuestion.revealPhrases : [];
+    setNewRevealPhrases([
+      arr[0] ?? "",
+      arr[1] ?? "",
+      arr[2] ?? "",
+      arr[3] ?? "",
+      arr[4] ?? "",
+    ]);
+  }, [editingQuestion]);
+
 
   const [newQ, setNewQ] = useState({
     text: "",
@@ -266,6 +293,11 @@ export default function Admin() {
       const hasAnswersCsv = typeof it.answersCsv === "string";
       const hasTimecodeStr = typeof it.timecodeStr === "string";
 
+      const cleanedRevealPhrases = revealPhrases
+        .map(s => (s ?? '').trim())
+        .filter(Boolean)       // on ne garde que les non vides
+        .slice(0, 5);          // max 5
+
       const payload = {
         text: it.text ?? "",
         answers: hasAnswersCsv
@@ -285,6 +317,7 @@ export default function Admin() {
           typeof it.order === "number"
             ? it.order
             : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
+        revealPhrases: cleanedRevealPhrases, // peut être [] → fallback côté client
       };
 
       await updateDoc(doc(db, "LesQuestions", it.id), payload);
@@ -349,6 +382,11 @@ export default function Admin() {
           ? Math.max(...items.map((x) => x.order || 0)) + 1000
           : 1000;
 
+      const cleanedRevealPhrases = (newRevealPhrases ?? [])
+        .map(s => (s ?? "").trim())
+        .filter(Boolean)
+        .slice(0, 5);
+
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
@@ -356,9 +394,11 @@ export default function Admin() {
         imageUrl,
         createdAt: new Date(),
         order,
+        revealPhrases: cleanedRevealPhrases, // peut être [] → fallback côté client
       });
 
       setNewQ({ text: "", answersCsv: "", timecodeStr: "", imageFile: null });
+      setNewRevealPhrases(["", "", "", "", ""]); // ← nettoie les 5 champs après création OK
     } catch (err) {
       console.error("createOne error:", err);
       alert("Échec de la création : " + (err?.message || err));
@@ -366,6 +406,7 @@ export default function Admin() {
       setCreating(false);
       await load();
     }
+    setNewRevealPhrases(["", "", "", "", ""]);
   };
 
   // ---------- QUIZ CONTROL ----------
@@ -855,54 +896,94 @@ export default function Admin() {
       >
         <h2 style={{ margin: 0 }}>Créer une nouvelle question</h2>
       </div>
-      <div style={{ display: "grid", gap: 8, maxWidth: 800, marginBottom: 16 }}>
-        <label>
-          Question
-          <textarea
-            rows={2}
-            value={newQ.text}
-            onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
-            style={{ width: "100%", boxSizing: "border-box" }}
-          />
-        </label>
 
-        <label>
-          Réponses acceptées (séparées par des virgules)
-          <input
-            type="text"
-            value={newQ.answersCsv}
-            onChange={(e) => setNewQ((p) => ({ ...p, answersCsv: e.target.value }))}
-            placeholder="ex: Mario, Super Mario"
-            style={{ width: "100%", boxSizing: "border-box" }}
-          />
-        </label>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 1fr) 360px",
+          gap: 16,
+          alignItems: "start",
+          maxWidth: 1100,
+          marginBottom: 16
+        }}
+      >
+        {/* Colonne gauche : formulaire existant */}
+        <div style={{ display: "grid", gap: 8 }}>
+          <label>
+            Question
+            <textarea
+              rows={2}
+              value={newQ.text}
+              onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
+              style={{ width: "100%", boxSizing: "border-box" }}
+            />
+          </label>
 
-        <label>
-          Timecode (hh:mm:ss)
-          <input
-            type="text"
-            value={newQ.timecodeStr}
-            onChange={(e) => setNewQ((p) => ({ ...p, timecodeStr: e.target.value }))}
-            placeholder="ex: 00:07:30"
-            style={{ width: "100%", boxSizing: "border-box" }}
-          />
-        </label>
+          <label>
+            Réponses acceptées (séparées par des virgules)
+            <input
+              type="text"
+              value={newQ.answersCsv}
+              onChange={(e) => setNewQ((p) => ({ ...p, answersCsv: e.target.value }))}
+              placeholder="ex: Mario, Super Mario"
+              style={{ width: "100%", boxSizing: "border-box" }}
+            />
+          </label>
 
-        <label>
-          Image (optionnelle)
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(e) => setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))}
-          />
-        </label>
+          <label>
+            Timecode (hh:mm:ss)
+            <input
+              type="text"
+              value={newQ.timecodeStr}
+              onChange={(e) => setNewQ((p) => ({ ...p, timecodeStr: e.target.value }))}
+              placeholder="ex: 00:07:30"
+              style={{ width: "100%", boxSizing: "border-box" }}
+            />
+          </label>
 
-        <div>
-          <button onClick={createOne} disabled={creating}>
-            {creating ? "Création…" : "Créer la question"}
-          </button>
+          <label>
+            Image (optionnelle)
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))}
+            />
+          </label>
+
+          <div>
+            <button onClick={createOne} disabled={creating}>
+              {creating ? "Création…" : "Créer la question"}
+            </button>
+          </div>
         </div>
+
+        {/* Colonne droite : phrases de révélation */}
+        <fieldset style={{ border: "1px solid #333", padding: 12, borderRadius: 8 }}>
+          <legend style={{ padding: "0 6px" }}>Phrase de réponse aléatoire (max 5)</legend>
+
+          {newRevealPhrases.map((val, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <label style={{ width: 120 }}>Phrase {i + 1}</label>
+              <input
+                type="text"
+                value={val}
+                onChange={(e) => {
+                  const next = [...newRevealPhrases];
+                  next[i] = e.target.value;
+                  setNewRevealPhrases(next);
+                }}
+                placeholder={DEFAULT_REVEAL_PHRASES[i] || "Ex: La réponse était :"}
+                style={{ flex: 1, padding: 8 }}
+              />
+            </div>
+          ))}
+
+          <div style={{ fontSize: 12, opacity: 0.7 }}>
+            Laisse vide pour utiliser la liste par défaut.
+          </div>
+        </fieldset>
       </div>
+
 
       {table}
     </div>

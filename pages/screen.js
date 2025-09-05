@@ -1,5 +1,5 @@
 // /pages/screen.js
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { db } from '../lib/firebase';
 import { collection, getDocs, orderBy, query, doc, onSnapshot } from 'firebase/firestore';
 
@@ -10,6 +10,34 @@ function getTimeSec(q) {
   if (typeof q.timecode === 'number') return Math.round(q.timecode * 60); // rétro-compat (minutes)
   return Infinity;
 }
+
+// --- Phrases de révélation (fallback) ---
+const DEFAULT_REVEAL_PHRASES = [
+  "La réponse était :",
+  "Il fallait trouver :",
+  "C'était :",
+  "La bonne réponse :",
+  "Réponse :"
+];
+
+// Sélection déterministe (même phrase sur Player & Screen pour une question donnée)
+function pickRevealPhrase(q) {
+  const custom = Array.isArray(q?.revealPhrases)
+    ? q.revealPhrases.filter(p => typeof p === 'string' && p.trim() !== '')
+    : [];
+  const pool = custom.length ? custom : DEFAULT_REVEAL_PHRASES;
+  if (!pool.length) return "Réponse :";
+
+  const seedStr = String(q?.id || '');
+  let hash = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
+  }
+  const idx = hash % pool.length;
+  return pool[idx];
+}
+
+
 function formatHMS(sec) {
   if (!Number.isFinite(sec) || sec < 0) return '00:00:00';
   const h = Math.floor(sec / 3600);
@@ -101,9 +129,49 @@ export default function Screen() {
   }
   const currentQuestion = activeIndex >= 0 ? sorted[activeIndex] : null;
 
+  const currentQuestionId = currentQuestion?.id ?? null;
+
+  const revealPhrase = useMemo(() => {
+    return currentQuestion ? pickRevealPhrase(currentQuestion) : "";
+  }, [currentQuestionId]);
+
+  const primaryAnswer = useMemo(() => {
+    const a = currentQuestion?.answers;
+    return Array.isArray(a) && a.length ? String(a[0]) : "";
+  }, [currentQuestionId]);
+
+
   // Infos pour les messages d’attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
+
+  // Prochaine question planifiée (après maintenant)
+  let nextTimeSec = null;
+  for (let i = 0; i < sorted.length; i++) {
+    const t = getTimeSec(sorted[i]);
+    if (Number.isFinite(t) && t > elapsedSec) { nextTimeSec = t; break; }
+  }
+
+  // --- Révélation = les 20s AVANT la prochaine question planifiée ---
+  const REVEAL_DURATION_SEC = 20;
+  const secondsToNext = (typeof nextTimeSec === 'number') ? (nextTimeSec - elapsedSec) : null;
+
+  const isRevealing = Boolean(
+    currentQuestion &&
+    typeof nextTimeSec === 'number' &&
+    secondsToNext > 0 &&
+    secondsToNext <= REVEAL_DURATION_SEC
+  );
+
+  const SCREEN_IMG_MAX = 300; // px
+
+  // --- Préchargement image ---
+  useEffect(() => {
+    if (currentQuestion?.imageUrl) {
+      const img = new Image();
+      img.src = currentQuestion.imageUrl;
+    }
+  }, [currentQuestion?.imageUrl]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'row', background: '#000814', color: 'white', minHeight: '100vh', position: 'relative' }}>
@@ -126,33 +194,41 @@ export default function Screen() {
         {currentQuestion ? (
           <>
             <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-              <h1 style={{ fontSize: '2rem', margin: 0 }}>{currentQuestion.text}</h1>
+              {!isRevealing ? (
+                <h1 style={{ fontSize: '2rem', margin: 0 }}>{currentQuestion.text}</h1>
+              ) : (
+                <div style={{ marginTop: 8, marginBottom: 4 }}>
+                  <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 8 }}>{revealPhrase}</div>
+                  <h1 style={{ fontSize: '2.2rem', margin: 0 }}>{primaryAnswer}</h1>
+                </div>
+              )}
             </div>
 
-            {currentQuestion.imageUrl && (
+            {isRevealing && currentQuestion?.imageUrl ? (
               <div
                 style={{
-                  width: 100,
-                  height: 100,
-                  marginTop: 20,
+                  width: SCREEN_IMG_MAX,
+                  height: SCREEN_IMG_MAX,
+                  maxWidth: '100%',
+                  margin: '16px auto',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   background: '#111',
                   borderRadius: 8,
-                  overflow: 'hidden',
-                  border: '1px solid #2a2a2a',
+                  overflow: 'hidden'
                 }}
               >
                 <img
                   src={currentQuestion.imageUrl}
-                  alt="illustration"
+                  alt="Révélation — œuvre"
                   style={{ width: '100%', height: '100%', objectFit: 'contain', imageRendering: 'auto' }}
                   loading="lazy"
                   decoding="async"
                 />
               </div>
-            )}
+            ) : null}
+
 
             <div style={{ marginTop: 12, opacity: 0.7, fontSize: 14 }}>
               Temps écoulé : {formatHMS(elapsedSec)}
