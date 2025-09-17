@@ -1,59 +1,59 @@
 // /pages/screen.js
-import { useState, useEffect, useMemo, useRef } from 'react';
-import { db } from '../lib/firebase';
-import { collection, getDocs, orderBy, query, doc, onSnapshot } from 'firebase/firestore';
+import { useEffect, useMemo, useRef, useState } from "react";
+import { db } from "../lib/firebase";
+import { collection, doc, getDocs, onSnapshot, orderBy, query } from "firebase/firestore";
 
-/* ============ Constantes & helpers ============ */
+/* ============================ CONSTANTES & HELPERS ============================ */
 const DEFAULT_REVEAL_PHRASES = [
   "La réponse était :",
   "Il fallait trouver :",
   "C'était :",
   "La bonne réponse :",
-  "Réponse :"
+  "Réponse :",
 ];
-
 
 const REVEAL_DURATION_SEC = 20; // 15s avec la réponse + 5s de décompte
 const COUNTDOWN_START_SEC = 5;
 
+// Barre de temps
 const BAR_H = 6;
-const BAR_BLUE = '#3b82f6';
-const BAR_RED = '#ef4444';
-const HANDLE_COLOR = '#f8fafc';
+const BAR_BLUE = "#3b82f6";
+const BAR_RED = "#ef4444";
+const HANDLE_COLOR = "#f8fafc";
 
 const SCREEN_IMG_MAX = 300; // px
 
 function getTimeSec(q) {
-  if (!q || typeof q !== 'object') return Infinity;
-  if (typeof q.timecodeSec === 'number') return q.timecodeSec;        // secondes
-  if (typeof q.timecode === 'number') return Math.round(q.timecode * 60); // minutes → s (legacy)
+  if (!q || typeof q !== "object") return Infinity;
+  if (typeof q.timecodeSec === "number") return q.timecodeSec;            // secondes
+  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes → s (legacy)
   return Infinity;
 }
 function formatHMS(sec) {
-  if (!Number.isFinite(sec) || sec < 0) return '00:00:00';
+  if (!Number.isFinite(sec) || sec < 0) return "00:00:00";
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   const s = Math.floor(sec % 60);
-  return [h, m, s].map(n => String(n).padStart(2, '0')).join(':');
+  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
 }
 function pickRevealPhrase(q) {
   const custom = Array.isArray(q?.revealPhrases)
-    ? q.revealPhrases.filter(p => typeof p === 'string' && p.trim() !== '')
+    ? q.revealPhrases.filter((p) => typeof p === "string" && p.trim() !== "")
     : [];
   const pool = custom.length ? custom : DEFAULT_REVEAL_PHRASES;
   if (!pool.length) return "Réponse :";
-  const seedStr = String(q?.id || '');
+  const seedStr = String(q?.id || "");
   let hash = 0;
   for (let i = 0; i < seedStr.length; i++) hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
   return pool[hash % pool.length];
 }
-// manches
+// Manches
 function roundIndexOfTime(t, offsets) {
   if (!Array.isArray(offsets)) return 0;
   let idx = -1;
   for (let i = 0; i < offsets.length; i++) {
     const v = offsets[i];
-    if (typeof v === 'number' && t >= v) idx = i;
+    if (typeof v === "number" && t >= v) idx = i;
   }
   return Math.max(0, idx);
 }
@@ -61,14 +61,14 @@ function nextRoundStartAfter(t, offsets) {
   if (!Array.isArray(offsets)) return null;
   for (let i = 0; i < offsets.length; i++) {
     const v = offsets[i];
-    if (typeof v === 'number' && v > t) return v;
+    if (typeof v === "number" && v > t) return v;
   }
   return null;
 }
 
-/* ============ Composant ============ */
+/* ================================== COMPOSANT ================================= */
 export default function Screen() {
-  // données / timing
+  // Données / timing
   const [questionsList, setQuestionsList] = useState([]);
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
@@ -77,11 +77,10 @@ export default function Screen() {
   const [pauseAtMs, setPauseAtMs] = useState(null);
   const ignoreCountdownUntilRef = useRef(0);
 
-
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
 
-  // intro & fin de manche (poussés par l’admin)
+  // Intro & fin de manche (poussés par l’admin)
   const [isIntro, setIsIntro] = useState(false);
   const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
   const [introRoundIndex, setIntroRoundIndex] = useState(null);
@@ -91,32 +90,35 @@ export default function Screen() {
   const introGuardUntilRef = useRef(0);
   const prevStartMsRef = useRef(null);
 
-
-  /* ----- charger questions ----- */
+  /* --------------------------- Charger les questions --------------------------- */
   useEffect(() => {
     (async () => {
-      const q = query(collection(db, 'LesQuestions'), orderBy('createdAt', 'asc'));
+      const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
       const snapshot = await getDocs(q);
-      setQuestionsList(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+      setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
     })();
   }, []);
 
-  /* ----- écouter /quiz/state (startAt Timestamp OU startEpochMs number) + anti-flicker ----- */
+  /* ---- Écouter /quiz/state (startAt Timestamp OU startEpochMs) + anti-flash --- */
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, 'quiz', 'state'), (snap) => {
+    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
 
       // calcule startMs depuis startAt (Timestamp) OU startEpochMs (number)
       let startMs = null;
-      if (d.startAt && typeof d.startAt.seconds === 'number') {
+      if (d.startAt && typeof d.startAt.seconds === "number") {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
-      } else if (typeof d.startEpochMs === 'number') {
+      } else if (typeof d.startEpochMs === "number") {
         startMs = d.startEpochMs;
       }
 
       // Anti-flicker (voir Player)
       const now = Date.now();
-      if ((startMs && prevStartMsRef.current !== startMs) || d.isIntro === true || typeof d.introEndsAtMs === 'number') {
+      if (
+        (startMs && prevStartMsRef.current !== startMs) ||
+        d.isIntro === true ||
+        typeof d.introEndsAtMs === "number"
+      ) {
         introGuardUntilRef.current = now + 300;
         if (startMs) prevStartMsRef.current = startMs;
       }
@@ -130,7 +132,7 @@ export default function Screen() {
         setElapsedSec(0);
       } else {
         setQuizStartMs(startMs);
-        if (d.pauseAt && typeof d.pauseAt.seconds === 'number') {
+        if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
           const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
           setPauseAtMs(pms);
           if (d.isPaused) {
@@ -142,55 +144,60 @@ export default function Screen() {
         }
       }
 
-      // flags intro / fin-manche
+      // Flags intro / fin-manche
       setIsIntro(!!d.isIntro);
-      setIntroEndsAtMs(typeof d.introEndsAtMs === 'number' ? d.introEndsAtMs : null);
+      setIntroEndsAtMs(typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null);
       setIntroRoundIndex(Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null);
-      setLastAutoPausedRoundIndex(Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null);
+      setLastAutoPausedRoundIndex(
+        Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
+      );
     });
     return () => unsub();
   }, []);
 
-
-
-  /* ----- écouter /quiz/config ----- */
+  /* ------------------------------- Écouter config ------------------------------ */
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, 'quiz', 'config'), (snap) => {
+    const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
       const d = snap.data();
-      setQuizEndSec(typeof d?.endOffsetSec === 'number' ? d.endOffsetSec : null);
-      setRoundOffsetsSec(Array.isArray(d?.roundOffsetsSec)
-        ? d.roundOffsetsSec.map(v => Number.isFinite(v) ? v : null)
-        : []);
+      setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
+      setRoundOffsetsSec(
+        Array.isArray(d?.roundOffsetsSec) ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null)) : []
+      );
     });
     return () => unsub();
   }, []);
 
-  /* ----- timer local ----- */
+  /* -------------------------------- Timer local -------------------------------- */
   useEffect(() => {
-    if (!quizStartMs) { setElapsedSec(0); return; }
+    if (!quizStartMs) {
+      setElapsedSec(0);
+      return;
+    }
     if (isPaused && pauseAtMs) {
       setElapsedSec(Math.max(0, Math.floor((pauseAtMs - quizStartMs) / 1000)));
       return;
     }
-    if (!isRunning) { setElapsedSec(0); return; }
-    const tick = () => setElapsedSec(Math.max(0, Math.floor((Date.now() - quizStartMs) / 1000)));
+    if (!isRunning) {
+      setElapsedSec(0);
+      return;
+    }
+    const tick = () =>
+      setElapsedSec(Math.max(0, Math.floor((Date.now() - quizStartMs) / 1000)));
     tick();
     const id = setInterval(tick, 500);
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs]);
 
-  /* ----- Anti-flicker: ignorer le bloc "décompte 5s" pendant ~600ms après un seek/reprise ----- */
+  /* Anti-flicker: ignorer le bloc "décompte 5s" pendant ~600ms après un seek/reprise */
   useEffect(() => {
-    if (typeof quizStartMs === 'number') {
-      // changement de startAt => on arme la fenêtre d'ignorance
+    if (typeof quizStartMs === "number") {
       ignoreCountdownUntilRef.current = Date.now() + 600;
     } else {
-      // reset (quand on stoppe le quiz par ex.)
       ignoreCountdownUntilRef.current = 0;
     }
   }, [quizStartMs]);
 
-  /* ----- Choix question active (borné à la manche courante) ----- */
+  /* --------------- Choix question active (borné à la manche courante) --------- */
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
 
   // Début/fin de la manche courante
@@ -210,49 +217,48 @@ export default function Screen() {
     return Infinity;
   })();
 
-  // Choisir la dernière question dont le timecode est dans [currentRoundStart, elapsedSec]
+  // Dernière question dans [currentRoundStart, elapsedSec[
   let activeIndex = -1;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
     if (!Number.isFinite(t) || t < currentRoundStart) continue;
-    if (t <= elapsedSec && t < currentRoundEnd) activeIndex = i; else if (t >= currentRoundEnd) break;
+    if (t <= elapsedSec && t < currentRoundEnd) activeIndex = i;
+    else if (t >= currentRoundEnd) break;
   }
   const currentQuestion = activeIndex >= 0 ? sorted[activeIndex] : null;
-  // id utilisé pour déclencher proprement les recalculs liés à la question affichée
-  const currentQuestionId = currentQuestion?.id ?? null;
+  const currentQuestionId = currentQuestion?.id ?? null; // pour useMemo deps
 
-
-
-  /* ----- prochaine échéance (question / manche / fin quiz) ----- */
-  // prochaine question
+  /* --------------- Prochaine échéance (question / manche / fin quiz) ---------- */
+  // Prochaine question
   let nextTimeSec = null;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
-    if (Number.isFinite(t) && t > elapsedSec) { nextTimeSec = t; break; }
+    if (Number.isFinite(t) && t > elapsedSec) {
+      nextTimeSec = t;
+      break;
+    }
   }
 
-  // prochaine manche
+  // Prochaine manche
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
   const nextRoundBoundary = Number.isFinite(nextRoundStart) ? Math.max(0, nextRoundStart - GAP) : null;
 
+  // Fenêtre morte (1s avant la frontière)
   const ROUND_DEADZONE_SEC = 1;
-  const secondsToRoundBoundary = Number.isFinite(nextRoundStart)
-    ? nextRoundStart - elapsedSec
-    : null;
+  const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
     secondsToRoundBoundary != null &&
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
 
-
-  // min des candidates
+  // Min des candidates
   let effectiveNextTimeSec = null;
   let nextKind = null; // "question" | "round" | "end"
   const cands = [];
-  if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: 'question' });
-  if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: 'round' });
-  if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: 'end' });
+  if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: "question" });
+  if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: "round" });
+  if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: "end" });
   if (cands.length) {
     const best = cands.reduce((a, b) => (a.t < b.t ? a : b));
     effectiveNextTimeSec = best.t;
@@ -262,50 +268,50 @@ export default function Screen() {
   // Points de la question courante
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
   const boundary = effectiveNextTimeSec;
-  const qEnd = (boundary != null) ? (boundary - REVEAL_DURATION_SEC) : null;
+  const qEnd = boundary != null ? boundary - REVEAL_DURATION_SEC : null;
 
-  // fin de manche (pause posée au boundary par l’admin)
+  // Fin de manche (pause posée au boundary par l’admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
-  const isQuizEnded = typeof quizEndSec === 'number' && elapsedSec >= quizEndSec;
+  const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
   const isRoundBreak = Boolean(isPaused && endedRoundIndex != null && !isQuizEnded);
 
-  // Fenêtres de phases basées sur des bornes fixes (évite tout flash)
-  const nextEvent = effectiveNextTimeSec;                       // prochaine échéance (question, manche, fin)
-  const revealStart = (nextEvent != null) ? nextEvent - REVEAL_DURATION_SEC : null;
-  const countdownStart = (nextEvent != null) ? nextEvent - COUNTDOWN_START_SEC : null;
+  // Fenêtres de phases (bornes fixes → pas de flash)
+  const nextEvent = effectiveNextTimeSec;
+  const revealStart = nextEvent != null ? nextEvent - REVEAL_DURATION_SEC : null;
+  const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
 
   const isQuestionPhase = Boolean(
     currentQuestion &&
-    qStart != null &&
-    nextEvent != null &&
-    elapsedSec >= qStart &&
-    elapsedSec < revealStart &&
-    !isPaused &&
-    !isRoundBreak
+      qStart != null &&
+      nextEvent != null &&
+      elapsedSec >= qStart &&
+      elapsedSec < revealStart &&
+      !isPaused &&
+      !isRoundBreak
   );
 
   const isRevealAnswerPhase = Boolean(
     currentQuestion &&
-    revealStart != null &&
-    countdownStart != null &&
-    elapsedSec >= revealStart &&
-    elapsedSec < countdownStart &&
-    !isPaused &&
-    !isRoundBreak
+      revealStart != null &&
+      countdownStart != null &&
+      elapsedSec >= revealStart &&
+      elapsedSec < countdownStart &&
+      !isPaused &&
+      !isRoundBreak
   );
 
   const isCountdownPhase = Boolean(
     currentQuestion &&
-    countdownStart != null &&
-    nextEvent != null &&
-    elapsedSec >= countdownStart &&
-    elapsedSec < nextEvent &&
-    !isPaused &&
-    !isRoundBreak
+      countdownStart != null &&
+      nextEvent != null &&
+      elapsedSec >= countdownStart &&
+      elapsedSec < nextEvent &&
+      !isPaused &&
+      !isRoundBreak
   );
 
-  // Valeur & libellé du décompte (jamais 0s)
-  const secondsToNext = (nextEvent != null) ? (nextEvent - elapsedSec) : null;
+  // Décompte (jamais 0s)
+  const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
   const countdownSec = isCountdownPhase
     ? Math.max(1, Math.min(COUNTDOWN_START_SEC, Math.ceil(secondsToNext)))
     : null;
@@ -316,32 +322,32 @@ export default function Screen() {
     const endingIdx = Number.isFinite(nextEvent)
       ? roundIndexOfTime(Math.max(0, nextEvent - 0.001), roundOffsetsSec)
       : null;
-    countdownLabel = `Fin de la manche ${endingIdx != null ? (endingIdx + 1) : ""} dans :`;
+    countdownLabel = `Fin de la manche ${endingIdx != null ? endingIdx + 1 : ""} dans :`;
   }
 
-
-
+  // Intro (garde visuelle)
   const isRoundIntro = Date.now() < (introGuardUntilRef?.current || 0);
   const introRemaining = 0;
 
-  const canShowTimeBar = Boolean(isQuestionPhase && qStart != null && qEnd != null && qEnd > qStart);
+  // Barre de progression
+  const canShowTimeBar = Boolean(
+    isQuestionPhase && qStart != null && qEnd != null && qEnd > qStart
+  );
   const progress = canShowTimeBar
     ? Math.min(1, Math.max(0, (elapsedSec - qStart) / (qEnd - qStart)))
     : 0;
 
-
+  // Phrases de révélation & réponse principale
   const revealPhrase = useMemo(
     () => (currentQuestion ? pickRevealPhrase(currentQuestion) : ""),
     [currentQuestionId]
   );
-
   const primaryAnswer = useMemo(() => {
     const a = currentQuestion?.answers;
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
 
-
-  // préchargement image reveal
+  // Préchargement image reveal
   useEffect(() => {
     if (currentQuestion?.imageUrl) {
       const img = new Image();
@@ -349,27 +355,28 @@ export default function Screen() {
     }
   }, [currentQuestion?.imageUrl]);
 
-  // infos attente
+  // Infos attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
 
   const showPreStart = !(quizStartMs && isRunning);
 
+  /* ================================== RENDER ================================== */
   if (showPreStart) {
     return (
       <div
         style={{
-          background: '#000814',
-          color: '#fff',
-          minHeight: '100vh',
-          display: 'grid',
-          placeItems: 'center',
-          padding: '24px',
-          textAlign: 'center'
+          background: "#000814",
+          color: "#fff",
+          minHeight: "100vh",
+          display: "grid",
+          placeItems: "center",
+          padding: "24px",
+          textAlign: "center",
         }}
       >
         <div>
-          <h1 style={{ fontSize: '2rem', fontWeight: 800, margin: 0 }}>
+          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
             EleyBox — Écran en attente
           </h1>
           <p style={{ opacity: 0.8, marginTop: 12 }}>
@@ -380,30 +387,45 @@ export default function Screen() {
     );
   }
 
-
-  /* ============ Render ============ */
   return (
-    <div style={{ display: 'flex', flexDirection: 'row', background: '#000814', color: 'white', minHeight: '100vh', position: 'relative' }}>
-      {/* horloge en haut à droite */}
-      <div style={{
-        position: 'absolute', top: 12, right: 12, background: '#111',
-        padding: '6px 10px', borderRadius: 8, fontFamily: 'monospace',
-        letterSpacing: 1, border: '1px solid #2a2a2a'
-      }}>
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "row",
+        background: "#000814",
+        color: "white",
+        minHeight: "100vh",
+        position: "relative",
+      }}
+    >
+      {/* Horloge en haut à droite */}
+      <div
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          background: "#111",
+          padding: "6px 10px",
+          borderRadius: 8,
+          fontFamily: "monospace",
+          letterSpacing: 1,
+          border: "1px solid #2a2a2a",
+        }}
+      >
         ⏱ {formatHMS(elapsedSec)}
       </div>
 
       {/* Zone question (gauche) */}
-      <div style={{ flex: 2, padding: '40px' }}>
+      <div style={{ flex: 2, padding: "40px" }}>
         {isQuizEnded ? (
           <>
-            <h1 style={{ fontSize: '2.4rem', marginTop: 6 }}>Le gagnant est…</h1>
+            <h1 style={{ fontSize: "2.4rem", marginTop: 6 }}>Le gagnant est…</h1>
             <p style={{ opacity: 0.85, marginTop: 8 }}>(écran de fin — scoring à venir)</p>
           </>
         ) : isRoundBreak ? (
           <div style={{ marginTop: 8, marginBottom: 4 }}>
-            <h1 style={{ fontSize: '2rem', margin: 0 }}>
-              Fin de la manche {endedRoundIndex != null ? (endedRoundIndex + 1) : ""}
+            <h1 style={{ fontSize: "2rem", margin: 0 }}>
+              Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
             </h1>
             <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>
               (Ici, le tableau des scores — placeholder)
@@ -411,97 +433,106 @@ export default function Screen() {
           </div>
         ) : inRoundBoundaryWindow ? (
           <div style={{ marginTop: 8, marginBottom: 4 }}>
-            <h1 style={{ fontSize: '2rem', margin: 0 }}>
-              Fin de la manche {endedRoundIndex != null ? (endedRoundIndex + 1) : ""}
+            <h1 style={{ fontSize: "2rem", margin: 0 }}>
+              Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
             </h1>
             <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>(transition…)</div>
           </div>
         ) : isPaused ? (
           <div style={{ marginTop: 8, marginBottom: 4 }}>
-            <h1 style={{ fontSize: '2rem', margin: 0 }}>On revient dans un instant…</h1>
+            <h1 style={{ fontSize: "2rem", margin: 0 }}>On revient dans un instant…</h1>
             <div style={{ opacity: 0.75, marginTop: 8, fontSize: 16 }}>
               Le quiz est momentanément en pause.
             </div>
           </div>
         ) : currentQuestion ? (
-
           <>
             {/* fin de manche / question / révélation */}
             {isRoundBreak ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <h1 style={{ fontSize: '2rem', margin: 0 }}>
-                  Fin de la manche {endedRoundIndex != null ? (endedRoundIndex + 1) : ""}
+                <h1 style={{ fontSize: "2rem", margin: 0 }}>
+                  Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
                 </h1>
                 <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>
                   (Ici, le tableau des scores — placeholder)
                 </div>
               </div>
             ) : isQuestionPhase ? (
-              <h1 style={{ fontSize: '2rem', margin: 0 }}>{currentQuestion.text}</h1>
+              <h1 style={{ fontSize: "2rem", margin: 0 }}>{currentQuestion.text}</h1>
             ) : isRevealAnswerPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 8 }}>{revealPhrase}</div>
-                <h1 style={{ fontSize: '2.2rem', margin: 0 }}>{primaryAnswer}</h1>
+                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 8 }}>
+                  {revealPhrase}
+                </div>
+                <h1 style={{ fontSize: "2.2rem", margin: 0 }}>{primaryAnswer}</h1>
               </div>
             ) : isCountdownPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 6 }}>{countdownLabel}</div>
-                <div style={{ fontSize: '5rem', fontWeight: 800, lineHeight: 1 }}>
+                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 6 }}>
+                  {countdownLabel}
+                </div>
+                <div style={{ fontSize: "5rem", fontWeight: 800, lineHeight: 1 }}>
                   {countdownSec}
                 </div>
               </div>
             ) : (
-              <h1 style={{ fontSize: '2rem', margin: 0 }}>{currentQuestion.text}</h1>
+              <h1 style={{ fontSize: "2rem", margin: 0 }}>{currentQuestion.text}</h1>
             )}
 
-            {/* barre de temps sous la question */}
+            {/* Barre de temps sous la question */}
             {canShowTimeBar && (
               <div
                 style={{
-                  width: 'min(520px, 80%)',
+                  width: "min(520px, 80%)",
                   height: BAR_H,
                   marginTop: 12,
                   background: BAR_BLUE,
                   borderRadius: 9999,
-                  overflow: 'hidden',
-                  position: 'relative'
+                  overflow: "hidden",
+                  position: "relative",
                 }}
               >
-                <div style={{ width: `${(progress * 100).toFixed(2)}%`, height: '100%', background: BAR_RED }} />
                 <div
                   style={{
-                    position: 'absolute',
+                    width: `${(progress * 100).toFixed(2)}%`,
+                    height: "100%",
+                    background: BAR_RED,
+                  }}
+                />
+                <div
+                  style={{
+                    position: "absolute",
                     left: `calc(${(progress * 100).toFixed(2)}% - 1px)`,
                     top: -2,
                     bottom: -2,
                     width: 2,
                     background: HANDLE_COLOR,
-                    opacity: 0.9
+                    opacity: 0.9,
                   }}
                 />
               </div>
             )}
 
-            {/* image pendant la révélation */}
+            {/* Image pendant la révélation */}
             {isRevealAnswerPhase && currentQuestion?.imageUrl ? (
               <div
                 style={{
                   width: SCREEN_IMG_MAX,
                   height: SCREEN_IMG_MAX,
-                  maxWidth: '100%',
-                  margin: '16px auto',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  background: '#111',
+                  maxWidth: "100%",
+                  margin: "16px auto",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "#111",
                   borderRadius: 8,
-                  overflow: 'hidden'
+                  overflow: "hidden",
                 }}
               >
                 <img
                   src={currentQuestion.imageUrl}
                   alt="Révélation — œuvre"
-                  style={{ width: '100%', height: '100%', objectFit: 'contain', imageRendering: 'auto' }}
+                  style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "auto" }}
                   loading="lazy"
                   decoding="async"
                 />
@@ -532,7 +563,7 @@ export default function Screen() {
       </div>
 
       {/* Zone scores (droite) */}
-      <div style={{ flex: 1, padding: '20px', background: '#001d3d' }}>
+      <div style={{ flex: 1, padding: "20px", background: "#001d3d" }}>
         <h2>Tableau des scores</h2>
         <p>(Les scores seront ajoutés ici plus tard)</p>
       </div>

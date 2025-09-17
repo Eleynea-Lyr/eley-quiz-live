@@ -2,12 +2,24 @@
 import { useEffect, useMemo, useState } from "react";
 import { db, storage } from "../lib/firebase";
 import {
-  collection, query, orderBy, getDocs, getDoc, doc, updateDoc, deleteDoc,
-  addDoc, writeBatch, setDoc, serverTimestamp, onSnapshot, Timestamp,
+  collection,
+  query,
+  orderBy,
+  getDocs,
+  getDoc,
+  doc,
+  updateDoc,
+  deleteDoc,
+  addDoc,
+  writeBatch,
+  setDoc,
+  serverTimestamp,
+  onSnapshot,
+  Timestamp,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
-/* ================= Helpers ================= */
+/* ========================= Helpers ========================= */
 function parseCSV(input = "") {
   return String(input)
     .split(",")
@@ -26,13 +38,16 @@ function parseHMS(input) {
   if (s.includes(":")) {
     const parts = s.split(":").map((p) => p.trim());
     if (parts.length > 3) return null;
-    const [hStr, mStr, sStr] = parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
-    const h = Number(hStr), m = Number(mStr), sec = Number(sStr);
+    const [hStr, mStr, sStr] =
+      parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
+    const h = Number(hStr),
+      m = Number(mStr),
+      sec = Number(sStr);
     if (![h, m, sec].every((n) => Number.isFinite(n) && n >= 0)) return null;
     if (m >= 60 || sec >= 60) return null;
     return h * 3600 + m * 60 + sec;
   }
-  // nombre simple → minutes décimales (rétro-compat)
+  // nombre simple → minutes décimales (legacy)
   const num = Number(s);
   if (!Number.isFinite(num) || num < 0) return null;
   return Math.round(num * 60);
@@ -46,18 +61,16 @@ function formatHMS(totalSeconds) {
 }
 function getTimeSec(q) {
   if (!q || typeof q !== "object") return Infinity;
-  if (typeof q.timecodeSec === "number") return q.timecodeSec;            // nouveau (secondes)
-  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // rétro-compat (minutes)
+  if (typeof q.timecodeSec === "number") return q.timecodeSec; // secondes (nouveau)
+  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
   return Infinity;
 }
-
 function coerceOffsetsToNumbers(arr) {
   const out = [];
   for (let i = 0; i < 8; i++) {
     const v = arr?.[i];
-    if (typeof v === "number" && Number.isFinite(v)) {
-      out[i] = v;
-    } else if (typeof v === "string" && v.trim()) {
+    if (typeof v === "number" && Number.isFinite(v)) out[i] = v;
+    else if (typeof v === "string" && v.trim()) {
       const p = parseHMS(v);
       out[i] = p == null ? null : p;
     } else {
@@ -66,7 +79,6 @@ function coerceOffsetsToNumbers(arr) {
   }
   return out;
 }
-
 function roundIndexOfTime(t, offsets) {
   if (!Array.isArray(offsets)) return 0;
   let idx = -1;
@@ -76,18 +88,10 @@ function roundIndexOfTime(t, offsets) {
   }
   return Math.max(0, idx);
 }
-function nextRoundStartAfter(t, offsets) {
-  if (!Array.isArray(offsets)) return null;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && v > t) return v;
-  }
-  return null;
-}
 
-/* ============== Component ============== */
+/* ======================== Component ======================== */
 export default function Admin() {
-  // Data & UI
+  /* ------------ Data & UI ------------ */
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
@@ -97,28 +101,37 @@ export default function Admin() {
   const [creating, setCreating] = useState(false);
   const [mainBtnBusy, setMainBtnBusy] = useState(false);
 
-  // Rounds + end time
+  /* ------------ Rounds & End ------------ */
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
-    "00:00:00", "00:16:00", "00:31:00", "00:46:00", "", "", "", ""
+    "00:00:00",
+    "00:16:00",
+    "00:31:00",
+    "00:46:00",
+    "",
+    "",
+    "",
+    "",
   ]);
-  const [roundOffsetsSec, setRoundOffsetsSec] = useState([0, 960, 1860, 2760, null, null, null, null]);
+  const [roundOffsetsSec, setRoundOffsetsSec] = useState([
+    0, 960, 1860, 2760, null, null, null, null,
+  ]);
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [endOffsetStr, setEndOffsetStr] = useState("");
 
-  // Intro de manche décrochée + garde anti re-boucle
+  /* ------------ Intro / fin de manche ------------ */
   const [isIntro, setIsIntro] = useState(false);
   const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
   const [introRoundIndex, setIntroRoundIndex] = useState(null);
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
 
-  // Live state (timer affiché en haut)
+  /* ------------ Live state ------------ */
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
 
-  // Création de question
+  /* ------------ Création question ------------ */
   const [newQ, setNewQ] = useState({
     text: "",
     answersCsv: "",
@@ -126,37 +139,55 @@ export default function Admin() {
     imageFile: null,
   });
   const DEFAULT_REVEAL_PHRASES = [
-    "La réponse était :", "Il fallait trouver :", "C'était :", "La bonne réponse :", "Réponse :"
+    "La réponse était :",
+    "Il fallait trouver :",
+    "C'était :",
+    "La bonne réponse :",
+    "Réponse :",
   ];
-  const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
+  const [newRevealPhrases, setNewRevealPhrases] = useState([
+    "",
+    "",
+    "",
+    "",
+    "",
+  ]);
 
-  // Times utilitaires
+  /* ------------ Utilitaires temps ------------ */
   const plannedTimes = useMemo(
-    () => items.map(getTimeSec).filter((t) => Number.isFinite(t)).sort((a, b) => a - b),
+    () =>
+      items
+        .map(getTimeSec)
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => a - b),
     [items]
   );
 
-  /* --------- Load questions once --------- */
-  const load = async () => {
-    setLoading(true);
-    const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-    const snap = await getDocs(q);
-    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    setItems(arr);
-    setLoading(false);
-    setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
-  };
-  useEffect(() => { load(); }, []);
+  /* =================== Effects =================== */
 
-  /* --------- Listen config (rounds + end) --------- */
+  // Charger questions
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+      const snap = await getDocs(q);
+      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setItems(arr);
+      setLoading(false);
+      setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
+    })();
+  }, []);
+
+  // Écouter config (rounds + fin)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
       const d = snap.data() || {};
-
       if (Array.isArray(d.roundOffsetsSec)) {
         const offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
         setRoundOffsetsSec(offs);
-        setRoundOffsetsStr(offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : "")));
+        setRoundOffsetsStr(
+        offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : ""))
+        );
       }
       if (typeof d.endOffsetSec === "number") {
         setQuizEndSec(d.endOffsetSec);
@@ -169,15 +200,17 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
-  /* --------- Listen live state (startAt Timestamp OU startEpochMs number) --------- */
+  // Écouter état live (Timestamp ou startEpochMs)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
 
-      // calcule startMs depuis startAt (Timestamp) OU startEpochMs (number)
+      // startMs depuis startAt (Timestamp) OU startEpochMs (number)
       let startMs = null;
       if (d.startAt && typeof d.startAt.seconds === "number") {
-        startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
+        startMs =
+          d.startAt.seconds * 1000 +
+          Math.floor((d.startAt.nanoseconds || 0) / 1e6);
       } else if (typeof d.startEpochMs === "number") {
         startMs = d.startEpochMs;
       }
@@ -192,7 +225,9 @@ export default function Admin() {
       } else {
         setQuizStartMs(startMs);
         if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
-          const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
+          const pms =
+            d.pauseAt.seconds * 1000 +
+            Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
           setPauseAtMs(pms);
         } else {
           setPauseAtMs(null);
@@ -201,15 +236,22 @@ export default function Admin() {
 
       // flags
       setIsIntro(!!d.isIntro);
-      setIntroEndsAtMs(typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null);
-      setIntroRoundIndex(Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null);
-      setLastAutoPausedRoundIndex(Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null);
+      setIntroEndsAtMs(
+        typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null
+      );
+      setIntroRoundIndex(
+        Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null
+      );
+      setLastAutoPausedRoundIndex(
+        Number.isInteger(d.lastAutoPausedRoundIndex)
+          ? d.lastAutoPausedRoundIndex
+          : null
+      );
     });
     return () => unsub();
   }, []);
 
-
-  /* --------- Local timer (clamp fin de quiz) --------- */
+  // Timer local (avec clamp fin de quiz)
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
@@ -228,7 +270,11 @@ export default function Admin() {
     const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
     const first = computeNow();
     setElapsedSec(
-      Number.isFinite(quizEndSec) && first >= quizEndSec ? quizEndSec : (first < 0 ? 0 : first)
+      Number.isFinite(quizEndSec) && first >= quizEndSec
+        ? quizEndSec
+        : first < 0
+        ? 0
+        : first
     );
 
     const id = setInterval(() => {
@@ -243,30 +289,35 @@ export default function Admin() {
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
-  /* --------- Auto-pause à la fin de manche (boundary = nextStart - 1s) --------- */
+  // Auto-pause à la fin de manche (boundary = nextStart - 1s)
   useEffect(() => {
     if (!isRunning || isPaused) return;
-    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every(v => v == null)) return;
+    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null)) return;
 
     const prevIdx = roundIndexOfTime(Math.max(0, elapsedSec - 1), roundOffsetsSec);
     const nextStart =
-      (typeof roundOffsetsSec[prevIdx + 1] === "number") ? roundOffsetsSec[prevIdx + 1] : null;
+      typeof roundOffsetsSec[prevIdx + 1] === "number"
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
     if (typeof nextStart !== "number") return; // pas de manche suivante
 
     const boundary = Math.max(0, nextStart - 1); // marge 1s
     if (elapsedSec >= boundary && lastAutoPausedRoundIndex !== prevIdx) {
-      setDoc(doc(db, "quiz", "state"), {
-        isPaused: true,
-        pauseAt: serverTimestamp(),
-        lastAutoPausedRoundIndex: prevIdx
-      }, { merge: true }).catch(console.error);
+      setDoc(
+        doc(db, "quiz", "state"),
+        {
+          isPaused: true,
+          pauseAt: serverTimestamp(),
+          lastAutoPausedRoundIndex: prevIdx,
+        },
+        { merge: true }
+      ).catch(console.error);
     }
   }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
 
+  /* =================== Actions =================== */
 
-
-
-  /* ================= Saves & updates ================= */
+  // Modifs inline des champs question
   const handleFieldChange = (id, field, value) => {
     setItems((prev) =>
       prev.map((it) => {
@@ -279,6 +330,7 @@ export default function Admin() {
     );
   };
 
+  // Manches (UI) : saisir puis sauver
   const handleRoundOffsetChange = (i, value) => {
     setRoundOffsetsStr((prev) => {
       const next = [...prev];
@@ -286,19 +338,24 @@ export default function Admin() {
       return next;
     });
   };
-
   const saveRoundOffsets = async (nextStrs) => {
     try {
       const secs = nextStrs.map((s) => {
         const t = (s || "").trim();
-        if (!t) return null;                 // vide => désactivée
+        if (!t) return null; // vide => désactivée
         const v = parseHMS(t);
         if (v == null) throw new Error("format");
         return v;
       });
-      await setDoc(doc(db, "quiz", "config"), { roundOffsetsSec: secs }, { merge: true });
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { roundOffsetsSec: secs },
+        { merge: true }
+      );
       setRoundOffsetsSec(secs);
-      setRoundOffsetsStr(secs.map((s) => (typeof s === "number" ? formatHMS(s) : "")));
+      setRoundOffsetsStr(
+        secs.map((s) => (typeof s === "number" ? formatHMS(s) : ""))
+      );
       setNotice("Offsets enregistrés");
       setTimeout(() => setNotice(null), 1500);
     } catch {
@@ -312,7 +369,11 @@ export default function Admin() {
       const t = (valStr || "").trim();
       const v = t ? parseHMS(t) : null; // null = pas de fin
       if (t && v == null) throw new Error("format");
-      await setDoc(doc(db, "quiz", "config"), { endOffsetSec: v }, { merge: true });
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { endOffsetSec: v },
+        { merge: true }
+      );
       setEndOffsetStr(v != null ? formatHMS(v) : "");
       setNotice("Fin du quiz enregistrée");
       setTimeout(() => setNotice(null), 1500);
@@ -322,19 +383,26 @@ export default function Admin() {
     }
   };
 
+  // Upload image question
   const uploadImage = async (file) => {
     if (!file) return null;
     try {
       const storageRef = ref(
         storage,
-        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${file.name}`
+        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${
+          file.name
+        }`
       );
       const task = uploadBytesResumable(storageRef, file);
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => { },
-          (err) => { console.error("[UPLOAD] Erreur:", err); alert("Échec de l’upload : " + (err?.message || err)); reject(err); },
+          () => {},
+          (err) => {
+            console.error("[UPLOAD] Erreur:", err);
+            alert("Échec de l’upload : " + (err?.message || err));
+            reject(err);
+          },
           async () => resolve(await getDownloadURL(task.snapshot.ref))
         );
       });
@@ -344,7 +412,6 @@ export default function Admin() {
       return null;
     }
   };
-
   const handleImageChange = async (id, file) => {
     if (!file) return;
     handleFieldChange(id, "_imageUploading", true);
@@ -353,6 +420,7 @@ export default function Admin() {
     handleFieldChange(id, "_imageUploading", false);
   };
 
+  // Save / delete
   const saveOne = async (it) => {
     try {
       setSavingId(it.id);
@@ -362,15 +430,24 @@ export default function Admin() {
 
       const payload = {
         text: it.text ?? "",
-        answers: hasAnswersCsv ? parseCSV(it.answersCsv)
-          : Array.isArray(it.answers) ? it.answers : [],
-        timecodeSec: hasTimecodeStr ? parseHMS(it.timecodeStr)
-          : typeof it.timecodeSec === "number" ? it.timecodeSec
-            : typeof it.timecode === "number" ? Math.round(it.timecode * 60)
-              : null,
+        answers: hasAnswersCsv
+          ? parseCSV(it.answersCsv)
+          : Array.isArray(it.answers)
+          ? it.answers
+          : [],
+        timecodeSec: hasTimecodeStr
+          ? parseHMS(it.timecodeStr)
+          : typeof it.timecodeSec === "number"
+          ? it.timecodeSec
+          : typeof it.timecode === "number"
+          ? Math.round(it.timecode * 60)
+          : null,
         imageUrl: it.imageUrl || "",
-        order: typeof it.order === "number" ? it.order : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
-        // on ne touche pas à revealPhrases ici (édition à la création uniquement)
+        order:
+          typeof it.order === "number"
+            ? it.order
+            : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
+        // revealPhrases inchangé (création uniquement)
       };
 
       await updateDoc(doc(db, "LesQuestions", it.id), payload);
@@ -381,39 +458,61 @@ export default function Admin() {
       alert("Échec de la modification : " + (err?.message || err));
     } finally {
       setSavingId(null);
-      await load();
+      await (async () => {
+        const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+        const snap = await getDocs(q);
+        setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      })();
     }
   };
-
   const removeOne = async (id) => {
     if (!confirm("Supprimer cette question ?")) return;
     await deleteDoc(doc(db, "LesQuestions", id));
-    await load();
+    const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+    const snap = await getDocs(q);
+    setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
-  /* --------- Reorder --------- */
+  // Reorder
   const swapOrder = async (indexA, indexB) => {
-    if (indexA < 0 || indexB < 0 || indexA >= items.length || indexB >= items.length) return;
-    const a = items[indexA], b = items[indexB];
+    if (
+      indexA < 0 ||
+      indexB < 0 ||
+      indexA >= items.length ||
+      indexB >= items.length
+    )
+      return;
+    const a = items[indexA],
+      b = items[indexB];
     const batch = writeBatch(db);
-    batch.update(doc(db, "LesQuestions", a.id), { order: b.order ?? (indexB + 1) * 1000 });
-    batch.update(doc(db, "LesQuestions", b.id), { order: a.order ?? (indexA + 1) * 1000 });
+    batch.update(doc(db, "LesQuestions", a.id), {
+      order: b.order ?? (indexB + 1) * 1000,
+    });
+    batch.update(doc(db, "LesQuestions", b.id), {
+      order: a.order ?? (indexA + 1) * 1000,
+    });
     await batch.commit();
-    await load();
+    const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+    const snap = await getDocs(q);
+    setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
-  /* --------- Init order (one-time) --------- */
+  // Init order (one-time)
   const initOrder = async () => {
     const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
     const snap = await getDocs(q);
     const arr = snap.docs.map((d, i) => ({ id: d.id, ...d.data(), idx: i }));
     const batch = writeBatch(db);
-    arr.forEach((it, i) => batch.update(doc(db, "LesQuestions", it.id), { order: (i + 1) * 1000 }));
+    arr.forEach((it, i) =>
+      batch.update(doc(db, "LesQuestions", it.id), { order: (i + 1) * 1000 })
+    );
     await batch.commit();
-    await load();
+    const q2 = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+    const snap2 = await getDocs(q2);
+    setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
   };
 
-  /* --------- Create --------- */
+  // Create
   const createOne = async () => {
     try {
       setCreating(true);
@@ -422,7 +521,10 @@ export default function Admin() {
 
       const answers = parseCSV(newQ.answersCsv);
       const timecodeSec = parseHMS(newQ.timecodeStr);
-      const order = items.length > 0 ? Math.max(...items.map((x) => x.order || 0)) + 1000 : 1000;
+      const order =
+        items.length > 0
+          ? Math.max(...items.map((x) => x.order || 0)) + 1000
+          : 1000;
 
       const cleanedRevealPhrases = (newRevealPhrases ?? [])
         .map((s) => (s ?? "").trim())
@@ -439,18 +541,25 @@ export default function Admin() {
         revealPhrases: cleanedRevealPhrases, // [] autorisé → fallback côté client
       });
 
-      setNewQ({ text: "", answersCsv: "", timecodeStr: "", imageFile: null });
+      setNewQ({
+        text: "",
+        answersCsv: "",
+        timecodeStr: "",
+        imageFile: null,
+      });
       setNewRevealPhrases(["", "", "", "", ""]);
     } catch (err) {
       console.error("createOne error:", err);
       alert("Échec de la création : " + (err?.message || err));
     } finally {
       setCreating(false);
-      await load();
+      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+      const snap = await getDocs(q);
+      setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     }
   };
 
-  /* --------- Live controls --------- */
+  // Live controls
   const startQuiz = async () => {
     try {
       const nowMs = Date.now();
@@ -460,8 +569,8 @@ export default function Admin() {
           isRunning: true,
           isPaused: false,
           startAt: Timestamp.fromMillis(nowMs), // même base temps que startEpochMs
-          startEpochMs: nowMs,                  // compat Player/Screen
-          pauseAt: null
+          startEpochMs: nowMs, // compat Player/Screen
+          pauseAt: null,
         },
         { merge: true }
       );
@@ -479,12 +588,12 @@ export default function Admin() {
           isRunning: false,
           isPaused: false,
           startAt: null,
-          startEpochMs: null,            // compat Player/Screen
+          startEpochMs: null, // compat Player/Screen
           pauseAt: null,
           isIntro: false,
           introEndsAtMs: null,
           introRoundIndex: null,
-          lastAutoPausedRoundIndex: null
+          lastAutoPausedRoundIndex: null,
         },
         { merge: true }
       );
@@ -501,8 +610,8 @@ export default function Admin() {
         {
           isPaused: true,
           pauseAt: serverTimestamp(),
-          // ✅ Pause MANUELLE : on efface la sentinelle pour ne pas afficher "Fin de manche"
-          lastAutoPausedRoundIndex: null
+          // Pause MANUELLE : on efface la sentinelle pour ne pas afficher "Fin de manche"
+          lastAutoPausedRoundIndex: null,
         },
         { merge: true }
       );
@@ -512,32 +621,30 @@ export default function Admin() {
     }
   };
 
-
   const seekTo = async (targetSec) => {
     try {
       const target = Math.max(0, Math.floor(targetSec));
       const ms = Date.now() - target * 1000;
 
-      // ⚙️ Neutraliser l'auto-pause si on saute au début d'une manche
-      // On calcule la manche "précédente" au temps (target - 1)
+      // Neutraliser l'auto-pause si on saute au début d'une manche
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && (target - 1) >= t) prevIdx = i;
+        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
       }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1]) ? roundOffsetsSec[prevIdx + 1] : null;
-      const boundary = (typeof nextStart === "number") ? Math.max(0, nextStart - 1) : null;
+      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
+      const boundary =
+        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
 
       const payload = {
         isRunning: true,
         isPaused: false,
         startAt: Timestamp.fromMillis(ms),
         startEpochMs: ms,
-        pauseAt: null
+        pauseAt: null,
       };
-
-      // Si on atterrit à/sur/après la frontière précédente (ex: target=80, boundary=79),
-      // on arme la sentinelle pour ne PAS re-déclencher l'auto-pause immédiatement.
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
         payload.lastAutoPausedRoundIndex = prevIdx;
       }
@@ -549,7 +656,6 @@ export default function Admin() {
     }
   };
 
-  // Reprendre la lecture en conservant le temps exact où on s'est mis en pause
   const resumeFromPause = async () => {
     try {
       const newStartMs = Date.now() - Math.max(0, Math.floor(elapsedSec)) * 1000;
@@ -560,15 +666,18 @@ export default function Admin() {
         const t = roundOffsetsSec[i];
         if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
       }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1]) ? roundOffsetsSec[prevIdx + 1] : null;
-      const boundary = (typeof nextStart === "number") ? Math.max(0, nextStart - 1) : null;
+      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
+      const boundary =
+        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
 
       const payload = {
         isRunning: true,
         isPaused: false,
         startAt: Timestamp.fromMillis(newStartMs),
         startEpochMs: newStartMs,
-        pauseAt: null
+        pauseAt: null,
       };
       if (typeof boundary === "number" && elapsedSec >= boundary) {
         payload.lastAutoPausedRoundIndex = prevIdx;
@@ -581,7 +690,6 @@ export default function Admin() {
     }
   };
 
-  // Sauter à un début de manche et reprendre la lecture, en neutralisant l'auto-pause de la manche précédente
   const jumpToRoundStartAndPlay = async (roundStartSec) => {
     try {
       const target = Math.max(0, Math.floor(roundStartSec));
@@ -591,7 +699,7 @@ export default function Admin() {
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && (target - 1) >= t) prevIdx = i;
+        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
       }
 
       await setDoc(
@@ -602,7 +710,7 @@ export default function Admin() {
           startAt: Timestamp.fromMillis(ms),
           startEpochMs: ms,
           pauseAt: null,
-          lastAutoPausedRoundIndex: prevIdx
+          lastAutoPausedRoundIndex: prevIdx,
         },
         { merge: true }
       );
@@ -612,9 +720,6 @@ export default function Admin() {
     }
   };
 
-
-
-  // Repositionner le temps MAIS rester en pause (pour Back/Next)
   const seekPaused = async (targetSec) => {
     try {
       const target = Math.max(0, Math.floor(targetSec));
@@ -623,17 +728,20 @@ export default function Admin() {
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && (target - 1) >= t) prevIdx = i;
+        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
       }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1]) ? roundOffsetsSec[prevIdx + 1] : null;
-      const boundary = (typeof nextStart === "number") ? Math.max(0, nextStart - 1) : null;
+      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
+      const boundary =
+        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
 
       const payload = {
         isRunning: true,
         isPaused: true,
         startAt: Timestamp.fromMillis(startMs),
         startEpochMs: startMs,
-        pauseAt: serverTimestamp()
+        pauseAt: serverTimestamp(),
       };
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
         payload.lastAutoPausedRoundIndex = prevIdx;
@@ -645,8 +753,6 @@ export default function Admin() {
       alert("Échec du positionnement (pause) : " + (err?.message || err));
     }
   };
-
-
 
   const startOrNextRound = async () => {
     const actives = (Array.isArray(roundOffsetsSec) ? roundOffsetsSec : [])
@@ -662,15 +768,15 @@ export default function Admin() {
       return;
     }
 
-    // 1) Première fois (quiz pas démarré) → juste démarrer
+    // 1) Première fois (quiz pas démarré) → démarrer
     if (!isRunning || !quizStartMs) {
       await startQuiz();
       return;
     }
 
-    // 2) En pause → comportement contextuel :
-    //    - si on est AVANT la frontière (elapsed < nextStart - 1) -> SAUTER au DÉBUT de la manche suivante (seekTo(nextStart))
-    //    - sinon (on est pile/au-delà de la frontière) -> REPRENDRE sans seek (resumeFromPause)
+    // 2) En pause → contexte :
+    //    - si elapsed < boundary (nextStart - 1) → SAUT au début de la manche suivante
+    //    - sinon → reprise simple
     if (isPaused) {
       const nextRoundStart = actives.find((t) => t > elapsedSec);
       if (typeof nextRoundStart !== "number") {
@@ -679,55 +785,74 @@ export default function Admin() {
         return;
       }
       const boundary = Math.max(0, nextRoundStart - 1);
-
       if (elapsedSec < boundary) {
-        // Saut DIRECT au début de la manche suivante + reprise, avec sentinelle armée
         await jumpToRoundStartAndPlay(nextRoundStart);
       } else {
-        // Reprise pile à la frontière, avec neutralisation d'auto-pause si nécessaire
         await resumeFromPause();
       }
       return;
     }
-
   };
-
 
   const handleBack = async () => {
     if (!isPaused) return;
+
+    // Si on est sur la frontière de manche → bloqué (UX)
     if (atRoundBoundary) {
       setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
       setTimeout(() => setNotice(null), 1600);
       return;
     }
 
-    const actives = roundOffsetsSec.filter((t) => typeof t === "number").sort((a, b) => a - b);
+    const actives = roundOffsetsSec
+      .filter((t) => typeof t === "number")
+      .sort((a, b) => a - b);
     const firstActive = actives[0] ?? 0;
     const roundStart = actives.filter((t) => t <= elapsedSec).slice(-1)[0] ?? firstActive;
     const roundEnd = actives.find((t) => t > roundStart) ?? Infinity;
 
-    if (!plannedTimes.length || elapsedSec < firstActive) { await seekTo(0); return; }
+    if (!plannedTimes.length || elapsedSec < firstActive) {
+      await seekTo(0);
+      return;
+    }
 
     const inRound = plannedTimes.filter((t) => t >= roundStart && t < roundEnd);
-    if (!inRound.some((t) => t <= elapsedSec)) { await seekTo(roundStart); return; }
+    if (!inRound.some((t) => t <= elapsedSec)) {
+      await seekTo(roundStart);
+      return;
+    }
 
     const past = inRound.filter((t) => t <= elapsedSec);
     const target = past[past.length - 1] ?? roundStart;
     await seekTo(target);
   };
 
-
-
   const handleNext = async () => {
     if (!isPaused) return;
-    if (atRoundBoundary) { setNotice("Fin de manche atteinte : utilisez « Manche suivante »"); setTimeout(() => setNotice(null), 1600); return; }
-    if (!plannedTimes.length) { setNotice("Aucune question suivante"); setTimeout(() => setNotice(null), 2000); return; }
+    if (atRoundBoundary) {
+      setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
+      setTimeout(() => setNotice(null), 1600);
+      return;
+    }
+    if (!plannedTimes.length) {
+      setNotice("Aucune question suivante");
+      setTimeout(() => setNotice(null), 2000);
+      return;
+    }
 
     const first = plannedTimes[0];
-    if (elapsedSec < first) { await seekTo(first); return; }
+    if (elapsedSec < first) {
+      await seekTo(first);
+      return;
+    }
 
-    const currentRoundStart = roundOffsetsSec.filter((t) => typeof t === "number" && t <= elapsedSec).slice(-1)[0] ?? 0;
-    const currentRoundEnd = roundOffsetsSec.find((t) => typeof t === "number" && t > currentRoundStart) ?? Infinity;
+    const currentRoundStart =
+      roundOffsetsSec
+        .filter((t) => typeof t === "number" && t <= elapsedSec)
+        .slice(-1)[0] ?? 0;
+    const currentRoundEnd =
+      roundOffsetsSec.find((t) => typeof t === "number" && t > currentRoundStart) ??
+      Infinity;
 
     const next = plannedTimes.find((t) => t > elapsedSec && t < currentRoundEnd);
     if (typeof next === "number") {
@@ -738,14 +863,17 @@ export default function Admin() {
     }
   };
 
-
   async function goToRoundEndPaused() {
     const prevIdx = roundIndexOfTime(Math.max(0, elapsedSec - 1), roundOffsetsSec);
-    const nextStart = (typeof roundOffsetsSec[prevIdx + 1] === "number") ? roundOffsetsSec[prevIdx + 1] : null;
+    const nextStart =
+      typeof roundOffsetsSec[prevIdx + 1] === "number"
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
     if (!Number.isFinite(nextStart)) return; // pas de manche suivante
 
     const targetSec = Math.max(0, Math.floor(nextStart));
     const startMs = Date.now() - targetSec * 1000;
+
     try {
       await setDoc(
         doc(db, "quiz", "state"),
@@ -753,9 +881,9 @@ export default function Admin() {
           isRunning: true,
           isPaused: true,
           startAt: Timestamp.fromMillis(startMs),
-          startEpochMs: startMs,           // compat Player/Screen
+          startEpochMs: startMs,
           pauseAt: serverTimestamp(),
-          lastAutoPausedRoundIndex: prevIdx
+          lastAutoPausedRoundIndex: prevIdx,
         },
         { merge: true }
       );
@@ -763,7 +891,6 @@ export default function Admin() {
       console.error("goToRoundEndPaused error:", e);
     }
   }
-
 
   async function fixRoundsInConfig() {
     try {
@@ -773,7 +900,9 @@ export default function Admin() {
       const fixed = coerceOffsetsToNumbers(d.roundOffsetsSec || []);
       await setDoc(refCfg, { roundOffsetsSec: fixed }, { merge: true });
       setRoundOffsetsSec(fixed);
-      setRoundOffsetsStr(fixed.map(s => (typeof s === "number" ? formatHMS(s) : "")));
+      setRoundOffsetsStr(
+        fixed.map((s) => (typeof s === "number" ? formatHMS(s) : ""))
+      );
       setNotice("Manches réparées ✅");
       setTimeout(() => setNotice(null), 1500);
     } catch (e) {
@@ -783,7 +912,7 @@ export default function Admin() {
     }
   }
 
-  /* --------- Derived round index & UI colors --------- */
+  /* =================== Derived =================== */
   const currentRoundIndex = useMemo(() => {
     let lastIdx = -1;
     for (let i = 0; i < roundOffsetsSec.length; i++) {
@@ -805,68 +934,87 @@ export default function Admin() {
 
   // Frontière de fin de manche avec marge 1s
   const roundBoundarySec = useMemo(() => {
-    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every(v => v == null)) return null;
+    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
+      return null;
     let prevIdx = -1;
     for (let i = 0; i < roundOffsetsSec.length; i++) {
       const t = roundOffsetsSec[i];
       if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
     }
-    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1]) ? roundOffsetsSec[prevIdx + 1] : null;
-    return (typeof nextStart === "number") ? Math.max(0, nextStart - 1) : null;
+    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+      ? roundOffsetsSec[prevIdx + 1]
+      : null;
+    return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
   }, [elapsedSec, roundOffsetsSec]);
 
-  const atRoundBoundary = Boolean(isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec);
-
+  const atRoundBoundary = Boolean(
+    isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec
+  );
 
   const roundColors = [
-    "#fef08a", // M1 - jaune
-    "#fb923c", // M2 - orange
-    "#a78bfa", // M3 - violet
-    "#93c5fd", // M4 - bleu
-    "#86efac", // M5 - vert
-    "#5eead4", // M6 - teal
-    "#f472b6", // M7 - rose
-    "#f59e0b", // M8 - ambre
+    "#fef08a", // M1
+    "#fb923c", // M2
+    "#a78bfa", // M3
+    "#93c5fd", // M4
+    "#86efac", // M5
+    "#5eead4", // M6
+    "#f472b6", // M7
+    "#f59e0b", // M8
   ];
 
   const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
-
   const currentRoundNumber = currentRoundIndex + 1;
 
   const mainButtonLabel = isQuizEnded
     ? "Fin du quiz"
-    : (!isRunning
-      ? "Démarrer le quiz"
-      : (isPaused ? "Manche suivante" : `Manche ${currentRoundNumber}`));
+    : !isRunning
+    ? "Démarrer le quiz"
+    : isPaused
+    ? "Manche suivante"
+    : `Manche ${currentRoundNumber}`;
 
   const mainButtonRoundIdx = isQuizEnded
     ? null
-    : (!isRunning ? null : (isPaused ? nextRoundIndex : currentRoundIndex));
+    : !isRunning
+    ? null
+    : isPaused
+    ? nextRoundIndex
+    : currentRoundIndex;
 
   const mainButtonColor =
     mainButtonRoundIdx != null && mainButtonRoundIdx >= 0
-      ? (roundColors[mainButtonRoundIdx] || "#e5e7eb")
+      ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
 
   // Pause « soft-disabled »
   const canClickPause = isRunning && !isPaused && !isQuizEnded;
   const pauseCursor = canClickPause ? "pointer" : "not-allowed";
 
-  /* ================= UI ================= */
+  /* =================== UI =================== */
   const table = useMemo(() => {
     if (loading) return <p>Chargement…</p>;
     if (!items.length) return <p>Aucune question.</p>;
 
     return (
       <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+        <table
+          style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}
+        >
           <thead style={{ background: "#2c5d8bff", color: "white" }}>
             <tr>
               <th style={{ width: 110, textAlign: "left", padding: "10px" }}>Ordre</th>
-              <th style={{ width: "20%", textAlign: "left", padding: "10px" }}>Question</th>
-              <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>Réponses acceptées</th>
-              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>Timecode (hh:mm:ss)</th>
-              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>Image</th>
+              <th style={{ width: "20%", textAlign: "left", padding: "10px" }}>
+                Question
+              </th>
+              <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>
+                Réponses acceptées
+              </th>
+              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>
+                Timecode (hh:mm:ss)
+              </th>
+              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>
+                Image
+              </th>
               <th style={{ width: 180, padding: "10px" }}>Actions</th>
             </tr>
           </thead>
@@ -874,25 +1022,40 @@ export default function Admin() {
             {items.map((it, i) => {
               const answersCsv = it.answersCsv ?? toCSV(it.answers || []);
               const timecodeStr =
-                typeof it.timecodeStr === "string" ? it.timecodeStr
-                  : typeof it.timecodeSec === "number" ? formatHMS(it.timecodeSec)
-                    : typeof it.timecode === "number" ? formatHMS(Math.round(it.timecode * 60))
-                      : "";
+                typeof it.timecodeStr === "string"
+                  ? it.timecodeStr
+                  : typeof it.timecodeSec === "number"
+                  ? formatHMS(it.timecodeSec)
+                  : typeof it.timecode === "number"
+                  ? formatHMS(Math.round(it.timecode * 60))
+                  : "";
 
               return (
                 <tr key={it.id} style={{ borderTop: "1px solid #333" }}>
                   <td style={{ verticalAlign: "top", padding: "12px", whiteSpace: "nowrap" }}>
-                    <button onClick={() => swapOrder(i, i - 1)} disabled={i === 0}>↑</button>{" "}
-                    <button onClick={() => swapOrder(i, i + 1)} disabled={i === items.length - 1}>↓</button>
+                    <button onClick={() => swapOrder(i, i - 1)} disabled={i === 0}>
+                      ↑
+                    </button>{" "}
+                    <button
+                      onClick={() => swapOrder(i, i + 1)}
+                      disabled={i === items.length - 1}
+                    >
+                      ↓
+                    </button>
                     <div style={{ fontSize: 12, opacity: 0.7 }}>({it.order ?? "—"})</div>
                   </td>
 
                   <td style={{ width: "20%", verticalAlign: "top", padding: "12px" }}>
                     <textarea
+                      rows={2}
                       value={it.text || ""}
                       onChange={(e) => handleFieldChange(it.id, "text", e.target.value)}
-                      rows={2}
-                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0", resize: "vertical" }}
+                      style={{
+                        width: "100%",
+                        boxSizing: "border-box",
+                        margin: "4px 0",
+                        resize: "vertical",
+                      }}
                     />
                   </td>
 
@@ -904,7 +1067,9 @@ export default function Admin() {
                       placeholder="ex: Goku, Son Goku"
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
-                    <div style={{ fontSize: 12, opacity: 0.7 }}>Sépare par des virgules</div>
+                    <div style={{ fontSize: 12, opacity: 0.7 }}>
+                      Sépare par des virgules
+                    </div>
                   </td>
 
                   <td style={{ width: "15%", verticalAlign: "top", padding: "12px" }}>
@@ -937,17 +1102,28 @@ export default function Admin() {
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(e) => handleImageChange(it.id, e.target.files?.[0] || null)}
+                      onChange={(e) =>
+                        handleImageChange(it.id, e.target.files?.[0] || null)
+                      }
                       disabled={it._imageUploading}
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
                   </td>
 
-                  <td style={{ textAlign: "center", whiteSpace: "nowrap", verticalAlign: "top", padding: "12px" }}>
+                  <td
+                    style={{
+                      textAlign: "center",
+                      whiteSpace: "nowrap",
+                      verticalAlign: "top",
+                      padding: "12px",
+                    }}
+                  >
                     <button onClick={() => saveOne(it)} disabled={savingId === it.id}>
                       {savingId === it.id ? "Modification…" : "Modifier"}
                     </button>{" "}
-                    {savedRowId === it.id && <span style={{ marginLeft: 8, color: "lime" }}>Modifié ✔</span>}{" "}
+                    {savedRowId === it.id && (
+                      <span style={{ marginLeft: 8, color: "lime" }}>Modifié ✔</span>
+                    )}{" "}
                     <button onClick={() => removeOne(it.id)} style={{ color: "crimson" }}>
                       Supprimer
                     </button>
@@ -961,16 +1137,31 @@ export default function Admin() {
     );
   }, [items, loading, savingId, savedRowId]);
 
-  /* ================= RENDER ================= */
+  /* =================== Render =================== */
   return (
     <div style={{ background: "#0a0a1a", color: "white", minHeight: "100vh", padding: 20 }}>
       {/* Header */}
-      <div style={{ margin: "0 -20px 16px", background: "#2c5d8bff", color: "white", padding: "12px 20px" }}>
+      <div
+        style={{
+          margin: "0 -20px 16px",
+          background: "#2c5d8bff",
+          color: "white",
+          padding: "12px 20px",
+        }}
+      >
         <h1 style={{ margin: 0 }}>Admin — Les Questions</h1>
       </div>
 
       {/* Toolbar */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "12px 0", flexWrap: "wrap" }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          margin: "12px 0",
+          flexWrap: "wrap",
+        }}
+      >
         <button
           onClick={startOrNextRound}
           disabled={(isRunning && !isPaused) || isQuizEnded || mainBtnBusy}
@@ -985,10 +1176,13 @@ export default function Admin() {
             background: mainButtonColor,
             color: "#000",
             fontWeight: 600,
-            cursor: (isRunning && !isPaused) || isIntro || isQuizEnded ? "not-allowed" : "pointer",
+            cursor:
+              (isRunning && !isPaused) || isIntro || isQuizEnded
+                ? "not-allowed"
+                : "pointer",
             transition: "background 160ms ease",
             textAlign: "center",
-            whiteSpace: "nowrap"
+            whiteSpace: "nowrap",
           }}
           title={mainButtonLabel}
         >
@@ -1002,11 +1196,11 @@ export default function Admin() {
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#fecaca", // rouge doux permanent (pas grisé)
+            background: "#fecaca", // rouge doux permanent
             color: "#000",
             fontWeight: 600,
             cursor: pauseCursor,
-            transition: "background 160ms ease"
+            transition: "background 160ms ease",
           }}
           title={canClickPause ? "Mettre en pause le quiz" : "Pause indisponible"}
         >
@@ -1020,20 +1214,23 @@ export default function Admin() {
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#bfdbfe", // bleu clair fixe
+            background: "#bfdbfe",
             color: "#000",
             fontWeight: 600,
-            cursor: (!isPaused || plannedTimes.length === 0 || atRoundBoundary) ? "not-allowed" : "pointer",
-            transition: "background 160ms ease"
+            cursor:
+              !isPaused || plannedTimes.length === 0 || atRoundBoundary
+                ? "not-allowed"
+                : "pointer",
+            transition: "background 160ms ease",
           }}
-          title={atRoundBoundary
-            ? "Fin de manche atteinte : utilisez « Manche suivante »"
-            : "Revenir au début de la question en cours (ou au début de la manche)"
+          title={
+            atRoundBoundary
+              ? "Fin de manche atteinte : utilisez « Manche suivante »"
+              : "Revenir au début de la question en cours (ou au début de la manche)"
           }
         >
           Back
         </button>
-
 
         <button
           onClick={handleNext}
@@ -1045,28 +1242,46 @@ export default function Admin() {
             background: "#c7d2fe",
             color: "#000",
             fontWeight: 600,
-            cursor: (!isPaused || plannedTimes.length === 0 || atRoundBoundary) ? "not-allowed" : "pointer",
-            transition: "background 160ms ease"
+            cursor:
+              !isPaused || plannedTimes.length === 0 || atRoundBoundary
+                ? "not-allowed"
+                : "pointer",
+            transition: "background 160ms ease",
           }}
-          title={atRoundBoundary
-            ? "Fin de manche atteinte : utilisez « Manche suivante »"
-            : "Aller au début de la prochaine question (si disponible dans cette manche)"
+          title={
+            atRoundBoundary
+              ? "Fin de manche atteinte : utilisez « Manche suivante »"
+              : "Aller au début de la prochaine question (si disponible dans cette manche)"
           }
         >
           Next
         </button>
 
-
-
         <button
           onClick={resetQuiz}
-          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #2a2a2a", background: "#e5e7eb", color: "#000", fontWeight: 600 }}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #2a2a2a",
+            background: "#e5e7eb",
+            color: "#000",
+            fontWeight: 600,
+          }}
           title="Réinitialiser le quiz"
         >
           Réinitialiser
         </button>
 
-        <div style={{ padding: "6px 10px", background: "#111", borderRadius: 8, fontFamily: "monospace", letterSpacing: 1, border: "1px solid #2a2a2a" }}>
+        <div
+          style={{
+            padding: "6px 10px",
+            background: "#111",
+            borderRadius: 8,
+            fontFamily: "monospace",
+            letterSpacing: 1,
+            border: "1px solid #2a2a2a",
+          }}
+        >
           ⏱ {formatHMS(elapsedSec)}
         </div>
 
@@ -1074,27 +1289,40 @@ export default function Admin() {
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
             <label key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{
-                padding: "2px 6px",
-                borderRadius: 6,
-                background: Number.isFinite(roundOffsetsSec[i]) ? (roundColors[i] || "#444") : "#3a3a3a",
-                color: Number.isFinite(roundOffsetsSec[i]) ? "#111" : "#aaa",
-                fontWeight: 700,
-                opacity: Number.isFinite(roundOffsetsSec[i]) ? 1 : 0.6
-              }}>
+              <span
+                style={{
+                  padding: "2px 6px",
+                  borderRadius: 6,
+                  background: Number.isFinite(roundOffsetsSec[i])
+                    ? roundColors[i] || "#444"
+                    : "#3a3a3a",
+                  color: Number.isFinite(roundOffsetsSec[i]) ? "#111" : "#aaa",
+                  fontWeight: 700,
+                  opacity: Number.isFinite(roundOffsetsSec[i]) ? 1 : 0.6,
+                }}
+              >
                 M{i + 1}
               </span>
               <input
                 type="text"
                 value={roundOffsetsStr[i]}
-                placeholder={typeof roundOffsetsSec[i] === "number" ? "hh:mm:ss" : "désactivée"}
+                placeholder={
+                  typeof roundOffsetsSec[i] === "number" ? "hh:mm:ss" : "désactivée"
+                }
                 onChange={(e) => handleRoundOffsetChange(i, e.target.value)}
                 onBlur={() => saveRoundOffsets(roundOffsetsStr)}
-                onKeyDown={(e) => { if (e.key === "Enter") saveRoundOffsets(roundOffsetsStr); }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveRoundOffsets(roundOffsetsStr);
+                }}
                 style={{
-                  width: 90, padding: "4px 6px", borderRadius: 6, border: "1px solid #2a2a2a",
-                  background: "#111", color: "#fff", fontFamily: "monospace",
-                  opacity: (typeof roundOffsetsSec[i] === "number") ? 1 : 0.75
+                  width: 90,
+                  padding: "4px 6px",
+                  borderRadius: 6,
+                  border: "1px solid #2a2a2a",
+                  background: "#111",
+                  color: "#fff",
+                  fontFamily: "monospace",
+                  opacity: typeof roundOffsetsSec[i] === "number" ? 1 : 0.75,
                 }}
               />
             </label>
@@ -1108,7 +1336,7 @@ export default function Admin() {
               background: "#e5e7eb",
               color: "#000",
               fontWeight: 600,
-              cursor: "pointer"
+              cursor: "pointer",
             }}
             title="Convertit les manches stockées en hh:mm:ss en secondes numériques"
           >
@@ -1125,11 +1353,18 @@ export default function Admin() {
               value={endOffsetStr}
               onChange={(e) => setEndOffsetStr(e.target.value)}
               onBlur={() => saveEndOffset(endOffsetStr)}
-              onKeyDown={(e) => { if (e.key === "Enter") saveEndOffset(endOffsetStr); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveEndOffset(endOffsetStr);
+              }}
               placeholder="ex: 01:58:00"
               style={{
-                width: 110, padding: "4px 6px", borderRadius: 6, border: "1px solid #2a2a2a",
-                background: "#111", color: "#fff", fontFamily: "monospace"
+                width: 110,
+                padding: "4px 6px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: "#111",
+                color: "#fff",
+                fontFamily: "monospace",
               }}
               title="Point de fin global (utilisé pour la révélation & le décompte final)"
             />
@@ -1137,7 +1372,15 @@ export default function Admin() {
         </div>
 
         {notice && (
-          <div style={{ padding: "6px 10px", background: "#1f2937", border: "1px solid #374151", borderRadius: 8, color: "#fff" }}>
+          <div
+            style={{
+              padding: "6px 10px",
+              background: "#1f2937",
+              border: "1px solid #374151",
+              borderRadius: 8,
+              color: "#fff",
+            }}
+          >
             {notice}
           </div>
         )}
@@ -1145,7 +1388,8 @@ export default function Admin() {
 
       {needsOrderInit && (
         <div style={{ background: "#222", padding: 12, borderRadius: 8, marginBottom: 12 }}>
-          <b>Initialisation de l’ordre requise :</b> certaines questions n’ont pas encore de champ <code>order</code>.
+          <b>Initialisation de l’ordre requise :</b> certaines questions n’ont pas encore
+          de champ <code>order</code>.
           <div style={{ marginTop: 8 }}>
             <button onClick={initOrder}>Initialiser l’ordre (une fois)</button>
           </div>
@@ -1153,7 +1397,14 @@ export default function Admin() {
       )}
 
       {/* Création question */}
-      <div style={{ margin: "24px -20px 8px", background: "#2c5d8bff", color: "white", padding: "10px 20px" }}>
+      <div
+        style={{
+          margin: "24px -20px 8px",
+          background: "#2c5d8bff",
+          color: "white",
+          padding: "10px 20px",
+        }}
+      >
         <h2 style={{ margin: 0 }}>Créer une nouvelle question</h2>
       </div>
 
@@ -1164,7 +1415,7 @@ export default function Admin() {
           gap: 16,
           alignItems: "start",
           maxWidth: 1100,
-          marginBottom: 16
+          marginBottom: 16,
         }}
       >
         {/* Colonne gauche */}
@@ -1206,7 +1457,9 @@ export default function Admin() {
             <input
               type="file"
               accept="image/*"
-              onChange={(e) => setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))}
+              onChange={(e) =>
+                setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))
+              }
             />
           </label>
 
@@ -1222,7 +1475,10 @@ export default function Admin() {
           <legend style={{ padding: "0 6px" }}>Phrase de réponse aléatoire (max 5)</legend>
 
           {newRevealPhrases.map((val, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <div
+              key={i}
+              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
+            >
               <label style={{ width: 120 }}>Phrase {i + 1}</label>
               <input
                 type="text"
