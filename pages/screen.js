@@ -16,11 +16,68 @@ const REVEAL_DURATION_SEC = 20; // 15s avec la réponse + 5s de décompte
 const COUNTDOWN_START_SEC = 5;
 const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
+// ====== JOIN (DEV) ======
+const DEV_JOIN_URL = "http://localhost:3000/player";
+const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+
+
 // Barre de temps
 const BAR_H = 6;
 const BAR_BLUE = "#3b82f6";
 const BAR_RED = "#ef4444";
 const HANDLE_COLOR = "#f8fafc";
+
+
+// Panneau "Rejoindre" — inline, bleu, taille paramétrable ("md" ou "lg")
+function JoinPanelInline({ size = "md" }) {
+  const imgSize = size === "lg" ? 320 : 160; // 2× plus gros en "lg"
+  const panelStyle = {
+    marginTop: 12,
+    width: size === "lg" ? 360 : 320,
+    padding: 12,
+    borderRadius: 12,
+    background: "rgba(15, 35, 74, 0.92)", // bleu foncé légèrement plus clair
+    boxShadow: "0 2px 12px rgba(0,0,0,0.25)",
+    color: "#e6eeff",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center", // centre le QR dans le panneau
+    textAlign: "center",
+  };
+  return (
+    <div style={panelStyle} aria-hidden="true">
+      <div style={{ fontWeight: 700, marginBottom: 6 }}>Rejoindre :</div>
+      <div style={{ fontFamily: "monospace", fontSize: 16, userSelect: "all" }}>
+        {DEV_JOIN_URL}
+      </div>
+      <img
+        src={JOIN_QR_SRC}
+        alt=""
+        width={imgSize}
+        height={imgSize}
+        style={{ display: "block", marginTop: 10 }}
+      />
+    </div>
+  );
+}
+
+// Version FIXE : ancrée en bas de page (bas-gauche) pour le quiz en cours
+function JoinPanelFixedBottom() {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        left: 18,
+        bottom: 18,
+        zIndex: 10,
+        pointerEvents: "none", // non interactif
+      }}
+      aria-hidden="true"
+    >
+      <JoinPanelInline size="lg" />
+    </div>
+  );
+}
 
 const SCREEN_IMG_MAX = 300; // px
 
@@ -436,24 +493,27 @@ export default function Screen() {
   /* ================================== RENDER ================================== */
   if (showPreStart) {
     return (
-      <div
-        style={{
-          background: "#000814",
-          color: "#fff",
-          minHeight: "100vh",
-          display: "grid",
-          placeItems: "center",
-          padding: "24px",
-          textAlign: "center",
-        }}
-      >
-        <div>
+      <div style={{
+        background: "#000814", color: "#fff", minHeight: "100vh",
+        display: "grid", placeItems: "center", padding: "24px", textAlign: "center"
+      }}>
+        <div
+          style={{
+            width: 360,
+            maxWidth: "90vw",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            textAlign: "center",
+          }}
+        >
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            EleyBox — Écran en attente
+            EleyBox<br />Écran en attente
           </h1>
           <p style={{ opacity: 0.8, marginTop: 12 }}>
-            Le quiz n'a pas encore commencé. Préparez-vous…
+            Le quiz n'a pas encore commencé.<br />Préparez-vous…
           </p>
+          <JoinPanelInline size="lg" />
         </div>
       </div>
     );
@@ -469,6 +529,7 @@ export default function Screen() {
         minHeight: "100vh",
         position: "relative",
       }}
+
     >
       {/* Horloge en haut à droite */}
       <div
@@ -488,7 +549,7 @@ export default function Screen() {
       </div>
 
       {/* Zone question (gauche) */}
-      <div style={{ flex: 2, padding: "40px" }}>
+      <div style={{ flex: 2, padding: "40px", display: "flex", flexDirection: "column", alignItems: "center", gap: 12, textAlign: "center" }}>
         {isQuizEnded ? (
           <>
             <h1 style={{ fontSize: "2.4rem", marginTop: 6 }}>Le gagnant est…</h1>
@@ -634,13 +695,16 @@ export default function Screen() {
             )}
           </>
         )}
+        {/* QR — écran d’attente : juste sous le texte d’attente */}
+        {!isRunning && <JoinPanelInline size="md" />}
       </div>
-
       {/* Zone scores (droite) */}
-      <div style={{ flex: 1, padding: "20px", background: "#001d3d" }}>
+      <div style={{ flex: 1, padding: "20px", background: "#0b1e3d" }}>
         <h2>Tableau des scores</h2>
         <p>(Les scores seront ajoutés ici plus tard)</p>
       </div>
+      {/* QR — pendant le quiz : en bas à gauche et 2× plus gros */}
+      {isRunning && <JoinPanelFixedBottom />}
     </div>
   );
 }
