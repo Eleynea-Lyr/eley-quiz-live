@@ -14,6 +14,7 @@ const DEFAULT_REVEAL_PHRASES = [
 
 const REVEAL_DURATION_SEC = 20; // 15s avec la réponse + 5s de décompte
 const COUNTDOWN_START_SEC = 5;
+const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
 // Barre de temps
 const BAR_H = 6;
@@ -167,26 +168,43 @@ export default function Screen() {
     return () => unsub();
   }, []);
 
-  /* -------------------------------- Timer local -------------------------------- */
+  /* -------------------------------- Timer local (avec clamp fin de quiz) -------------------------------- */
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
       return;
     }
     if (isPaused && pauseAtMs) {
-      setElapsedSec(Math.max(0, Math.floor((pauseAtMs - quizStartMs) / 1000)));
+      const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
+      const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
+      setElapsedSec(clamped < 0 ? 0 : clamped);
       return;
     }
     if (!isRunning) {
       setElapsedSec(0);
       return;
     }
-    const tick = () =>
-      setElapsedSec(Math.max(0, Math.floor((Date.now() - quizStartMs) / 1000)));
-    tick();
-    const id = setInterval(tick, 500);
+
+    const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
+    const first = computeNow();
+    if (Number.isFinite(quizEndSec) && first >= quizEndSec) {
+      setElapsedSec(Math.max(0, quizEndSec));
+      return;
+    }
+    setElapsedSec(first < 0 ? 0 : first);
+
+    const id = setInterval(() => {
+      const raw = computeNow();
+      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+        setElapsedSec(Math.max(0, quizEndSec));
+        clearInterval(id);
+      } else {
+        setElapsedSec(raw < 0 ? 0 : raw);
+      }
+    }, 500);
     return () => clearInterval(id);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs]);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+
 
   /* Anti-flicker: ignorer le bloc "décompte 5s" pendant ~600ms après un seek/reprise */
   useEffect(() => {
@@ -265,10 +283,58 @@ export default function Screen() {
     nextKind = best.k;
   }
 
-  // Points de la question courante
-  const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
-  const boundary = effectiveNextTimeSec;
-  const qEnd = boundary != null ? boundary - REVEAL_DURATION_SEC : null;
+  // Base locale indépendante de qStart (au cas où l'ordre des blocs change)
+  const qStartBase =
+    Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
+
+  const firstQuestionTimeInCurrentRound = (() => {
+    for (let i = 0; i < sorted.length; i++) {
+      const t = getTimeSec(sorted[i]);
+      if (!Number.isFinite(t)) continue;
+      if (t >= currentRoundStart && t < currentRoundEnd) return t;
+    }
+    return null;
+  })();
+
+  const isFirstQuestionOfRound =
+    Number.isFinite(qStartBase) &&
+    Number.isFinite(firstQuestionTimeInCurrentRound) &&
+    qStartBase === firstQuestionTimeInCurrentRound;
+
+  const introStart = isFirstQuestionOfRound ? qStartBase : null;
+  const introEnd =
+    isFirstQuestionOfRound && Number.isFinite(qStartBase)
+      ? qStartBase + ROUND_START_INTRO_SEC
+      : null;
+
+  const isRoundIntroPhase = Boolean(
+    isFirstQuestionOfRound &&
+    !isPaused &&
+    !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
+    introStart != null &&
+    elapsedSec >= introStart &&
+    elapsedSec < introEnd
+  );
+
+  // Le temps “utilisable” pour répondre commence après l’intro
+  const qStartEffective =
+    isFirstQuestionOfRound && Number.isFinite(qStartBase)
+      ? qStartBase + ROUND_START_INTRO_SEC
+      : qStartBase;
+
+  // Compte à rebours affiché 5..1
+  const introCountdownSec = isRoundIntroPhase
+    ? Math.max(1, Math.ceil((introEnd ?? 0) - elapsedSec))
+    : null;
+
+  // Numéro de manche pour l’UI
+  const roundIdxForCurrentQuestion = Number.isFinite(qStartBase)
+    ? roundIndexOfTime(Math.max(0, qStartBase), roundOffsetsSec)
+    : null;
+  const roundNumberForIntro =
+    roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
+
+
 
   // Fin de manche (pause posée au boundary par l’admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
@@ -282,32 +348,33 @@ export default function Screen() {
 
   const isQuestionPhase = Boolean(
     currentQuestion &&
-      qStart != null &&
-      nextEvent != null &&
-      elapsedSec >= qStart &&
-      elapsedSec < revealStart &&
-      !isPaused &&
-      !isRoundBreak
+    qStartEffective != null &&
+    nextEvent != null &&
+    elapsedSec >= qStartEffective &&
+    elapsedSec < revealStart &&
+    !isPaused &&
+    !isRoundBreak
   );
+
 
   const isRevealAnswerPhase = Boolean(
     currentQuestion &&
-      revealStart != null &&
-      countdownStart != null &&
-      elapsedSec >= revealStart &&
-      elapsedSec < countdownStart &&
-      !isPaused &&
-      !isRoundBreak
+    revealStart != null &&
+    countdownStart != null &&
+    elapsedSec >= revealStart &&
+    elapsedSec < countdownStart &&
+    !isPaused &&
+    !isRoundBreak
   );
 
   const isCountdownPhase = Boolean(
     currentQuestion &&
-      countdownStart != null &&
-      nextEvent != null &&
-      elapsedSec >= countdownStart &&
-      elapsedSec < nextEvent &&
-      !isPaused &&
-      !isRoundBreak
+    countdownStart != null &&
+    nextEvent != null &&
+    elapsedSec >= countdownStart &&
+    elapsedSec < nextEvent &&
+    !isPaused &&
+    !isRoundBreak
   );
 
   // Décompte (jamais 0s)
@@ -329,13 +396,18 @@ export default function Screen() {
   const isRoundIntro = Date.now() < (introGuardUntilRef?.current || 0);
   const introRemaining = 0;
 
-  // Barre de progression
+  // Barre de progression (autonome, sans dépendre d'une var qEnd externe)
+  const boundaryLocal = (typeof boundary !== "undefined" ? boundary : effectiveNextTimeSec);
+  const qEndLocal = boundaryLocal != null ? boundaryLocal - REVEAL_DURATION_SEC : null;
+
   const canShowTimeBar = Boolean(
-    isQuestionPhase && qStart != null && qEnd != null && qEnd > qStart
+    isQuestionPhase && qStartEffective != null && qEndLocal != null && qEndLocal > qStartEffective
   );
   const progress = canShowTimeBar
-    ? Math.min(1, Math.max(0, (elapsedSec - qStart) / (qEnd - qStart)))
+    ? Math.min(1, Math.max(0, (elapsedSec - qStartEffective) / (qEndLocal - qStartEffective)))
     : 0;
+
+
 
   // Phrases de révélation & réponse principale
   const revealPhrase = useMemo(
@@ -447,7 +519,7 @@ export default function Screen() {
           </div>
         ) : currentQuestion ? (
           <>
-            {/* fin de manche / question / révélation */}
+            {/* fin de manche / intro de manche / question / révélation */}
             {isRoundBreak ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
                 <h1 style={{ fontSize: "2rem", margin: 0 }}>
@@ -455,6 +527,15 @@ export default function Screen() {
                 </h1>
                 <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>
                   (Ici, le tableau des scores — placeholder)
+                </div>
+              </div>
+            ) : isRoundIntroPhase ? (
+              <div style={{ marginTop: 8, marginBottom: 4 }}>
+                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 6 }}>
+                  {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
+                </div>
+                <div style={{ fontSize: "5rem", fontWeight: 800, lineHeight: 1 }}>
+                  {introCountdownSec}
                 </div>
               </div>
             ) : isQuestionPhase ? (
@@ -538,13 +619,6 @@ export default function Screen() {
                 />
               </div>
             ) : null}
-
-            <div style={{ marginTop: 12, opacity: 0.7, fontSize: 14 }}>
-              Temps écoulé : {formatHMS(elapsedSec)}
-              {Number.isFinite(getTimeSec(currentQuestion)) && (
-                <> — Timecode : {formatHMS(getTimeSec(currentQuestion))}</>
-              )}
-            </div>
           </>
         ) : (
           <>

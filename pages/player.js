@@ -31,6 +31,9 @@ const DEFAULT_REVEAL_PHRASES = [
 // Phases
 const REVEAL_DURATION_SEC = 20; // 15s réponse + 5s compte à rebours
 const COUNTDOWN_START_SEC = 5;
+// Intro au début de chaque manche (mange ce temps sur la 1ʳᵉ question de la manche)
+const ROUND_START_INTRO_SEC = 5;
+
 
 // Barre de temps
 const BAR_H = 6;
@@ -222,7 +225,7 @@ export default function Player() {
     return () => unsub();
   }, []);
 
-  // Timer local
+  // Timer local (avec clamp fin de quiz)
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
@@ -230,19 +233,34 @@ export default function Player() {
     }
     if (isPaused && pauseAtMs) {
       const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
-      setElapsedSec(e < 0 ? 0 : e);
+      const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
+      setElapsedSec(clamped < 0 ? 0 : clamped);
       return;
     }
     if (!isRunning) {
       setElapsedSec(0);
       return;
     }
-    const tick = () =>
-      setElapsedSec(Math.max(0, Math.floor((Date.now() - quizStartMs) / 1000)));
-    tick();
-    const id = setInterval(tick, 500);
+
+    const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
+    const first = computeNow();
+    if (Number.isFinite(quizEndSec) && first >= quizEndSec) {
+      setElapsedSec(Math.max(0, quizEndSec));
+      return;
+    }
+    setElapsedSec(first < 0 ? 0 : first);
+
+    const id = setInterval(() => {
+      const raw = computeNow();
+      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+        setElapsedSec(Math.max(0, quizEndSec));
+        clearInterval(id);
+      } else {
+        setElapsedSec(raw < 0 ? 0 : raw);
+      }
+    }, 500);
     return () => clearInterval(id);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs]);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
   // Anti-flicker : petite fenêtre d’ignorance du décompte après seek/reprise (réserve)
   useEffect(() => {
@@ -329,6 +347,54 @@ export default function Player() {
   const boundary = effectiveNextTimeSec;
   const qEnd = boundary != null ? boundary - REVEAL_DURATION_SEC : null;
 
+  // 1ʳᵉ question de la manche courante ?
+  const firstQuestionTimeInCurrentRound = (() => {
+    for (let i = 0; i < sorted.length; i++) {
+      const t = getTimeSec(sorted[i]);
+      if (!Number.isFinite(t)) continue;
+      if (t >= currentRoundStart && t < currentRoundEnd) return t; // sorted asc → premier suffit
+    }
+    return null;
+  })();
+
+  const isFirstQuestionOfRound =
+    Number.isFinite(qStart) &&
+    Number.isFinite(firstQuestionTimeInCurrentRound) &&
+    qStart === firstQuestionTimeInCurrentRound;
+
+  // Fenêtre d’intro (compte à rebours 5→1) au S.D. de la 1ʳᵉ question de la manche
+  const introStart = isFirstQuestionOfRound ? qStart : null;
+  const introEnd = isFirstQuestionOfRound && Number.isFinite(qStart)
+    ? qStart + ROUND_START_INTRO_SEC
+    : null;
+
+  const isRoundIntroPhase = Boolean(
+    isFirstQuestionOfRound &&
+    !isPaused &&
+    !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
+    introStart != null &&
+    elapsedSec >= introStart &&
+    elapsedSec < introEnd
+  );
+
+
+  // Le temps “utilisable” pour répondre commence après l’intro
+  const qStartEffective = isFirstQuestionOfRound && Number.isFinite(qStart)
+    ? qStart + ROUND_START_INTRO_SEC
+    : qStart;
+
+  // Compte à rebours affiché 5..1
+  const introCountdownSec = isRoundIntroPhase
+    ? Math.max(1, Math.ceil((introEnd ?? 0) - elapsedSec))
+    : null;
+
+  // Numéro de manche pour l’UI
+  const roundIdxForCurrentQuestion = Number.isFinite(qStart)
+    ? roundIndexOfTime(Math.max(0, qStart), roundOffsetsSec)
+    : null;
+  const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
+
+
   // Fin de manche (pause posée à la frontière par l’admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
   const isRoundBreak = Boolean(isPaused && endedRoundIndex != null);
@@ -340,32 +406,33 @@ export default function Player() {
 
   const isQuestionPhase = Boolean(
     currentQuestion &&
-      qStart != null &&
-      nextEvent != null &&
-      elapsedSec >= qStart &&
-      elapsedSec < revealStart &&
-      !isPaused &&
-      !isRoundBreak
+    qStartEffective != null &&
+    nextEvent != null &&
+    elapsedSec >= qStartEffective &&
+    elapsedSec < revealStart &&
+    !isPaused &&
+    !isRoundBreak
   );
+
 
   const isRevealAnswerPhase = Boolean(
     currentQuestion &&
-      revealStart != null &&
-      countdownStart != null &&
-      elapsedSec >= revealStart &&
-      elapsedSec < countdownStart &&
-      !isPaused &&
-      !isRoundBreak
+    revealStart != null &&
+    countdownStart != null &&
+    elapsedSec >= revealStart &&
+    elapsedSec < countdownStart &&
+    !isPaused &&
+    !isRoundBreak
   );
 
   const isCountdownPhase = Boolean(
     currentQuestion &&
-      countdownStart != null &&
-      nextEvent != null &&
-      elapsedSec >= countdownStart &&
-      elapsedSec < nextEvent &&
-      !isPaused &&
-      !isRoundBreak
+    countdownStart != null &&
+    nextEvent != null &&
+    elapsedSec >= countdownStart &&
+    elapsedSec < nextEvent &&
+    !isPaused &&
+    !isRoundBreak
   );
 
   // Décompte (jamais 0s)
@@ -389,11 +456,12 @@ export default function Player() {
 
   // Barre de progression
   const canShowTimeBar = Boolean(
-    isQuestionPhase && qStart != null && qEnd != null && qEnd > qStart
+    isQuestionPhase && qStartEffective != null && qEnd != null && qEnd > qStartEffective
   );
   const progress = canShowTimeBar
-    ? Math.min(1, Math.max(0, (elapsedSec - qStart) / (qEnd - qStart)))
+    ? Math.min(1, Math.max(0, (elapsedSec - qStartEffective) / (qEnd - qStartEffective)))
     : 0;
+
 
   // Messages d’attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
@@ -583,7 +651,16 @@ export default function Player() {
       ) : currentQuestion ? (
         <>
           {/* question / révélation / décompte */}
-          {isQuestionPhase ? (
+          {isRoundIntroPhase ? (
+            <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
+              <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
+                {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
+              </div>
+              <div style={{ fontSize: "4rem", fontWeight: 800, lineHeight: 1 }}>
+                {introCountdownSec}
+              </div>
+            </div>
+          ) : isQuestionPhase ? (
             <h2 style={{ fontSize: "1.5rem" }}>{currentQuestion.text}</h2>
           ) : isRevealAnswerPhase ? (
             <div style={{ marginTop: 8, marginBottom: 4 }}>

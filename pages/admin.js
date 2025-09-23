@@ -6,7 +6,6 @@ import {
   query,
   orderBy,
   getDocs,
-  getDoc,
   doc,
   updateDoc,
   deleteDoc,
@@ -89,6 +88,50 @@ function roundIndexOfTime(t, offsets) {
   return Math.max(0, idx);
 }
 
+/* ---- TimeMusic rules ---- */
+const TIME_MUSIC_MIN_SEC = 20;       // reveal incompressible
+const DEFAULT_TIME_MUSIC_SEC = 35;   // durée par défaut d’un bloc (ex: 15s jeu + 20s reveal)
+
+function clampTimeMusicSec(sec) {
+  const n = Number(sec);
+  if (!Number.isFinite(n)) return DEFAULT_TIME_MUSIC_SEC;
+  return Math.max(TIME_MUSIC_MIN_SEC, Math.floor(n));
+}
+
+/* ---- Color utils ---- */
+function withAlpha(hex, alpha = 0.35) {
+  if (typeof hex !== "string") return hex;
+  const s0 = hex.trim();
+
+  // On ne traite que les hex; si ce n’est pas un #..., on rend tel quel.
+  if (!s0.startsWith("#")) return hex;
+
+  const s = s0.slice(1); // sans '#'
+  const A = Math.max(0, Math.min(1, Number(alpha)));
+
+  // #RGB ou #RGBA
+  if (s.length === 3 || s.length === 4) {
+    const r = parseInt(s[0] + s[0], 16);
+    const g = parseInt(s[1] + s[1], 16);
+    const b = parseInt(s[2] + s[2], 16);
+    // On ignore l'alpha du code (#RGBA) et on applique A
+    return `rgba(${r}, ${g}, ${b}, ${A})`;
+  }
+
+  // #RRGGBB ou #RRGGBBAA
+  if (s.length === 6 || s.length === 8) {
+    const r = parseInt(s.slice(0, 2), 16);
+    const g = parseInt(s.slice(2, 4), 16);
+    const b = parseInt(s.slice(4, 6), 16);
+    // On ignore l'alpha existant (les 2 derniers chars si présents) et on applique A
+    return `rgba(${r}, ${g}, ${b}, ${A})`;
+  }
+
+  // Format non pris en charge → on rend tel quel
+  return hex;
+}
+
+
 /* ======================== Component ======================== */
 export default function Admin() {
   /* ------------ Data & UI ------------ */
@@ -135,9 +178,10 @@ export default function Admin() {
   const [newQ, setNewQ] = useState({
     text: "",
     answersCsv: "",
-    timecodeStr: "",
+    timeMusicStr: "",
     imageFile: null,
   });
+
   const DEFAULT_REVEAL_PHRASES = [
     "La réponse était :",
     "Il fallait trouver :",
@@ -186,7 +230,7 @@ export default function Admin() {
         const offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
         setRoundOffsetsSec(offs);
         setRoundOffsetsStr(
-        offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : ""))
+          offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : ""))
         );
       }
       if (typeof d.endOffsetSec === "number") {
@@ -273,8 +317,8 @@ export default function Admin() {
       Number.isFinite(quizEndSec) && first >= quizEndSec
         ? quizEndSec
         : first < 0
-        ? 0
-        : first
+          ? 0
+          : first
     );
 
     const id = setInterval(() => {
@@ -317,6 +361,41 @@ export default function Admin() {
 
   /* =================== Actions =================== */
 
+  async function recalcAllTimecodesFromOrder() {
+    try {
+      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+      const snap = await getDocs(q);
+      const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      let t = 0;
+      const updates = [];
+      for (const it of docs) {
+        const newTimecode = t;
+        const tm = clampTimeMusicSec(it.timeMusicSec);
+        if (!Number.isFinite(it.timecodeSec) || it.timecodeSec !== newTimecode) {
+          updates.push({ id: it.id, timecodeSec: newTimecode });
+        }
+        t += tm;
+      }
+
+      if (updates.length) {
+        const batch = writeBatch(db);
+        for (const u of updates) {
+          batch.update(doc(db, "LesQuestions", u.id), { timecodeSec: u.timecodeSec });
+        }
+        await batch.commit();
+      }
+
+      // Rafraîchit la table
+      const snap2 = await getDocs(q);
+      setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      console.error("recalcAllTimecodesFromOrder error:", e);
+      alert("Échec du recalcul des timecodes : " + (e?.message || e));
+    }
+  }
+
+
   // Modifs inline des champs question
   const handleFieldChange = (id, field, value) => {
     setItems((prev) =>
@@ -324,7 +403,7 @@ export default function Admin() {
         if (it.id !== id) return it;
         const next = { ...it, [field]: value };
         if (field === "answersCsv") next.answers = parseCSV(value);
-        if (field === "timecodeStr") next.timecodeSec = parseHMS(value);
+        if (field === "timeMusicStr") next.timeMusicSec = clampTimeMusicSec(parseHMS(value));
         return next;
       })
     );
@@ -389,15 +468,14 @@ export default function Admin() {
     try {
       const storageRef = ref(
         storage,
-        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${
-          file.name
+        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${file.name
         }`
       );
       const task = uploadBytesResumable(storageRef, file);
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => {},
+          () => { },
           (err) => {
             console.error("[UPLOAD] Erreur:", err);
             alert("Échec de l’upload : " + (err?.message || err));
@@ -426,22 +504,25 @@ export default function Admin() {
       setSavingId(it.id);
 
       const hasAnswersCsv = typeof it.answersCsv === "string";
-      const hasTimecodeStr = typeof it.timecodeStr === "string";
+      const hasTimeMusicStr = typeof it.timeMusicStr === "string";
+
+      const nextTimeMusicSec =
+        hasTimeMusicStr
+          ? clampTimeMusicSec(parseHMS(it.timeMusicStr))
+          : Number.isFinite(it.timeMusicSec)
+            ? clampTimeMusicSec(it.timeMusicSec)
+            : DEFAULT_TIME_MUSIC_SEC;
 
       const payload = {
         text: it.text ?? "",
         answers: hasAnswersCsv
           ? parseCSV(it.answersCsv)
           : Array.isArray(it.answers)
-          ? it.answers
-          : [],
-        timecodeSec: hasTimecodeStr
-          ? parseHMS(it.timecodeStr)
-          : typeof it.timecodeSec === "number"
-          ? it.timecodeSec
-          : typeof it.timecode === "number"
-          ? Math.round(it.timecode * 60)
-          : null,
+            ? it.answers
+            : [],
+        timeMusicSec: nextTimeMusicSec,
+        // timecodeSec se recalculera automatiquement après changements d’ordre/TimeMusic
+        timecodeSec: typeof it.timecodeSec === "number" ? it.timecodeSec : null,
         imageUrl: it.imageUrl || "",
         order:
           typeof it.order === "number"
@@ -462,6 +543,7 @@ export default function Admin() {
         const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
         const snap = await getDocs(q);
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        await recalcAllTimecodesFromOrder();
       })();
     }
   };
@@ -471,6 +553,7 @@ export default function Admin() {
     const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
     const snap = await getDocs(q);
     setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    await recalcAllTimecodesFromOrder();
   };
 
   // Reorder
@@ -495,6 +578,7 @@ export default function Admin() {
     const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
     const snap = await getDocs(q);
     setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    await recalcAllTimecodesFromOrder();
   };
 
   // Init order (one-time)
@@ -510,6 +594,7 @@ export default function Admin() {
     const q2 = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
     const snap2 = await getDocs(q2);
     setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
+    await recalcAllTimecodesFromOrder();
   };
 
   // Create
@@ -520,21 +605,22 @@ export default function Admin() {
       if (newQ.imageFile) imageUrl = (await uploadImage(newQ.imageFile)) || "";
 
       const answers = parseCSV(newQ.answersCsv);
-      const timecodeSec = parseHMS(newQ.timecodeStr);
+      const timeMusicSec = clampTimeMusicSec(parseHMS(newQ.timeMusicStr));
       const order =
         items.length > 0
           ? Math.max(...items.map((x) => x.order || 0)) + 1000
           : 1000;
-
       const cleanedRevealPhrases = (newRevealPhrases ?? [])
         .map((s) => (s ?? "").trim())
         .filter(Boolean)
         .slice(0, 5);
 
+
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
-        timecodeSec,
+        timeMusicSec,
+        timecodeSec: null, // sera calculé par recalcAllTimecodesFromOrder
         imageUrl,
         createdAt: new Date(),
         order,
@@ -544,9 +630,10 @@ export default function Admin() {
       setNewQ({
         text: "",
         answersCsv: "",
-        timecodeStr: "",
+        timeMusicStr: "",
         imageFile: null,
       });
+
       setNewRevealPhrases(["", "", "", "", ""]);
     } catch (err) {
       console.error("createOne error:", err);
@@ -556,6 +643,7 @@ export default function Admin() {
       const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
       const snap = await getDocs(q);
       setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      await recalcAllTimecodesFromOrder();
     }
   };
 
@@ -892,26 +980,6 @@ export default function Admin() {
     }
   }
 
-  async function fixRoundsInConfig() {
-    try {
-      const refCfg = doc(db, "quiz", "config");
-      const snap = await getDoc(refCfg);
-      const d = snap.data() || {};
-      const fixed = coerceOffsetsToNumbers(d.roundOffsetsSec || []);
-      await setDoc(refCfg, { roundOffsetsSec: fixed }, { merge: true });
-      setRoundOffsetsSec(fixed);
-      setRoundOffsetsStr(
-        fixed.map((s) => (typeof s === "number" ? formatHMS(s) : ""))
-      );
-      setNotice("Manches réparées ✅");
-      setTimeout(() => setNotice(null), 1500);
-    } catch (e) {
-      console.error(e);
-      setNotice("Échec de la réparation des manches");
-      setTimeout(() => setNotice(null), 2000);
-    }
-  }
-
   /* =================== Derived =================== */
   const currentRoundIndex = useMemo(() => {
     let lastIdx = -1;
@@ -952,15 +1020,22 @@ export default function Admin() {
   );
 
   const roundColors = [
-    "#fef08a", // M1
+    "#e96db1ff", // M1
     "#fb923c", // M2
     "#a78bfa", // M3
     "#93c5fd", // M4
     "#86efac", // M5
     "#5eead4", // M6
-    "#f472b6", // M7
-    "#f59e0b", // M8
+    "#cf72f4ff", // M7
+    "#2b7bf3ff", // M8
   ];
+
+  // Note: tu peux mettre #RRGGBB, #RRGGBBAA, #RGB ou #RGBA — l’alpha inclus sera ignoré
+  // et remplacé par ROUND_BG_ALPHA pour une cohérence visuelle.
+
+  // Alpha de fond des lignes du tableau (réglable à volonté : 0..1)
+  const ROUND_BG_ALPHA = 0.70; // ← change cette valeur selon tes envies
+
 
   const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
   const currentRoundNumber = currentRoundIndex + 1;
@@ -968,18 +1043,18 @@ export default function Admin() {
   const mainButtonLabel = isQuizEnded
     ? "Fin du quiz"
     : !isRunning
-    ? "Démarrer le quiz"
-    : isPaused
-    ? "Manche suivante"
-    : `Manche ${currentRoundNumber}`;
+      ? "Démarrer le quiz"
+      : isPaused
+        ? "Manche suivante"
+        : `Manche ${currentRoundNumber}`;
 
   const mainButtonRoundIdx = isQuizEnded
     ? null
     : !isRunning
-    ? null
-    : isPaused
-    ? nextRoundIndex
-    : currentRoundIndex;
+      ? null
+      : isPaused
+        ? nextRoundIndex
+        : currentRoundIndex;
 
   const mainButtonColor =
     mainButtonRoundIdx != null && mainButtonRoundIdx >= 0
@@ -1009,8 +1084,11 @@ export default function Admin() {
               <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>
                 Réponses acceptées
               </th>
-              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>
-                Timecode (hh:mm:ss)
+              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>
+                TimeMusic
+              </th>
+              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>
+                TimeCode
               </th>
               <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>
                 Image
@@ -1018,6 +1096,7 @@ export default function Admin() {
               <th style={{ width: 180, padding: "10px" }}>Actions</th>
             </tr>
           </thead>
+
           <tbody>
             {items.map((it, i) => {
               const answersCsv = it.answersCsv ?? toCSV(it.answers || []);
@@ -1025,13 +1104,35 @@ export default function Admin() {
                 typeof it.timecodeStr === "string"
                   ? it.timecodeStr
                   : typeof it.timecodeSec === "number"
-                  ? formatHMS(it.timecodeSec)
-                  : typeof it.timecode === "number"
-                  ? formatHMS(Math.round(it.timecode * 60))
-                  : "";
+                    ? formatHMS(it.timecodeSec)
+                    : typeof it.timecode === "number"
+                      ? formatHMS(Math.round(it.timecode * 60))
+                      : "";
+              const timeMusicStr =
+                typeof it.timeMusicStr === "string"
+                  ? it.timeMusicStr
+                  : typeof it.timeMusicSec === "number"
+                    ? formatHMS(it.timeMusicSec)
+                    : "";
+
+              // Détermine la couleur de fond de la ligne en fonction de la manche
+              const tSec = getTimeSec(it);
+              let rowBg = undefined;
+
+              if (Number.isFinite(tSec) && !(Number.isFinite(quizEndSec) && tSec >= quizEndSec)) {
+                // trouver l’index de manche pour ce timecode (dans [offset_i, offset_{i+1}[ )
+                let rIdx = -1;
+                for (let k = 0; k < roundOffsetsSec.length; k++) {
+                  const v = roundOffsetsSec[k];
+                  if (Number.isFinite(v) && tSec >= v) rIdx = k;
+                }
+                const base = roundColors[rIdx] || null;
+                rowBg = base ? withAlpha(base, ROUND_BG_ALPHA) : undefined;
+              }
+
 
               return (
-                <tr key={it.id} style={{ borderTop: "1px solid #333" }}>
+                <tr key={it.id} style={{ borderTop: "1px solid #333", background: rowBg }}>
                   <td style={{ verticalAlign: "top", padding: "12px", whiteSpace: "nowrap" }}>
                     <button onClick={() => swapOrder(i, i - 1)} disabled={i === 0}>
                       ↑
@@ -1072,20 +1173,32 @@ export default function Admin() {
                     </div>
                   </td>
 
-                  <td style={{ width: "15%", verticalAlign: "top", padding: "12px" }}>
+                  <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
                     <input
                       type="text"
-                      value={timecodeStr}
-                      onChange={(e) => handleFieldChange(it.id, "timecodeStr", e.target.value)}
-                      placeholder="ex: 01:23:45 ou 03:30"
+                      value={timeMusicStr}
+                      onChange={(e) => handleFieldChange(it.id, "timeMusicStr", e.target.value)}
+                      placeholder="ex: 00:00:35"
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
-                    {!it.timecodeStr && typeof it.timecodeSec !== "number" && (
+                    {!it.timeMusicStr && typeof it.timeMusicSec !== "number" && (
                       <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        Laisse vide si tu ne veux pas caler cette question
+                        Défaut {DEFAULT_TIME_MUSIC_SEC}s (min {TIME_MUSIC_MIN_SEC}s)
                       </div>
                     )}
                   </td>
+
+                  <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
+                    <input
+                      type="text"
+                      value={timecodeStr}
+                      readOnly
+                      disabled
+                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0", opacity: 0.7 }}
+                      title="Calculé automatiquement d'après l’ordre et TimeMusic"
+                    />
+                  </td>
+
 
                   <td style={{ width: "15%", verticalAlign: "top", padding: "12px" }}>
                     {it.imageUrl ? (
@@ -1135,7 +1248,7 @@ export default function Admin() {
         </table>
       </div>
     );
-  }, [items, loading, savingId, savedRowId]);
+  }, [items, loading, savingId, savedRowId, roundOffsetsSec, quizEndSec]);
 
   /* =================== Render =================== */
   return (
@@ -1327,21 +1440,6 @@ export default function Admin() {
               />
             </label>
           ))}
-          <button
-            onClick={fixRoundsInConfig}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 8,
-              border: "1px solid #2a2a2a",
-              background: "#e5e7eb",
-              color: "#000",
-              fontWeight: 600,
-              cursor: "pointer",
-            }}
-            title="Convertit les manches stockées en hh:mm:ss en secondes numériques"
-          >
-            Réparer les manches
-          </button>
         </div>
 
         {/* Fin du quiz */}
@@ -1442,15 +1540,16 @@ export default function Admin() {
           </label>
 
           <label>
-            Timecode (hh:mm:ss)
+            TimeMusic (hh:mm:ss)
             <input
               type="text"
-              value={newQ.timecodeStr}
-              onChange={(e) => setNewQ((p) => ({ ...p, timecodeStr: e.target.value }))}
-              placeholder="ex: 00:07:30"
+              value={newQ.timeMusicStr}
+              onChange={(e) => setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))}
+              placeholder="ex: 00:00:35"
               style={{ width: "100%", boxSizing: "border-box" }}
             />
           </label>
+
 
           <label>
             Image (optionnelle)
