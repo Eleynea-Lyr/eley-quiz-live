@@ -1,5 +1,5 @@
 // /pages/admin.js
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { db, storage } from "../lib/firebase";
 import {
   collection,
@@ -17,6 +17,30 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
+
+// Couleurs distinctes (thème sombre friendly)
+const PLAYER_COLORS = [
+  "#f87171", "#fb923c", "#fbbf24", "#a3e635",
+  "#34d399", "#22d3ee", "#60a5fa", "#818cf8",
+  "#a78bfa", "#f472b6", "#fda4af", "#f59e0b",
+  "#10b981", "#06b6d4", "#3b82f6", "#8b5cf6",
+];
+
+// Normalisation alpha (casse/accents-insensible) pour le tri
+function normKey(s) {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function pickColorDifferent(prev) {
+  const pool = PLAYER_COLORS.filter((c) => c !== prev);
+  const bag = pool.length ? pool : PLAYER_COLORS;
+  return bag[Math.floor(Math.random() * bag.length)];
+}
+
 
 /* ========================= Helpers ========================= */
 function parseCSV(input = "") {
@@ -143,6 +167,21 @@ export default function Admin() {
   const [notice, setNotice] = useState(null);
   const [creating, setCreating] = useState(false);
   const [mainBtnBusy, setMainBtnBusy] = useState(false);
+  const [adminTab, setAdminTab] = useState("players"); // "players" | "questions"
+
+  // Panneau joueurs
+  const [players, setPlayers] = useState([]);
+  const [playersLoading, setPlayersLoading] = useState(true);
+  const assignedColorRef = useRef(new Set()); // évite de réassigner en boucle
+  const lastAssignedColorRef = useRef(null); // dernière couleur attribuée (anti doublon consécutif)
+
+
+  const connectedCount = useMemo(
+    () => players.filter((p) => !p?.isKicked).length,
+    [players]
+  );
+
+
 
   /* ------------ Rounds & End ------------ */
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
@@ -1250,6 +1289,119 @@ export default function Admin() {
     );
   }, [items, loading, savingId, savedRowId, roundOffsetsSec, quizEndSec]);
 
+  useEffect(() => {
+    const playersCol = collection(doc(db, "quiz", "state"), "players");
+
+    const unsub = onSnapshot(playersCol, (snap) => {
+      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      // Assigner une couleur random si absente (une seule fois par id)
+      arr.forEach((p) => {
+        if (!p.color && !assignedColorRef.current.has(p.id)) {
+          assignedColorRef.current.add(p.id);
+          const prev = lastAssignedColorRef.current;
+          const color = pickColorDifferent(prev);
+          lastAssignedColorRef.current = color;
+
+          // Fire & forget (ne bloque pas l'UI si échec)
+          updateDoc(doc(playersCol, p.id), { color }).catch(() => { });
+        }
+      });
+
+      // Tri alphabétique insensible à casse/accents
+      arr.sort((a, b) => normKey(a.name).localeCompare(normKey(b.name)));
+
+      setPlayers(arr);
+      setPlayersLoading(false);
+    });
+
+    return () => unsub();
+  }, []);
+
+
+  // Actions panneau joueurs
+  async function rejectPlayer(id) {
+    try {
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+      await updateDoc(doc(playersCol, id), { nameStatus: "rejected" });
+    } catch (e) {
+      console.error("rejectPlayer", e);
+    }
+  }
+
+  async function kickPlayer(id) {
+    try {
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+      await updateDoc(doc(playersCol, id), { isKicked: true });
+    } catch (e) {
+      console.error("kickPlayer", e);
+    }
+  }
+
+  // --- DEV ONLY: ajouter des joueurs de test ---
+  const DEV_NAMES = [
+    "Alice", "Bob", "Chloé", "David", "Emma", "Fabien", "Gaspard", "Hugo", "Inès", "Jules",
+    "Kenza", "Léa", "Malo", "Naël", "Ophélie", "Paul", "Quentin", "Rayan", "Sofia", "Théo",
+  ];
+
+  async function devAddFakePlayer() {
+    try {
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+      const name = DEV_NAMES[Math.floor(Math.random() * DEV_NAMES.length)];
+      const payload = {
+        name,
+        nameNorm: normKey(name),
+        createdAt: serverTimestamp(),
+        score: 0,
+        isKicked: false,
+        nameStatus: "ok",
+        color: (lastAssignedColorRef.current = pickColorDifferent(lastAssignedColorRef.current)),
+      };
+      await addDoc(playersCol, payload);
+    } catch (e) {
+      console.error("devAddFakePlayer", e);
+    }
+  }
+
+  async function devAddFivePlayers() {
+    for (let i = 0; i < 5; i++) {
+      // petite pause pour laisser Firestore respirer
+      // eslint-disable-next-line no-await-in-loop
+      await devAddFakePlayer();
+    }
+  }
+
+  // Supprime tous les joueurs (en batchs de 400)
+  async function deleteAllPlayers() {
+    const playersCol = collection(doc(db, "quiz", "state"), "players");
+    const snap = await getDocs(playersCol);
+    const ids = snap.docs.map((d) => d.id);
+
+    while (ids.length) {
+      const chunk = ids.splice(0, 400);
+      const batch = writeBatch(db);
+      chunk.forEach((id) => batch.delete(doc(playersCol, id)));
+      await batch.commit();
+    }
+  }
+
+  async function resetQuizAndPlayers() {
+    const ok = window.confirm("Réinitialiser le quiz ET supprimer tous les joueurs ?");
+    if (!ok) return;
+    try {
+      // ta fonction existante qui remet l'état du quiz à zéro
+      await Promise.resolve(resetQuiz());
+    } catch (e) {
+      console.warn("resetQuiz a échoué ou n'est pas async, on continue la purge des joueurs.", e);
+    }
+    try {
+      await deleteAllPlayers();
+    } catch (e) {
+      console.error("Suppression des joueurs échouée :", e);
+    }
+  }
+
+
   /* =================== Render =================== */
   return (
     <div style={{ background: "#0a0a1a", color: "white", minHeight: "100vh", padding: 20 }}>
@@ -1262,7 +1414,7 @@ export default function Admin() {
           padding: "12px 20px",
         }}
       >
-        <h1 style={{ margin: 0 }}>Admin — Les Questions</h1>
+        <h1 style={{ margin: 0 }}>Admin</h1>
       </div>
 
       {/* Toolbar */}
@@ -1309,7 +1461,7 @@ export default function Admin() {
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#fecaca", // rouge doux permanent
+            background: "#fecaca",
             color: "#000",
             fontWeight: 600,
             cursor: pauseCursor,
@@ -1371,7 +1523,7 @@ export default function Admin() {
         </button>
 
         <button
-          onClick={resetQuiz}
+          onClick={resetQuizAndPlayers}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
@@ -1494,7 +1646,7 @@ export default function Admin() {
         </div>
       )}
 
-      {/* Création question */}
+      {/* ===== Onglets + contenu ===== */}
       <div
         style={{
           margin: "24px -20px 8px",
@@ -1503,103 +1655,274 @@ export default function Admin() {
           padding: "10px 20px",
         }}
       >
-        <h2 style={{ margin: 0 }}>Créer une nouvelle question</h2>
-      </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "minmax(0, 1fr) 360px",
-          gap: 16,
-          alignItems: "start",
-          maxWidth: 1100,
-          marginBottom: 16,
-        }}
-      >
-        {/* Colonne gauche */}
-        <div style={{ display: "grid", gap: 8 }}>
-          <label>
-            Question
-            <textarea
-              rows={2}
-              value={newQ.text}
-              onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
-              style={{ width: "100%", boxSizing: "border-box" }}
-            />
-          </label>
-
-          <label>
-            Réponses acceptées (séparées par des virgules)
-            <input
-              type="text"
-              value={newQ.answersCsv}
-              onChange={(e) => setNewQ((p) => ({ ...p, answersCsv: e.target.value }))}
-              placeholder="ex: Mario, Super Mario"
-              style={{ width: "100%", boxSizing: "border-box" }}
-            />
-          </label>
-
-          <label>
-            TimeMusic (hh:mm:ss)
-            <input
-              type="text"
-              value={newQ.timeMusicStr}
-              onChange={(e) => setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))}
-              placeholder="ex: 00:00:35"
-              style={{ width: "100%", boxSizing: "border-box" }}
-            />
-          </label>
-
-
-          <label>
-            Image (optionnelle)
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) =>
-                setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))
-              }
-            />
-          </label>
-
-          <div>
-            <button onClick={createOne} disabled={creating}>
-              {creating ? "Création…" : "Créer la question"}
-            </button>
-          </div>
+        {/* Barre d’onglets */}
+        <div style={{ marginTop: 16, borderBottom: "1px solid #1f2a44", display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            onClick={() => setAdminTab("players")}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #1f2a44",
+              background: adminTab === "players" ? "#0b1e3d" : "transparent",
+              color: "#e6eeff",
+              cursor: "pointer",
+              fontWeight: adminTab === "players" ? 700 : 500,
+            }}
+          >
+            Joueurs
+          </button>
+          <button
+            type="button"
+            onClick={() => setAdminTab("questions")}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "1px solid #1f2a44",
+              background: adminTab === "questions" ? "#0b1e3d" : "transparent",
+              color: "#e6eeff",
+              cursor: "pointer",
+              fontWeight: adminTab === "questions" ? 700 : 500,
+            }}
+          >
+            Questions
+          </button>
         </div>
 
-        {/* Colonne droite : phrases de révélation */}
-        <fieldset style={{ border: "1px solid #333", padding: 12, borderRadius: 8 }}>
-          <legend style={{ padding: "0 6px" }}>Phrase de réponse aléatoire (max 5)</legend>
-
-          {newRevealPhrases.map((val, i) => (
-            <div
-              key={i}
-              style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
-            >
-              <label style={{ width: 120 }}>Phrase {i + 1}</label>
-              <input
-                type="text"
-                value={val}
-                onChange={(e) => {
-                  const next = [...newRevealPhrases];
-                  next[i] = e.target.value;
-                  setNewRevealPhrases(next);
-                }}
-                placeholder={DEFAULT_REVEAL_PHRASES[i] || "Ex: La réponse était :"}
-                style={{ flex: 1, padding: 8 }}
-              />
+        {/* Onglet Joueurs */}
+        {adminTab === "players" && (
+          <div style={{ marginTop: 16 }}>
+            <h2 style={{ margin: 0 }}>Joueurs</h2>
+            <div style={{ opacity: 0.9, marginTop: 6 }}>
+              Joueurs connectés : <b>{connectedCount}</b>
+              {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
             </div>
-          ))}
+            {/* DEV: Ajout rapide de joueurs factices */}
+            <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={devAddFakePlayer}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#d1fae5", color: "#064e3b", fontWeight: 600 }}
+                title="Ajouter un joueur de test"
+              >
+                +1 joueur test
+              </button>
+              <button
+                type="button"
+                onClick={devAddFivePlayers}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#bfdbfe", color: "#1e3a8a", fontWeight: 600 }}
+                title="Ajouter 5 joueurs de test"
+              >
+                +5 joueurs test
+              </button>
+            </div>
 
-          <div style={{ fontSize: 12, opacity: 0.7 }}>
-            Laisse vide pour utiliser la liste par défaut.
+            {/* Tableau joueurs */}
+            <div style={{ marginTop: 12, overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
+                <thead>
+                  <tr style={{ background: "#0b1e3d" }}>
+                    <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueur</th>
+                    <th style={{ textAlign: "left", padding: "10px 8px", width: 140 }}>Statut</th>
+                    <th style={{ textAlign: "left", padding: "10px 8px", width: 220 }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {players.map((p) => {
+                    const status = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
+                    const statusBg =
+                      p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
+                    const statusColor =
+                      p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
+
+                    return (
+                      <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
+                        <td style={{ padding: "8px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <span
+                              title={p.color || ""}
+                              style={{
+                                width: 14,
+                                height: 14,
+                                borderRadius: 4,
+                                background: p.color || "#6b7280",
+                                display: "inline-block",
+                                border: "1px solid rgba(255,255,255,0.2)",
+                              }}
+                            />
+                            <span style={{ fontWeight: 600 }}>{p.name || "(sans nom)"}</span>
+                          </div>
+                        </td>
+                        <td style={{ padding: "8px" }}>
+                          <span
+                            style={{
+                              display: "inline-block",
+                              padding: "4px 8px",
+                              borderRadius: 6,
+                              background: statusBg,
+                              color: statusColor,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {status}
+                          </span>
+                        </td>
+                        <td style={{ padding: "8px" }}>
+                          <button
+                            onClick={() => rejectPlayer(p.id)}
+                            disabled={p.isKicked || p.nameStatus === "rejected"}
+                            style={{
+                              padding: "6px 10px",
+                              borderRadius: 6,
+                              border: "1px solid #2a2a2a",
+                              background: "#fde68a",
+                              color: "#111827",
+                              fontWeight: 600,
+                              marginRight: 8,
+                              opacity: p.isKicked || p.nameStatus === "rejected" ? 0.6 : 1,
+                              cursor:
+                                p.isKicked || p.nameStatus === "rejected" ? "not-allowed" : "pointer",
+                            }}
+                            title="Refuser ce nom (le joueur devra en choisir un autre)"
+                          >
+                            Refuser
+                          </button>
+                          <button
+                            onClick={() => kickPlayer(p.id)}
+                            disabled={p.isKicked}
+                            style={{
+                              padding: "6px 10px",
+                              borderRadius: 6,
+                              border: "1px solid #2a2a2a",
+                              background: "#fecaca",
+                              color: "#111827",
+                              fontWeight: 600,
+                              opacity: p.isKicked ? 0.6 : 1,
+                              cursor: p.isKicked ? "not-allowed" : "pointer",
+                            }}
+                            title="Retirer ce joueur de la partie"
+                          >
+                            Kick
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {players.length === 0 && !playersLoading && (
+                    <tr>
+                      <td colSpan={3} style={{ padding: 12, opacity: 0.7 }}>
+                        Aucun joueur pour l’instant.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </fieldset>
-      </div>
+        )}
 
-      {table}
+
+        {/* Onglet Questions */}
+        {adminTab === "questions" && (
+          <>
+            <h2 style={{ margin: 0 }}>Créer une nouvelle question</h2>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(0, 1fr) 360px",
+                gap: 16,
+                alignItems: "start",
+                maxWidth: 1100,
+                marginBottom: 16,
+              }}
+            >
+              {/* Colonne gauche */}
+              <div style={{ display: "grid", gap: 8 }}>
+                <label>
+                  Question
+                  <textarea
+                    rows={2}
+                    value={newQ.text}
+                    onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
+                    style={{ width: "100%", boxSizing: "border-box" }}
+                  />
+                </label>
+
+                <label>
+                  Réponses acceptées (séparées par des virgules)
+                  <input
+                    type="text"
+                    value={newQ.answersCsv}
+                    onChange={(e) => setNewQ((p) => ({ ...p, answersCsv: e.target.value }))}
+                    placeholder="ex: Mario, Super Mario"
+                    style={{ width: "100%", boxSizing: "border-box" }}
+                  />
+                </label>
+
+                <label>
+                  TimeMusic (hh:mm:ss)
+                  <input
+                    type="text"
+                    value={newQ.timeMusicStr}
+                    onChange={(e) => setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))}
+                    placeholder="ex: 00:00:35"
+                    style={{ width: "100%", boxSizing: "border-box" }}
+                  />
+                </label>
+
+                <label>
+                  Image (optionnelle)
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) =>
+                      setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))
+                    }
+                  />
+                </label>
+
+                <div>
+                  <button onClick={createOne} disabled={creating}>
+                    {creating ? "Création…" : "Créer la question"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Colonne droite : phrases de révélation */}
+              <fieldset style={{ border: "1px solid #333", padding: 12, borderRadius: 8 }}>
+                <legend style={{ padding: "0 6px" }}>Phrase de réponse aléatoire (max 5)</legend>
+
+                {newRevealPhrases.map((val, i) => (
+                  <div
+                    key={i}
+                    style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
+                  >
+                    <label style={{ width: 120 }}>Phrase {i + 1}</label>
+                    <input
+                      type="text"
+                      value={val}
+                      onChange={(e) => {
+                        const next = [...newRevealPhrases];
+                        next[i] = e.target.value;
+                        setNewRevealPhrases(next);
+                      }}
+                      placeholder={DEFAULT_REVEAL_PHRASES[i] || "Ex: La réponse était :"}
+                      style={{ flex: 1, padding: 8 }}
+                    />
+                  </div>
+                ))}
+
+                <div style={{ fontSize: 12, opacity: 0.7 }}>
+                  Laisse vide pour utiliser la liste par défaut.
+                </div>
+              </fieldset>
+            </div>
+
+            {table}
+          </>
+        )}
+      </div>
     </div>
   );
 }

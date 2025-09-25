@@ -1,7 +1,7 @@
 // /pages/player.js
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
-import { collection, doc, getDocs, onSnapshot, orderBy, query } from "firebase/firestore";
+import { collection, doc, getDocs, onSnapshot, orderBy, query, addDoc, updateDoc, where, serverTimestamp, deleteDoc } from "firebase/firestore";
 
 /* ============================== CONSTANTES ============================== */
 // Anti-spam
@@ -109,6 +109,118 @@ function nextRoundStartAfter(t, offsets) {
   return null;
 }
 
+// ===== Helpers nom joueur =====
+
+// ===== Helpers nom joueur (validation + modération forte) =====
+
+// 1) Règles d'entrée : lettres FR + chiffres + espace + apostrophe + tirets, 1..30
+const NAME_ALLOWED_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-–\s]{1,30}$/u;
+
+// 2) Normalisation “unicité/tri”
+function normalizeName(s) {
+  return (s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // supprime les accents
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// 3) Normalisation “modération” (durcit : leet + ponctuation + répétitions)
+function normalizeForModeration(s) {
+  let t = (s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // accents
+    .toLowerCase();
+
+  // leetspeak courant
+  t = t
+    .replace(/[@]/g, "a")
+    .replace(/[$]/g, "s")
+    .replace(/[€]/g, "e")
+    .replace(/[0]/g, "o")
+    .replace(/[1l]/g, "i")
+    .replace(/[3]/g, "e")
+    .replace(/[4]/g, "a")
+    .replace(/[5]/g, "s")
+    .replace(/[7]/g, "t")
+    .replace(/[+]/g, "t");
+
+  // tout ce qui n'est pas alphanum devient espace
+  t = t.replace(/[^a-z0-9]+/g, " ");
+
+  // compressions de répétitions (biiiiiite -> biite -> bite)
+  t = t.replace(/([a-z0-9])\1{2,}/g, "$1$1");
+
+  // espaces propres
+  return t.replace(/\s+/g, " ").trim();
+}
+
+// 4) Dictionnaires — listes ciblées (peuvent être étendues)
+const PROFANITY = new Set([
+  "fuck", "shit", "merde", "pute", "putain", "salope", "connard", "connasse",
+  "encule", "enculé", "enculee", "enculee", "ntm", "fdp", "nique", "niquer",
+  "biatch", "bite", "couille", "couilles", "pd", "tapette", "tafiole",
+  // racisme / haine
+  "nazi", "hitler", "negro", "negre", "bougnoule", "youpin", "antisemite", "raciste"
+]);
+
+// Mots/organisations/lieux politiques & conflits
+const POLITICS_TOKENS = new Set([
+  "palestine", "israel", "gaza", "hamas", "hezbollah",
+  "ukraine", "russie", "russia", "poutine",
+  "front", "national", "rn", "reconquete", "zemmour", "sarkozy",
+  "lfi", "insoumise", "melenchon", "bardella",
+  "macron", "lepen", "trump", "biden", "FN"
+]);
+// Phrases exactes multi-mots à repérer (avec espaces normaux)
+const POLITICS_PHRASES = [
+  "front national", "la france insoumise", "le pen"
+];
+const POLITICS_PREFIX = new Set(["vive", "viva", "free", "support", "go"]);
+
+// 5) Vérification modération
+function moderationReason(raw) {
+  const norm = normalizeForModeration(raw);
+  if (!norm) return null;
+  const tokens = norm.split(" ");               // tokens sans accents, propres
+  const joined = ` ${tokens.join(" ")} `;       // pour les phrases
+
+  // Profanités (par token entier)
+  for (const t of tokens) {
+    if (PROFANITY.has(t)) return "moderation";  // insultes/haine/sexuel
+  }
+
+  // Phrases politiques connues
+  for (const phrase of POLITICS_PHRASES) {
+    if (joined.includes(` ${phrase} `)) return "politics";
+  }
+
+  // Mots politiques (si un token politique apparaît)
+  const hasPoliticalWord = tokens.some((t) => POLITICS_TOKENS.has(t));
+  if (hasPoliticalWord) return "politics";
+
+  // Combinaisons du type "vive/viva/free" + mot politique
+  const hasPrefix = tokens.some((t) => POLITICS_PREFIX.has(t));
+  if (hasPrefix && hasPoliticalWord) return "politics";
+
+  return null;
+}
+
+// 6) Validation globale — renvoie {ok, value?, reason?}
+function validateName(raw) {
+  if (!raw || typeof raw !== "string") return { ok: false, reason: "empty" };
+
+  const cleaned = raw.replace(/\s+/g, " ").trim();
+  if (cleaned.length < 1 || cleaned.length > 30) return { ok: false, reason: "length" };
+  if (!NAME_ALLOWED_RE.test(cleaned)) return { ok: false, reason: "charset" };
+
+  const mod = moderationReason(cleaned);
+  if (mod) return { ok: false, reason: mod };
+
+  return { ok: true, value: cleaned };
+}
+
+
+
 /* =============================== COMPOSANT =============================== */
 export default function Player() {
   /* -------- Données & timing -------- */
@@ -122,6 +234,13 @@ export default function Player() {
 
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
+
+  // Inscription
+  const [playerId, setPlayerId] = useState(null);
+  const [playerName, setPlayerName] = useState("");
+  const [inputName, setInputName] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
 
   // Intro & fin de manche (pilotées via /quiz/state)
   const [isIntro, setIsIntro] = useState(false);
@@ -146,6 +265,54 @@ export default function Player() {
   const [lockPhraseIndex, setLockPhraseIndex] = useState(null);
 
   /* =============================== Effects =============================== */
+
+  // Charger identité locale
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("reset") === "1") {
+      localStorage.removeItem("playerId");
+      localStorage.removeItem("playerName");
+      setPlayerId(null);
+      setPlayerName("");
+      setInputName("");
+      // nettoie le ?reset=1 de l'URL
+      url.searchParams.delete("reset");
+      window.history.replaceState({}, "", url.toString());
+    } else {
+      const pid = localStorage.getItem("playerId");
+      const pname = localStorage.getItem("playerName");
+      if (pid) setPlayerId(pid);
+      if (pname) setPlayerName(pname);
+    }
+  }, []);
+
+  // Suivre mon doc joueur pour voir si refusé/kické
+  useEffect(() => {
+    if (!playerId) return;
+    const playersCol = collection(doc(db, "quiz", "state"), "players");
+    const ref = doc(playersCol, playerId);
+    const unsub = onSnapshot(ref, (snap) => {
+      const d = snap.data();
+      if (!d) return;
+      // Si le nom a été refusé → on force l'écran de renommage
+      if (d.nameStatus === "rejected") {
+        setError("Nom refusé. Trouve un autre nom plus adapté à la soirée 🙂");
+        setInputName(d.name || "");
+      } else {
+        setError("");
+      }
+      if (d.isKicked) {
+        setError("Vous avez été retiré de la partie.");
+      }
+      if (typeof d.name === "string") {
+        setPlayerName(d.name);
+        localStorage.setItem("playerName", d.name);
+      }
+    });
+    return () => unsub();
+  }, [playerId]);
+
+
   // Récup questions
   useEffect(() => {
     (async () => {
@@ -545,7 +712,7 @@ export default function Player() {
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleAnswerSubmit = (e) => {
     if (e && typeof e.preventDefault === "function") e.preventDefault();
     if (isLocked) return;
     const trimmed = (answer ?? "").trim();
@@ -564,8 +731,164 @@ export default function Player() {
   const showPreStart = !(quizStartMs && isRunning);
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
 
+  async function nameExists(nameNorm, excludeId = null) {
+    const playersCol = collection(doc(db, "quiz", "state"), "players");
+    const q = query(playersCol, where("nameNorm", "==", nameNorm));
+    const snap = await getDocs(q);
+    return snap.docs.some((d) => d.id !== excludeId);
+  }
+
+  async function handleNameSubmit(e) {
+    e?.preventDefault?.();
+    setError("");
+    const v = validateName(inputName);
+    if (!v.ok) {
+      if (v.reason === "length") setError("Le nom doit faire entre 1 et 30 caractères.");
+      else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (’ ') et tirets.");
+      else if (v.reason === "politics") setError("Évite les noms à caractère politique. Merci !");
+      else if (v.reason === "moderation") setError("Nom inadapté au tout public.");
+      else setError("Nom invalide.");
+      return;
+    }
+
+    const cleaned = v.value;
+    const nameNorm = normalizeName(cleaned);
+    setBusy(true);
+    try {
+      if (await nameExists(nameNorm, playerId || null)) {
+        setError("Ce nom est déjà pris.");
+        return;
+      }
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+
+      if (!playerId) {
+        // 1ʳᵉ inscription : créer un doc
+        const ref = await addDoc(playersCol, {
+          name: cleaned,
+          nameNorm,
+          createdAt: serverTimestamp(),
+          score: 0,
+          isKicked: false,
+          nameStatus: "ok",
+        });
+        setPlayerId(ref.id);
+        localStorage.setItem("playerId", ref.id);
+        localStorage.setItem("playerName", cleaned);
+        setPlayerName(cleaned);
+        setInputName("");
+      } else {
+        // Renommage après refus (ou volontaire)
+        await updateDoc(doc(playersCol, playerId), {
+          name: cleaned,
+          nameNorm,
+          nameStatus: "ok",
+        });
+        setPlayerName(cleaned);
+        setInputName("");
+        setError("");
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Impossible d’enregistrer le nom. Réessaie.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resetAndDeletePlayer() {
+    try {
+      const pid = playerId || localStorage.getItem("playerId");
+      if (pid) {
+        const playersCol = collection(doc(db, "quiz", "state"), "players");
+        await deleteDoc(doc(playersCol, pid)); // supprime le doc joueur
+      }
+    } catch (e) {
+      console.error("Suppression du joueur échouée :", e);
+      // On continue malgré tout pour nettoyer localement
+    } finally {
+      localStorage.removeItem("playerId");
+      localStorage.removeItem("playerName");
+      setPlayerId(null);
+      setPlayerName("");
+      setInputName("");
+      setError("");
+    }
+  }
+
+
   /* ================================ RENDER =============================== */
-  if (showPreStart) {
+
+  // Écran d’inscription si pas encore identifié, ou si nom refusé
+  if (!playerId || error === "Nom refusé. Trouve un autre nom plus adapté à la soirée 🙂") {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          background: "#000814",
+          color: "white",
+          display: "grid",
+          placeItems: "center",
+          padding: 24,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ width: 380, maxWidth: "90vw" }}>
+          <h1 style={{ margin: 0, fontSize: "2rem", fontWeight: 800 }}>
+            Bienvenue dans le quiz d’ELEY
+          </h1>
+          <p style={{ opacity: 0.85, marginTop: 10 }}>
+            Choisis ton nom de joueur / team :
+          </p>
+
+          <form onSubmit={handleNameSubmit} style={{ marginTop: 12 }}>
+            <input
+              type="text"
+              value={inputName}
+              onChange={(e) => setInputName(e.target.value)}
+              maxLength={30}
+              placeholder="ex : Les Quichettes"
+              style={{
+                width: "100%", padding: "10px 12px",
+                borderRadius: 10, border: "1px solid #334155",
+                background: "#0b1220", color: "white", fontSize: 16,
+              }}
+              autoFocus
+            />
+            <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
+              Lettres FR, chiffres, espaces, apostrophes (’ '), tirets. 1–30 caractères.
+            </div>
+            {error && (
+              <div style={{ marginTop: 8, color: "#fecaca" }}>
+                {error}
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={busy}
+              style={{
+                marginTop: 12, width: "100%",
+                padding: "10px 12px", borderRadius: 10,
+                border: "1px solid #2a2a2a",
+                background: busy ? "#64748b" : "#3b82f6",
+                color: "white", fontWeight: 700, cursor: busy ? "not-allowed" : "pointer",
+              }}
+              title="Valider le nom"
+            >
+              {busy ? "Inscription…" : "Entrer"}
+            </button>
+          </form>
+
+          <div style={{ marginTop: 12, opacity: 0.7, fontSize: 12 }}>
+            Besoin de changer ? <button onClick={resetAndDeletePlayer} style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}>réinitialiser</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+
+  // Écran d’attente une fois inscrit (avant le lancement par l’Admin)
+  if (showPreStart && playerId) {
     return (
       <div
         style={{
@@ -578,17 +901,30 @@ export default function Player() {
           textAlign: "center",
         }}
       >
-        <div>
+        <div style={{ width: 380, maxWidth: "90vw" }}>
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            EleyBox — En attente du départ
+            ELEY&nbsp;Quiz — En attente du départ
           </h1>
-          <p style={{ opacity: 0.8, marginTop: 12 }}>
-            L'Admin n'a pas encore lancé le quiz.
+          <p style={{ opacity: 0.85, marginTop: 12 }}>
+            {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
+            L’Admin n’a pas encore lancé le quiz.
           </p>
+
+          {/* Optionnel : raccourci dev pour changer de nom sans vider Firestore */}
+          <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+            Besoin de changer de nom ?{" "}
+            <button
+              onClick={resetAndDeletePlayer}
+              style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}
+            >
+              réinitialiser
+            </button>
+          </div>
         </div>
       </div>
     );
   }
+
 
   return (
     <div
@@ -744,7 +1080,7 @@ export default function Player() {
           ) : null}
 
           {/* Saisie / anti-spam */}
-          <form onSubmit={handleSubmit}>
+          <form onSubmit={handleAnswerSubmit}>
             {showInput ? (
               <input
                 ref={answerInputRef}
