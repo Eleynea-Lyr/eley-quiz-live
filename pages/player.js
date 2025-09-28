@@ -1,7 +1,19 @@
 // /pages/player.js
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
-import { collection, doc, getDocs, onSnapshot, orderBy, query, addDoc, updateDoc, where, serverTimestamp, deleteDoc } from "firebase/firestore";
+import {
+  collection,
+  doc,
+  getDocs,
+  onSnapshot,
+  orderBy,
+  query,
+  addDoc,
+  updateDoc,
+  where,
+  serverTimestamp,
+  deleteDoc,
+} from "firebase/firestore";
 
 /* ============================== CONSTANTES ============================== */
 // Anti-spam
@@ -33,7 +45,6 @@ const REVEAL_DURATION_SEC = 20; // 15s réponse + 5s compte à rebours
 const COUNTDOWN_START_SEC = 5;
 // Intro au début de chaque manche (mange ce temps sur la 1ʳᵉ question de la manche)
 const ROUND_START_INTRO_SEC = 5;
-
 
 // Barre de temps
 const BAR_H = 6;
@@ -109,12 +120,15 @@ function nextRoundStartAfter(t, offsets) {
   return null;
 }
 
-// ===== Helpers nom joueur =====
-
-// ===== Helpers nom joueur (validation + modération forte) =====
+/* ===== Helpers nom joueur (validation + modération forte) ===== */
 
 // 1) Règles d'entrée : lettres FR + chiffres + espace + apostrophe + tirets, 1..30
 const NAME_ALLOWED_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-–\s]{1,30}$/u;
+
+// Helper : détecte "Player N" (N = entier)
+function isAliasName(raw) {
+  return /^player\s*\d+$/i.test(String(raw || "").trim());
+}
 
 // 2) Normalisation “unicité/tri”
 function normalizeName(s) {
@@ -219,10 +233,25 @@ function validateName(raw) {
   return { ok: true, value: cleaned };
 }
 
-
+function Splash() {
+  return (
+    <div
+      style={{
+        minHeight: "100vh",
+        background: "#0a0a1a", // même fond que l'UI Player
+      }}
+      aria-hidden="true"
+    />
+  );
+}
 
 /* =============================== COMPOSANT =============================== */
 export default function Player() {
+  const [hydrated, setHydrated] = useState(false);            // localStorage lu
+  const [stateLoaded, setStateLoaded] = useState(false);       // 1er /quiz/state reçu
+  const [playerDocLoaded, setPlayerDocLoaded] = useState(false); // 1er doc joueur reçu
+  const [splashReleased, setSplashReleased] = useState(false); // Splash affiché seulement au premier boot
+
   /* -------- Données & timing -------- */
   const [questionsList, setQuestionsList] = useState([]);
 
@@ -239,19 +268,15 @@ export default function Player() {
   const [playerId, setPlayerId] = useState(null);
   const [playerName, setPlayerName] = useState("");
   const [inputName, setInputName] = useState("");
+  const [nameLocked, setNameLocked] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [isKicked, setIsKicked] = useState(false);
+  const [rejectedNames, setRejectedNames] = useState([]);
+  const selfRenameRef = useRef(false); // true si le joueur déclenche "Modifier mon nom"
 
-  // Intro & fin de manche (pilotées via /quiz/state)
-  const [isIntro, setIsIntro] = useState(false);
-  const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
-  const [introRoundIndex, setIntroRoundIndex] = useState(null);
+  // Fin de manche (pilotée via /quiz/state)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
-
-  // Anti-flicker
-  const introGuardUntilRef = useRef(0);
-  const prevStartMsRef = useRef(null);
-  const ignoreCountdownUntilRef = useRef(0);
 
   // Joueur / input
   const [answer, setAnswer] = useState("");
@@ -267,16 +292,13 @@ export default function Player() {
   /* =============================== Effects =============================== */
 
   // Charger identité locale
+  const pendingResetRef = useRef(false);
+
   useEffect(() => {
     const url = new URL(window.location.href);
     if (url.searchParams.get("reset") === "1") {
-      localStorage.removeItem("playerId");
-      localStorage.removeItem("playerName");
-      setPlayerId(null);
-      setPlayerName("");
-      setInputName("");
-      // nettoie le ?reset=1 de l'URL
-      url.searchParams.delete("reset");
+      pendingResetRef.current = true; // on note la demande
+      url.searchParams.delete("reset"); // on nettoie l'URL
       window.history.replaceState({}, "", url.toString());
     } else {
       const pid = localStorage.getItem("playerId");
@@ -284,34 +306,143 @@ export default function Player() {
       if (pid) setPlayerId(pid);
       if (pname) setPlayerName(pname);
     }
+
+    // Recharger la cache locale des noms refusés
+    try {
+      const raw = localStorage.getItem("rejectedNamesCache");
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) setRejectedNames(arr);
+      }
+    } catch { }
+    setHydrated(true);
   }, []);
 
-  // Suivre mon doc joueur pour voir si refusé/kické
+  useEffect(() => {
+    if (!pendingResetRef.current) return;
+    if (isRunning) {
+      // Quiz lancé → on ignore la demande utilisateur
+      pendingResetRef.current = false;
+      return;
+    }
+    // Quiz pas lancé → on autorise le "Modifier mon nom" via resetAndDeletePlayer
+    pendingResetRef.current = false;
+    resetAndDeletePlayer();
+  }, [isRunning]);
+
+  // Suivre mon doc joueur pour voir si refusé / kické / verrouillé
   useEffect(() => {
     if (!playerId) return;
+    
     const playersCol = collection(doc(db, "quiz", "state"), "players");
     const ref = doc(playersCol, playerId);
+
     const unsub = onSnapshot(ref, (snap) => {
-      const d = snap.data();
-      if (!d) return;
-      // Si le nom a été refusé → on force l'écran de renommage
-      if (d.nameStatus === "rejected") {
-        setError("Nom refusé. Trouve un autre nom plus adapté à la soirée 🙂");
-        setInputName(d.name || "");
+      // 1) Le doc n'existe plus
+      if (!snap.exists()) {
+        const selfInitiated = selfRenameRef.current === true;
+        selfRenameRef.current = false;
+
+        // Invalider l'identité locale
+        localStorage.removeItem("playerId");
+        localStorage.removeItem("playerName");
+        setPlayerId(null);
+        setPlayerName("");
+        setInputName("");
+        setError("");
+        setIsKicked(false);
+
+        if (!selfInitiated) {
+          // Reset Admin → purge aussi la blocklist locale
+          localStorage.removeItem("rejectedNamesCache");
+          setRejectedNames([]);
+        }
+        return;
+      }
+
+      // 2) Le doc existe : lecture des champs
+      const d = snap.data() || {};
+
+      // KICK → écran bloquant + message
+      setIsKicked(!!d.isKicked);
+      if (d.isKicked) {
+        setError("Vous avez été retiré de la partie.");
+      } else if (d.nameStatus === "rejected") {
+        // Nom refusé par l’admin → retour au formulaire avec champ vidé
+        setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
+        setInputName(""); // on efface pour réafficher le placeholder
       } else {
         setError("");
       }
-      if (d.isKicked) {
-        setError("Vous avez été retiré de la partie.");
-      }
+
+      // Nom courant (affichage / badge)
       if (typeof d.name === "string") {
         setPlayerName(d.name);
         localStorage.setItem("playerName", d.name);
       }
+
+      // Verrouillage (après “Player N”)
+      setNameLocked(!!d.nameLocked);
+
+      // 3) Blocklist (noms refusés) : serveur + cache local (union)
+      let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
+
+      // Filtre défensif : on ne garde pas les alias "player N"
+      serverRejected = serverRejected.filter((n) => !isAliasName(n));
+
+      // Charger le cache local (tolérant)
+      let prev = [];
+      try {
+        const raw = localStorage.getItem("rejectedNamesCache");
+        prev = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(prev)) prev = [];
+      } catch {
+        prev = [];
+      }
+
+      // Union unique (serveur ∪ cache local), en filtrant aussi le local par sécurité
+      const union = Array.from(new Set([...prev.filter((n) => !isAliasName(n)), ...serverRejected]));
+
+      // Persister et mémoriser
+      localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
+      setRejectedNames(union);
+      setPlayerDocLoaded(true);
     });
+
     return () => unsub();
   }, [playerId]);
 
+  useEffect(() => {
+    if (!playerId) setPlayerDocLoaded(true);
+  }, [playerId]);
+
+  // État "running" simple (utilisé pour l'écran d'attente et reset URL)
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
+      const d = snap.data() || {};
+      setIsRunning(!!d.isRunning);
+    });
+    return () => unsub();
+  }, []);
+
+  //forcer la purge locale
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
+      const d = snap.data() || {};
+      const t = d.playersResetAt;
+      if (t && typeof t.seconds === "number") {
+        const ms = t.seconds * 1000 + Math.floor((t.nanoseconds || 0) / 1e6);
+        const prev = Number(localStorage.getItem("playersResetAt") || 0);
+        if (!Number.isFinite(prev) || ms > prev) {
+          // Nouveau reset détecté → purge des caches liés aux noms refusés
+          localStorage.setItem("playersResetAt", String(ms));
+          localStorage.removeItem("rejectedNamesCache");
+          setRejectedNames([]);
+        }
+      }
+    });
+    return () => unsub();
+  }, []);
 
   // Récup questions
   useEffect(() => {
@@ -322,7 +453,7 @@ export default function Player() {
     })();
   }, []);
 
-  // État live (Timestamp OU startEpochMs) + petite garde anti-flash
+  // État live (Timestamp OU startEpochMs)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
@@ -333,17 +464,6 @@ export default function Player() {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
       } else if (typeof d.startEpochMs === "number") {
         startMs = d.startEpochMs;
-      }
-
-      // Anti-flicker : masque l'UI question pendant ~300ms au moment d'un seek/reprise/intro
-      const now = Date.now();
-      if (
-        (startMs && prevStartMsRef.current !== startMs) ||
-        d.isIntro === true ||
-        typeof d.introEndsAtMs === "number"
-      ) {
-        introGuardUntilRef.current = now + 300;
-        if (startMs) prevStartMsRef.current = startMs;
       }
 
       setIsRunning(!!d.isRunning);
@@ -369,13 +489,11 @@ export default function Player() {
         }
       }
 
-      // Flags intro / fin de manche
-      setIsIntro(!!d.isIntro);
-      setIntroEndsAtMs(typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null);
-      setIntroRoundIndex(Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null);
+      // Fin de manche (sentinelle posée côté admin)
       setLastAutoPausedRoundIndex(
         Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
       );
+      setStateLoaded(true);
     });
     return () => unsub();
   }, []);
@@ -428,15 +546,6 @@ export default function Player() {
     }, 500);
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
-
-  // Anti-flicker : petite fenêtre d’ignorance du décompte après seek/reprise (réserve)
-  useEffect(() => {
-    if (typeof quizStartMs === "number") {
-      ignoreCountdownUntilRef.current = Date.now() + 600;
-    } else {
-      ignoreCountdownUntilRef.current = 0;
-    }
-  }, [quizStartMs]);
 
   // Ticker cooldown (anti-spam)
   useEffect(() => {
@@ -544,7 +653,6 @@ export default function Player() {
     elapsedSec < introEnd
   );
 
-
   // Le temps “utilisable” pour répondre commence après l’intro
   const qStartEffective = isFirstQuestionOfRound && Number.isFinite(qStart)
     ? qStart + ROUND_START_INTRO_SEC
@@ -560,7 +668,6 @@ export default function Player() {
     ? roundIndexOfTime(Math.max(0, qStart), roundOffsetsSec)
     : null;
   const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
-
 
   // Fin de manche (pause posée à la frontière par l’admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
@@ -580,7 +687,6 @@ export default function Player() {
     !isPaused &&
     !isRoundBreak
   );
-
 
   const isRevealAnswerPhase = Boolean(
     currentQuestion &&
@@ -617,10 +723,6 @@ export default function Player() {
     countdownLabel = `Fin de la manche ${endingIdx != null ? endingIdx + 1 : ""} dans :`;
   }
 
-  // Intro (garde visuelle)
-  const isRoundIntro = Date.now() < (introGuardUntilRef?.current || 0);
-  const introRemaining = 0;
-
   // Barre de progression
   const canShowTimeBar = Boolean(
     isQuestionPhase && qStartEffective != null && qEnd != null && qEnd > qStartEffective
@@ -628,7 +730,6 @@ export default function Player() {
   const progress = canShowTimeBar
     ? Math.min(1, Math.max(0, (elapsedSec - qStartEffective) / (qEnd - qStartEffective)))
     : 0;
-
 
   // Messages d’attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
@@ -741,6 +842,7 @@ export default function Player() {
   async function handleNameSubmit(e) {
     e?.preventDefault?.();
     setError("");
+
     const v = validateName(inputName);
     if (!v.ok) {
       if (v.reason === "length") setError("Le nom doit faire entre 1 et 30 caractères.");
@@ -751,8 +853,15 @@ export default function Player() {
       return;
     }
 
-    const cleaned = v.value;
-    const nameNorm = normalizeName(cleaned);
+    // Blocklist locale/serveur — alias "Player N" autorisé
+    const nameIsAlias = isAliasName(inputName);
+    const nameNorm = normalizeName(v.value);
+    if (!nameIsAlias && Array.isArray(rejectedNames) && rejectedNames.includes(nameNorm)) {
+      setError("Nom refusé par l’animateur. Merci d’en choisir un autre.");
+      setInputName("");
+      return;
+    }
+
     setBusy(true);
     try {
       if (await nameExists(nameNorm, playerId || null)) {
@@ -764,26 +873,27 @@ export default function Player() {
       if (!playerId) {
         // 1ʳᵉ inscription : créer un doc
         const ref = await addDoc(playersCol, {
-          name: cleaned,
+          name: v.value,
           nameNorm,
           createdAt: serverTimestamp(),
           score: 0,
           isKicked: false,
           nameStatus: "ok",
+          rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [], // réinjecte l’historique local
         });
         setPlayerId(ref.id);
         localStorage.setItem("playerId", ref.id);
-        localStorage.setItem("playerName", cleaned);
-        setPlayerName(cleaned);
+        localStorage.setItem("playerName", v.value);
+        setPlayerName(v.value);
         setInputName("");
       } else {
-        // Renommage après refus (ou volontaire)
+        // Renommage (après refus ou volontaire)
         await updateDoc(doc(playersCol, playerId), {
-          name: cleaned,
+          name: v.value,
           nameNorm,
           nameStatus: "ok",
         });
-        setPlayerName(cleaned);
+        setPlayerName(v.value);
         setInputName("");
         setError("");
       }
@@ -797,6 +907,7 @@ export default function Player() {
 
   async function resetAndDeletePlayer() {
     try {
+      selfRenameRef.current = true; // indique que la suppression du doc vient du joueur
       const pid = playerId || localStorage.getItem("playerId");
       if (pid) {
         const playersCol = collection(doc(db, "quiz", "state"), "players");
@@ -815,11 +926,39 @@ export default function Player() {
     }
   }
 
+  // Flags d’état pour le bouton
+  const normInput = normalizeName(inputName);
+
+  // Refusé par l’admin ET ce n’est PAS un alias "Player N"
+  const isRejectedInput =
+    Array.isArray(rejectedNames) &&
+    rejectedNames.includes(normInput) &&
+    !isAliasName(inputName);
+
+  // Cas particulier: après un refus immédiat du nom courant
+  const isSameAsRejectedCurrent =
+    typeof error === "string" &&
+    error.startsWith("Nom refusé") &&
+    normalizeName(inputName) === normalizeName(playerName || "") &&
+    !isAliasName(inputName);
+
+  // Bouton désactivé si occupation, ou nom refusé (hors alias), ou même nom refusé courant (hors alias)
+  const isSubmitDisabled = busy || isRejectedInput || isSameAsRejectedCurrent;
 
   /* ================================ RENDER =============================== */
+  // Garde initiale : on attend la toute première disponibilité, puis on "relâche" le Splash définitivement
+  const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
 
-  // Écran d’inscription si pas encore identifié, ou si nom refusé
-  if (!playerId || error === "Nom refusé. Trouve un autre nom plus adapté à la soirée 🙂") {
+  // dès que le boot initial est prêt une fois, on ne réaffiche plus jamais le Splash (même si playerDocLoaded rebouge)
+  useEffect(() => {
+    if (initialBootReady) setSplashReleased(true);
+  }, [initialBootReady]);
+
+  if (!splashReleased) return <Splash />;
+
+
+  // 1) Écran d’inscription (P6)
+  if (!playerId || (typeof error === "string" && error.startsWith("Nom refusé"))) {
     return (
       <div
         style={{
@@ -857,35 +996,79 @@ export default function Player() {
             <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
               Lettres FR, chiffres, espaces, apostrophes (’ '), tirets. 1–30 caractères.
             </div>
+
             {error && (
               <div style={{ marginTop: 8, color: "#fecaca" }}>
                 {error}
               </div>
             )}
+
             <button
               type="submit"
-              disabled={busy}
+              disabled={isSubmitDisabled}
               style={{
-                marginTop: 12, width: "100%",
-                padding: "10px 12px", borderRadius: 10,
+                marginTop: 12,
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 10,
                 border: "1px solid #2a2a2a",
                 background: busy ? "#64748b" : "#3b82f6",
-                color: "white", fontWeight: 700, cursor: busy ? "not-allowed" : "pointer",
+                color: "white",
+                fontWeight: 700,
+                cursor: isSubmitDisabled ? "not-allowed" : "pointer",
               }}
-              title="Valider le nom"
+              title={
+                isRejectedInput || isSameAsRejectedCurrent
+                  ? "Ce nom a été refusé — choisis-en un autre."
+                  : "Valider le nom"
+              }
+              aria-disabled={isSubmitDisabled ? "true" : "false"}
             >
               {busy ? "Inscription…" : "Entrer"}
             </button>
-          </form>
 
-          <div style={{ marginTop: 12, opacity: 0.7, fontSize: 12 }}>
-            Besoin de changer ? <button onClick={resetAndDeletePlayer} style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}>réinitialiser</button>
-          </div>
+            {Array.isArray(rejectedNames)
+              && rejectedNames.includes(normalizeName(inputName))
+              && !isAliasName(inputName) && (
+                <div style={{ marginTop: 6, color: "#fbbf24" }}>
+                  Ce nom a été refusé par l’animateur. Choisis-en un autre.
+                </div>
+              )}
+
+          </form>
         </div>
       </div>
     );
   }
 
+  // Écran bloquant si le joueur a été retiré
+  if (isKicked && playerId) {
+    return (
+      <div
+        style={{
+          background: "#0a0a1a",
+          color: "#fff",
+          minHeight: "100vh",
+          display: "grid",
+          placeItems: "center",
+          padding: "24px",
+          textAlign: "center",
+        }}
+      >
+        <div style={{ width: 380, maxWidth: "90vw" }}>
+          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
+            ELEY&nbsp;Quiz — Accès retiré
+          </h1>
+          <p style={{ opacity: 0.85, marginTop: 12 }}>
+            Vous avez été retiré de la partie par l’animateur.
+          </p>
+          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
+            (Si c’est une erreur, rapprochez-vous de l’animateur.)
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Écran d’attente une fois inscrit (avant le lancement par l’Admin)
   if (showPreStart && playerId) {
@@ -910,21 +1093,28 @@ export default function Player() {
             L’Admin n’a pas encore lancé le quiz.
           </p>
 
-          {/* Optionnel : raccourci dev pour changer de nom sans vider Firestore */}
-          <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-            Besoin de changer de nom ?{" "}
-            <button
-              onClick={resetAndDeletePlayer}
-              style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}
-            >
-              réinitialiser
-            </button>
-          </div>
+          {(!nameLocked && !isRunning) ? (
+            <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+              Envie de changer de nom ?{" "}
+              <button
+                onClick={resetAndDeletePlayer}
+                style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}
+              >
+                Modifier mon nom
+              </button>
+            </div>
+          ) : (
+            nameLocked && (
+              <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                Ton nom a été fixé par l’animateur.
+              </div>
+            )
+          )}
+
         </div>
       </div>
     );
   }
-
 
   return (
     <div
@@ -952,6 +1142,32 @@ export default function Player() {
       >
         ⏱ {formatHMS(elapsedSec)}
       </div>
+
+      {/* Badge nom joueur en haut (quiz lancé) */}
+      {isRunning && playerName && (
+        <div
+          style={{
+            position: "fixed",
+            top: 10,
+            left: 10,
+            zIndex: 20,
+            background: "#0b1e3d",
+            border: "1px solid #1f2a44",
+            borderRadius: 9999,
+            padding: "6px 10px",
+            fontSize: 14,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+          }}
+          aria-label="Nom du joueur"
+          title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
+        >
+          <span>👤</span>
+          <b style={{ letterSpacing: 0.2 }}>{playerName}</b>
+          {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
+        </div>
+      )}
 
       {isQuizEnded ? (
         <>

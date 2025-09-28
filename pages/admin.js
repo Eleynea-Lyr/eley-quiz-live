@@ -6,6 +6,7 @@ import {
   query,
   orderBy,
   getDocs,
+  getDoc,
   doc,
   updateDoc,
   deleteDoc,
@@ -15,6 +16,9 @@ import {
   serverTimestamp,
   onSnapshot,
   Timestamp,
+  arrayUnion,
+  runTransaction,
+  where,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
@@ -26,7 +30,7 @@ const PLAYER_COLORS = [
   "#10b981", "#06b6d4", "#3b82f6", "#8b5cf6",
 ];
 
-// Normalisation alpha (casse/accents-insensible) pour le tri
+// Normalisation alpha (casse/accents-insensible) pour le tri / normalisation noms
 function normKey(s) {
   return (s || "")
     .normalize("NFD")
@@ -40,7 +44,6 @@ function pickColorDifferent(prev) {
   const bag = pool.length ? pool : PLAYER_COLORS;
   return bag[Math.floor(Math.random() * bag.length)];
 }
-
 
 /* ========================= Helpers ========================= */
 function parseCSV(input = "") {
@@ -138,7 +141,6 @@ function withAlpha(hex, alpha = 0.35) {
     const r = parseInt(s[0] + s[0], 16);
     const g = parseInt(s[1] + s[1], 16);
     const b = parseInt(s[2] + s[2], 16);
-    // On ignore l'alpha du code (#RGBA) et on applique A
     return `rgba(${r}, ${g}, ${b}, ${A})`;
   }
 
@@ -147,14 +149,11 @@ function withAlpha(hex, alpha = 0.35) {
     const r = parseInt(s.slice(0, 2), 16);
     const g = parseInt(s.slice(2, 4), 16);
     const b = parseInt(s.slice(4, 6), 16);
-    // On ignore l'alpha existant (les 2 derniers chars si présents) et on applique A
     return `rgba(${r}, ${g}, ${b}, ${A})`;
   }
 
-  // Format non pris en charge → on rend tel quel
   return hex;
 }
-
 
 /* ======================== Component ======================== */
 export default function Admin() {
@@ -175,13 +174,14 @@ export default function Admin() {
   const assignedColorRef = useRef(new Set()); // évite de réassigner en boucle
   const lastAssignedColorRef = useRef(null); // dernière couleur attribuée (anti doublon consécutif)
 
+  // ⏱ Ordre d’arrivée (session locale, sans écrire en DB)
+  const playerOrderRef = useRef(new Map());   // id -> index d’arrivée
+  const nextPlayerOrderRef = useRef(1);
 
   const connectedCount = useMemo(
     () => players.filter((p) => !p?.isKicked).length,
     [players]
   );
-
-
 
   /* ------------ Rounds & End ------------ */
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
@@ -434,7 +434,6 @@ export default function Admin() {
     }
   }
 
-
   // Modifs inline des champs question
   const handleFieldChange = (id, field, value) => {
     setItems((prev) =>
@@ -507,14 +506,13 @@ export default function Admin() {
     try {
       const storageRef = ref(
         storage,
-        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${file.name
-        }`
+        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${file.name}`
       );
       const task = uploadBytesResumable(storageRef, file);
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => { },
+          () => {},
           (err) => {
             console.error("[UPLOAD] Erreur:", err);
             alert("Échec de l’upload : " + (err?.message || err));
@@ -654,7 +652,6 @@ export default function Admin() {
         .filter(Boolean)
         .slice(0, 5);
 
-
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
@@ -695,8 +692,8 @@ export default function Admin() {
         {
           isRunning: true,
           isPaused: false,
-          startAt: Timestamp.fromMillis(nowMs), // même base temps que startEpochMs
-          startEpochMs: nowMs, // compat Player/Screen
+          startAt: Timestamp.fromMillis(nowMs),
+          startEpochMs: nowMs,
           pauseAt: null,
         },
         { merge: true }
@@ -715,7 +712,7 @@ export default function Admin() {
           isRunning: false,
           isPaused: false,
           startAt: null,
-          startEpochMs: null, // compat Player/Screen
+          startEpochMs: null,
           pauseAt: null,
           isIntro: false,
           introEndsAtMs: null,
@@ -1060,21 +1057,17 @@ export default function Admin() {
 
   const roundColors = [
     "#e96db1ff", // M1
-    "#fb923c", // M2
-    "#a78bfa", // M3
-    "#93c5fd", // M4
-    "#86efac", // M5
-    "#5eead4", // M6
-    "#cf72f4ff", // M7
-    "#2b7bf3ff", // M8
+    "#fb923c",  // M2
+    "#a78bfa",  // M3
+    "#93c5fd",  // M4
+    "#86efac",  // M5
+    "#5eead4",  // M6
+    "#cf72f4ff",// M7
+    "#2b7bf3ff",// M8
   ];
 
-  // Note: tu peux mettre #RRGGBB, #RRGGBBAA, #RGB ou #RGBA — l’alpha inclus sera ignoré
-  // et remplacé par ROUND_BG_ALPHA pour une cohérence visuelle.
-
-  // Alpha de fond des lignes du tableau (réglable à volonté : 0..1)
-  const ROUND_BG_ALPHA = 0.70; // ← change cette valeur selon tes envies
-
+  // Alpha de fond des lignes du tableau
+  const ROUND_BG_ALPHA = 0.70;
 
   const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
   const currentRoundNumber = currentRoundIndex + 1;
@@ -1159,7 +1152,6 @@ export default function Admin() {
               let rowBg = undefined;
 
               if (Number.isFinite(tSec) && !(Number.isFinite(quizEndSec) && tSec >= quizEndSec)) {
-                // trouver l’index de manche pour ce timecode (dans [offset_i, offset_{i+1}[ )
                 let rIdx = -1;
                 for (let k = 0; k < roundOffsetsSec.length; k++) {
                   const v = roundOffsetsSec[k];
@@ -1168,7 +1160,6 @@ export default function Admin() {
                 const base = roundColors[rIdx] || null;
                 rowBg = base ? withAlpha(base, ROUND_BG_ALPHA) : undefined;
               }
-
 
               return (
                 <tr key={it.id} style={{ borderTop: "1px solid #333", background: rowBg }}>
@@ -1238,7 +1229,6 @@ export default function Admin() {
                     />
                   </td>
 
-
                   <td style={{ width: "15%", verticalAlign: "top", padding: "12px" }}>
                     {it.imageUrl ? (
                       <div>
@@ -1304,12 +1294,23 @@ export default function Admin() {
           lastAssignedColorRef.current = color;
 
           // Fire & forget (ne bloque pas l'UI si échec)
-          updateDoc(doc(playersCol, p.id), { color }).catch(() => { });
+          updateDoc(doc(playersCol, p.id), { color }).catch(() => {});
         }
       });
 
-      // Tri alphabétique insensible à casse/accents
-      arr.sort((a, b) => normKey(a.name).localeCompare(normKey(b.name)));
+      // 🔢 Ordre d'arrivée local : on mémorise la première apparition
+      arr.forEach((p) => {
+        if (!playerOrderRef.current.has(p.id)) {
+          playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
+        }
+      });
+
+      // Tri par ordre d'arrivée (stable vis-à-vis des renommages/refus)
+      arr.sort(
+        (a, b) =>
+          (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
+          (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
+      );
 
       setPlayers(arr);
       setPlayersLoading(false);
@@ -1318,14 +1319,66 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
+  // Récupère un N unique et libre pour "Player N"
+  async function getNextAliasNumber() {
+    const stateRef = doc(db, "quiz", "state");
+    let reservedN = await runTransaction(db, async (tx) => {
+      const snap = await tx.get(stateRef);
+      const data = snap.exists() ? snap.data() : {};
+      const current = Number.isFinite(data?.aliasCounter) ? data.aliasCounter : 1;
+      const next = current + 1;
+      tx.update(stateRef, { aliasCounter: next });
+      return current; // on utilise la valeur actuelle
+    });
+
+    // Collision (rare) : si "Player reservedN" existe déjà -> on boucle
+    while (true) {
+      const nameNorm = normKey(`Player ${reservedN}`);
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+      const q = query(playersCol, where("nameNorm", "==", nameNorm));
+      const snap = await getDocs(q);
+      if (snap.empty) return reservedN;
+      reservedN = await runTransaction(db, async (tx) => {
+        const snap2 = await tx.get(stateRef);
+        const data2 = snap2.exists() ? snap2.data() : {};
+        const current2 = Number.isFinite(data2?.aliasCounter) ? data2.aliasCounter : 1;
+        const next2 = current2 + 1;
+        tx.update(stateRef, { aliasCounter: next2 });
+        return current2;
+      });
+    }
+  }
 
   // Actions panneau joueurs
-  async function rejectPlayer(id) {
+  async function rejectPlayer(playerId, currentName) {
     try {
       const playersCol = collection(doc(db, "quiz", "state"), "players");
-      await updateDoc(doc(playersCol, id), { nameStatus: "rejected" });
+      const ref = doc(playersCol, playerId);
+
+      // Lire l’état courant pour savoir si c’est un alias “Player N”
+      const snap = await getDoc(ref);
+      if (!snap.exists()) return;
+      const d = snap.data() || {};
+
+      const isAliased = !!d.isAlias; // flag posé par “Player N”
+      const norm = normKey(typeof d.name === "string" ? d.name : (currentName || ""));
+
+      // Base: passer en "rejected" et déverrouiller
+      const baseUpdates = {
+        nameStatus: "rejected",
+        nameLocked: false,
+        isAlias: false,
+        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+      };
+
+      // ⛔️ On n’ajoute PAS “player n” dans rejectedNames
+      const updates = isAliased
+        ? baseUpdates
+        : { ...baseUpdates, rejectedNames: arrayUnion(norm) };
+
+      await updateDoc(ref, updates);
     } catch (e) {
-      console.error("rejectPlayer", e);
+      console.error("rejectPlayer failed:", e);
     }
   }
 
@@ -1338,36 +1391,26 @@ export default function Admin() {
     }
   }
 
-  // --- DEV ONLY: ajouter des joueurs de test ---
-  const DEV_NAMES = [
-    "Alice", "Bob", "Chloé", "David", "Emma", "Fabien", "Gaspard", "Hugo", "Inès", "Jules",
-    "Kenza", "Léa", "Malo", "Naël", "Ophélie", "Paul", "Quentin", "Rayan", "Sofia", "Théo",
-  ];
-
-  async function devAddFakePlayer() {
+  async function renameToAlias(playerId) {
     try {
-      const playersCol = collection(doc(db, "quiz", "state"), "players");
-      const name = DEV_NAMES[Math.floor(Math.random() * DEV_NAMES.length)];
-      const payload = {
-        name,
-        nameNorm: normKey(name),
-        createdAt: serverTimestamp(),
-        score: 0,
-        isKicked: false,
-        nameStatus: "ok",
-        color: (lastAssignedColorRef.current = pickColorDifferent(lastAssignedColorRef.current)),
-      };
-      await addDoc(playersCol, payload);
-    } catch (e) {
-      console.error("devAddFakePlayer", e);
-    }
-  }
+      const n = await getNextAliasNumber();
+      const alias = `Player ${n}`;
+      const aliasNorm = normKey(alias);
 
-  async function devAddFivePlayers() {
-    for (let i = 0; i < 5; i++) {
-      // petite pause pour laisser Firestore respirer
-      // eslint-disable-next-line no-await-in-loop
-      await devAddFakePlayer();
+      const playersCol = collection(doc(db, "quiz", "state"), "players");
+      const ref = doc(playersCol, playerId);
+
+      await updateDoc(ref, {
+        name: alias,
+        nameNorm: aliasNorm,
+        nameLocked: true,        // verrouille le nom
+        nameStatus: "locked",    // UI: bouton "Player N" devient "Owned :)"
+        isAlias: true,
+        aliasNumber: n,
+        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+      });
+    } catch (e) {
+      console.error("renameToAlias", e);
     }
   }
 
@@ -1389,7 +1432,6 @@ export default function Admin() {
     const ok = window.confirm("Réinitialiser le quiz ET supprimer tous les joueurs ?");
     if (!ok) return;
     try {
-      // ta fonction existante qui remet l'état du quiz à zéro
       await Promise.resolve(resetQuiz());
     } catch (e) {
       console.warn("resetQuiz a échoué ou n'est pas async, on continue la purge des joueurs.", e);
@@ -1399,8 +1441,11 @@ export default function Admin() {
     } catch (e) {
       console.error("Suppression des joueurs échouée :", e);
     }
+    await updateDoc(doc(db, "quiz", "state"), {
+      playersResetAt: serverTimestamp(),
+      aliasCounter: 1,
+    });
   }
-
 
   /* =================== Render =================== */
   return (
@@ -1697,34 +1742,28 @@ export default function Admin() {
               Joueurs connectés : <b>{connectedCount}</b>
               {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
             </div>
-            {/* DEV: Ajout rapide de joueurs factices */}
-            <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
-              <button
-                type="button"
-                onClick={devAddFakePlayer}
-                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#d1fae5", color: "#064e3b", fontWeight: 600 }}
-                title="Ajouter un joueur de test"
-              >
-                +1 joueur test
-              </button>
-              <button
-                type="button"
-                onClick={devAddFivePlayers}
-                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#bfdbfe", color: "#1e3a8a", fontWeight: 600 }}
-                title="Ajouter 5 joueurs de test"
-              >
-                +5 joueurs test
-              </button>
-            </div>
 
             {/* Tableau joueurs */}
             <div style={{ marginTop: 12, overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 520 }}>
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  tableLayout: "fixed",
+                  minWidth: 820
+                }}
+              >
                 <thead>
                   <tr style={{ background: "#0b1e3d" }}>
-                    <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueur</th>
-                    <th style={{ textAlign: "left", padding: "10px 8px", width: 140 }}>Statut</th>
-                    <th style={{ textAlign: "left", padding: "10px 8px", width: 220 }}>Actions</th>
+                    <th style={{ textAlign: "left", padding: "10px 8px" }}>
+                      Joueur
+                    </th>
+                    <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>
+                      Statut
+                    </th>
+                    <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>
+                      Actions
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1738,7 +1777,7 @@ export default function Admin() {
                     return (
                       <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
                         <td style={{ padding: "8px" }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                             <span
                               title={p.color || ""}
                               style={{
@@ -1748,12 +1787,26 @@ export default function Admin() {
                                 background: p.color || "#6b7280",
                                 display: "inline-block",
                                 border: "1px solid rgba(255,255,255,0.2)",
+                                flex: "0 0 auto",
                               }}
                             />
-                            <span style={{ fontWeight: 600 }}>{p.name || "(sans nom)"}</span>
+                            <span
+                              title={p.name || "(sans nom)"}
+                              style={{
+                                fontWeight: 600,
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                maxWidth: "100%",
+                                display: "block",
+                              }}
+                            >
+                              {p.name || "(sans nom)"}
+                            </span>
                           </div>
                         </td>
-                        <td style={{ padding: "8px" }}>
+
+                        <td style={{ padding: "8px", textAlign: "center" }}>
                           <span
                             style={{
                               display: "inline-block",
@@ -1769,7 +1822,7 @@ export default function Admin() {
                         </td>
                         <td style={{ padding: "8px" }}>
                           <button
-                            onClick={() => rejectPlayer(p.id)}
+                            onClick={() => rejectPlayer(p.id, p.name)}
                             disabled={p.isKicked || p.nameStatus === "rejected"}
                             style={{
                               padding: "6px 10px",
@@ -1787,10 +1840,39 @@ export default function Admin() {
                           >
                             Refuser
                           </button>
+                          {(() => {
+                            const isAliased = !!p.nameLocked || p.nameStatus === "locked";
+                            return (
+                              <button
+                                onClick={() => renameToAlias(p.id)}
+                                disabled={!isRunning || isAliased}
+                                title={
+                                  !isRunning
+                                    ? "Disponible une fois le quiz lancé"
+                                    : isAliased
+                                      ? "Nom modéré (verrouillé)"
+                                      : "Fixer le nom sur « Player N »"
+                                }
+                                style={{
+                                  padding: "6px 10px",
+                                  borderRadius: 6,
+                                  border: "1px solid #2a2a2a",
+                                  background: isAliased ? "#e5e7eb" : "#c7d2fe",
+                                  color: "#111827",
+                                  fontWeight: 600,
+                                  opacity: !isRunning || isAliased ? 0.6 : 1,
+                                  cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
+                                }}
+                              >
+                                {isAliased ? "Owned :)" : "Player N"}
+                              </button>
+                            );
+                          })()}
                           <button
                             onClick={() => kickPlayer(p.id)}
                             disabled={p.isKicked}
                             style={{
+                              marginLeft: 8,
                               padding: "6px 10px",
                               borderRadius: 6,
                               border: "1px solid #2a2a2a",
@@ -1820,7 +1902,6 @@ export default function Admin() {
             </div>
           </div>
         )}
-
 
         {/* Onglet Questions */}
         {adminTab === "questions" && (
