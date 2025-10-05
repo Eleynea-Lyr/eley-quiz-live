@@ -19,10 +19,12 @@ import {
   arrayUnion,
   runTransaction,
   where,
+  increment,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
-// Couleurs distinctes (thème sombre friendly)
+/* ========================= COULEURS & HELPERS JOUEURS ========================= */
+
 const PLAYER_COLORS = [
   "#f87171", "#fb923c", "#fbbf24", "#a3e635",
   "#34d399", "#22d3ee", "#60a5fa", "#818cf8",
@@ -30,7 +32,7 @@ const PLAYER_COLORS = [
   "#10b981", "#06b6d4", "#3b82f6", "#8b5cf6",
 ];
 
-// Normalisation alpha (casse/accents-insensible) pour le tri / normalisation noms
+// Normalisation alpha (casse/accents-insensible)
 function normKey(s) {
   return (s || "")
     .normalize("NFD")
@@ -38,86 +40,20 @@ function normKey(s) {
     .toLowerCase()
     .trim();
 }
-
 function pickColorDifferent(prev) {
   const pool = PLAYER_COLORS.filter((c) => c !== prev);
   const bag = pool.length ? pool : PLAYER_COLORS;
   return bag[Math.floor(Math.random() * bag.length)];
 }
 
-/* ========================= Helpers ========================= */
-function parseCSV(input = "") {
-  return String(input)
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-function toCSV(list = []) {
-  return (list || []).join(", ");
-}
-function parseHMS(input) {
-  if (input == null) return null;
-  const s = String(input).trim();
-  if (!s) return null;
+/* ========================= DEFAULTS & CONSTANTES GLOBALES ========================= */
 
-  // hh:mm:ss | mm:ss | ss
-  if (s.includes(":")) {
-    const parts = s.split(":").map((p) => p.trim());
-    if (parts.length > 3) return null;
-    const [hStr, mStr, sStr] =
-      parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
-    const h = Number(hStr),
-      m = Number(mStr),
-      sec = Number(sStr);
-    if (![h, m, sec].every((n) => Number.isFinite(n) && n >= 0)) return null;
-    if (m >= 60 || sec >= 60) return null;
-    return h * 3600 + m * 60 + sec;
-  }
-  // nombre simple → minutes décimales (legacy)
-  const num = Number(s);
-  if (!Number.isFinite(num) || num < 0) return null;
-  return Math.round(num * 60);
-}
-function formatHMS(totalSeconds) {
-  if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "";
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = Math.floor(totalSeconds % 60);
-  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
-}
-function getTimeSec(q) {
-  if (!q || typeof q !== "object") return Infinity;
-  if (typeof q.timecodeSec === "number") return q.timecodeSec; // secondes (nouveau)
-  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
-  return Infinity;
-}
-function coerceOffsetsToNumbers(arr) {
-  const out = [];
-  for (let i = 0; i < 8; i++) {
-    const v = arr?.[i];
-    if (typeof v === "number" && Number.isFinite(v)) out[i] = v;
-    else if (typeof v === "string" && v.trim()) {
-      const p = parseHMS(v);
-      out[i] = p == null ? null : p;
-    } else {
-      out[i] = null;
-    }
-  }
-  return out;
-}
-function roundIndexOfTime(t, offsets) {
-  if (!Array.isArray(offsets)) return 0;
-  let idx = -1;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && t >= v) idx = i;
-  }
-  return Math.max(0, idx);
-}
+const DEFAULT_SCORING_TABLE = [30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+const DEFAULT_REVEAL_DURATION_SEC = 20;   // 15s affichage + 5s décompte
+const DEFAULT_LEADERBOARD_TOP_N = 20;
 
-/* ---- TimeMusic rules ---- */
-const TIME_MUSIC_MIN_SEC = 20;       // reveal incompressible
-const DEFAULT_TIME_MUSIC_SEC = 35;   // durée par défaut d’un bloc (ex: 15s jeu + 20s reveal)
+const TIME_MUSIC_MIN_SEC = 20;     // reveal incompressible
+const DEFAULT_TIME_MUSIC_SEC = 35; // ex: 15s jeu + 20s reveal
 
 function clampTimeMusicSec(sec) {
   const n = Number(sec);
@@ -125,102 +61,279 @@ function clampTimeMusicSec(sec) {
   return Math.max(TIME_MUSIC_MIN_SEC, Math.floor(n));
 }
 
-/* ---- Color utils ---- */
-function withAlpha(hex, alpha = 0.35) {
-  if (typeof hex !== "string") return hex;
-  const s0 = hex.trim();
+/* =================== CONFIG PAR DÉFAUT (IDEMPOTENT) =================== */
 
-  // On ne traite que les hex; si ce n’est pas un #..., on rend tel quel.
-  if (!s0.startsWith("#")) return hex;
+async function ensureConfigDefaults() {
+  const cfgRef = doc(db, "quiz", "config");
+  const snap = await getDoc(cfgRef);
+  const data = snap.exists() ? snap.data() : {};
 
-  const s = s0.slice(1); // sans '#'
-  const A = Math.max(0, Math.min(1, Number(alpha)));
+  const patch = {};
+  if (!("scoringTable" in data)) patch.scoringTable = DEFAULT_SCORING_TABLE;
+  if (!("revealDurationSec" in data)) patch.revealDurationSec = DEFAULT_REVEAL_DURATION_SEC;
+  if (!("leaderboardTopN" in data)) patch.leaderboardTopN = DEFAULT_LEADERBOARD_TOP_N;
 
-  // #RGB ou #RGBA
-  if (s.length === 3 || s.length === 4) {
-    const r = parseInt(s[0] + s[0], 16);
-    const g = parseInt(s[1] + s[1], 16);
-    const b = parseInt(s[2] + s[2], 16);
-    return `rgba(${r}, ${g}, ${b}, ${A})`;
+  if (Object.keys(patch).length > 0) {
+    await setDoc(cfgRef, patch, { merge: true });
   }
-
-  // #RRGGBB ou #RRGGBBAA
-  if (s.length === 6 || s.length === 8) {
-    const r = parseInt(s.slice(0, 2), 16);
-    const g = parseInt(s.slice(2, 4), 16);
-    const b = parseInt(s.slice(4, 6), 16);
-    return `rgba(${r}, ${g}, ${b}, ${A})`;
-  }
-
-  return hex;
 }
 
-/* ======================== Component ======================== */
+/* ========== SCORING (CACHE) ========== */
+
+let _cachedScoringTable = null;
+async function getScoringTableAdmin() {
+  if (_cachedScoringTable) return _cachedScoringTable;
+  try {
+    const cfgRef = doc(db, "quiz", "config");
+    const snap = await getDoc(cfgRef);
+    const tbl = (snap.exists() && Array.isArray(snap.data().scoringTable))
+      ? snap.data().scoringTable
+      : DEFAULT_SCORING_TABLE;
+    _cachedScoringTable = tbl;
+    return tbl;
+  } catch (e) {
+    console.error("[Admin/getScoringTableAdmin] fallback:", e);
+    _cachedScoringTable = DEFAULT_SCORING_TABLE;
+    return DEFAULT_SCORING_TABLE;
+  }
+}
+
+/* ========== ATTRIBUTION TRANSACTIONNELLE (ANTI-DOUBLONS) ========== */
+// PATCH(Admin): robust awards TX (aligné sur Screen)
+async function ensureAwardsForQuestionTx(qid) {
+  if (!qid) return { ok: false, reason: "no-qid" };
+
+  // 1) Lire toutes les bonnes réponses (sans orderBy)
+  const subsCol = collection(db, "answers", qid, "submissions");
+  let subsSnap;
+  try {
+    subsSnap = await getDocs(query(subsCol, where("isCorrect", "==", true)));
+  } catch (e) {
+    console.error("[Admin] read submissions failed:", e);
+    return { ok: false, reason: "read-failed" };
+  }
+
+  // 2) Normaliser un "temps" en ms pour trier localement (plusieurs schémas possibles)
+  function toMs(obj) {
+    if (!obj) return Infinity;
+    if (typeof obj.toMillis === "function") return obj.toMillis();
+    if (typeof obj.seconds === "number") {
+      return obj.seconds * 1000 + Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6);
+    }
+    if (typeof obj === "number" && Number.isFinite(obj)) return Math.floor(obj);
+    return Infinity;
+  }
+
+  const raw = subsSnap.docs.map(d => ({ id: d.id, data: d.data() || {} }));
+  const ranked = raw
+    .map(({ id, data }) => {
+      const candidates = [
+        toMs(data.firstCorrectAt),
+        toMs(data.firstCorrectAtMs),
+        toMs(data.createdAt),
+        toMs(data.updatedAt),
+      ];
+      const t = Math.min(...candidates);
+      return { id, t };
+    })
+    .filter(x => Number.isFinite(x.t))
+    .sort((a, b) => a.t - b.t);
+
+  if (ranked.length === 0) {
+    console.warn("[Admin] no correct submissions for qid=", qid);
+    return { ok: true, reason: "no-correct-submissions" };
+  }
+
+  const table = await getScoringTableAdmin();
+  const qDocRef = doc(db, "answers", qid);
+  const playersCol = collection(doc(db, "quiz", "state"), "players");
+
+  // 3) TX: idempotence + attributions
+  return await runTransaction(db, async (tx) => {
+    const snap = await tx.get(qDocRef);
+    if (snap.exists() && snap.data()?.awarded === true) {
+      return { ok: true, reason: "already-awarded" };
+    }
+
+    tx.set(qDocRef, {
+      awarded: true,
+      awardedAt: serverTimestamp(),
+      awardedCount: ranked.length,
+    }, { merge: true });
+
+    for (let i = 0; i < ranked.length; i++) {
+      const pid = ranked[i].id;
+      const points = table[i] ?? 0;
+
+      tx.set(doc(db, "answers", qid, "awards", pid), {
+        points, rank: i + 1, awardedAt: serverTimestamp()
+      }, { merge: true });
+
+      tx.set(doc(playersCol, pid), {
+        score: increment(points),
+        lastDelta: points,
+        lastDeltaForQuestionId: qid,
+      }, { merge: true });
+    }
+
+    return { ok: true, reason: "awarded", count: ranked.length };
+  });
+}
+
+
+/* =============================== COMPOSANT =============================== */
+
+/* ====================== ÉTATS & HELPERS INTERNES (PARTIE 2/4) ====================== */
 export default function Admin() {
-  /* ------------ Data & UI ------------ */
+  /* Étape 0 : injecter la config par défaut si absente */
+  useEffect(() => {
+    ensureConfigDefaults().catch((e) => console.error("ensureConfigDefaults error:", e));
+  }, []);
+
+  // Garde locale pour l’attribution auto (anti multi-déclenchements UI)
+  const awardGuardRef = useRef({});
+
+  /* ---------- Helpers internes (déclarés ici pour usage dans tout le composant) ---------- */
+  function parseCSV(input = "") {
+    return String(input).split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  function toCSV(list = []) {
+    return (list || []).join(", ");
+  }
+  function parseHMS(input) {
+    if (input == null) return null;
+    const s = String(input).trim();
+    if (!s) return null;
+
+    // hh:mm:ss | mm:ss | ss
+    if (s.includes(":")) {
+      const parts = s.split(":").map((p) => p.trim());
+      if (parts.length > 3) return null;
+      const [hStr, mStr, sStr] =
+        parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
+      const h = Number(hStr), m = Number(mStr), sec = Number(sStr);
+      if (![h, m, sec].every((n) => Number.isFinite(n) && n >= 0)) return null;
+      if (m >= 60 || sec >= 60) return null;
+      return h * 3600 + m * 60 + sec;
+    }
+    // nombre simple → minutes décimales (legacy)
+    const num = Number(s);
+    if (!Number.isFinite(num) || num < 0) return null;
+    return Math.round(num * 60);
+  }
+  function formatHMS(totalSeconds) {
+    if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "";
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = Math.floor(totalSeconds % 60);
+    return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
+  }
+  function getTimeSec(q) {
+    if (!q || typeof q !== "object") return Infinity;
+    if (typeof q.timecodeSec === "number") return q.timecodeSec;            // secondes (nouveau)
+    if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
+    return Infinity;
+  }
+  function coerceOffsetsToNumbers(arr) {
+    const out = [];
+    for (let i = 0; i < 8; i++) {
+      const v = arr?.[i];
+      if (typeof v === "number" && Number.isFinite(v)) out[i] = v;
+      else if (typeof v === "string" && v.trim()) {
+        const p = parseHMS(v);
+        out[i] = p == null ? null : p;
+      } else {
+        out[i] = null;
+      }
+    }
+    return out;
+  }
+  function roundIndexOfTime(t, offsets) {
+    if (!Array.isArray(offsets)) return 0;
+    let idx = -1;
+    for (let i = 0; i < offsets.length; i++) {
+      const v = offsets[i];
+      if (typeof v === "number" && t >= v) idx = i;
+    }
+    return Math.max(0, idx);
+  }
+  function withAlpha(hex, alpha = 0.35) {
+    if (typeof hex !== "string") return hex;
+    const s0 = hex.trim();
+    if (!s0.startsWith("#")) return hex;
+
+    const s = s0.slice(1);
+    const A = Math.max(0, Math.min(1, Number(alpha)));
+
+    // #RGB / #RGBA
+    if (s.length === 3 || s.length === 4) {
+      const r = parseInt(s[0] + s[0], 16);
+      const g = parseInt(s[1] + s[1], 16);
+      const b = parseInt(s[2] + s[2], 16);
+      return `rgba(${r}, ${g}, ${b}, ${A})`;
+    }
+    // #RRGGBB / #RRGGBBAA
+    if (s.length === 6 || s.length === 8) {
+      const r = parseInt(s.slice(0, 2), 16);
+      const g = parseInt(s.slice(2, 4), 16);
+      const b = parseInt(s.slice(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${A})`;
+    }
+    return hex;
+  }
+
+  /* --------------------------------- ÉTATS UI/DATA --------------------------------- */
+  // Questions
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
   const [savedRowId, setSavedRowId] = useState(null);
   const [needsOrderInit, setNeedsOrderInit] = useState(false);
+
+  // UI générique
   const [notice, setNotice] = useState(null);
   const [creating, setCreating] = useState(false);
   const [mainBtnBusy, setMainBtnBusy] = useState(false);
   const [adminTab, setAdminTab] = useState("players"); // "players" | "questions"
 
-  // Panneau joueurs
+  // Joueurs (panneau)
   const [players, setPlayers] = useState([]);
   const [playersLoading, setPlayersLoading] = useState(true);
-  const assignedColorRef = useRef(new Set()); // évite de réassigner en boucle
-  const lastAssignedColorRef = useRef(null); // dernière couleur attribuée (anti doublon consécutif)
+  const assignedColorRef = useRef(new Set());
+  const lastAssignedColorRef = useRef(null);
 
-  // ⏱ Ordre d’arrivée (session locale, sans écrire en DB)
-  const playerOrderRef = useRef(new Map());   // id -> index d’arrivée
+  // Ordre d’arrivée local
+  const playerOrderRef = useRef(new Map()); // id -> index d’arrivée
   const nextPlayerOrderRef = useRef(1);
 
-  const connectedCount = useMemo(
-    () => players.filter((p) => !p?.isKicked).length,
-    [players]
-  );
-
-  /* ------------ Rounds & End ------------ */
+  // Rounds & fin
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
-    "00:00:00",
-    "00:16:00",
-    "00:31:00",
-    "00:46:00",
-    "",
-    "",
-    "",
-    "",
+    "00:00:00", "00:16:00", "00:31:00", "00:46:00", "", "", "", "",
   ]);
-  const [roundOffsetsSec, setRoundOffsetsSec] = useState([
-    0, 960, 1860, 2760, null, null, null, null,
-  ]);
+  const [roundOffsetsSec, setRoundOffsetsSec] = useState([0, 960, 1860, 2760, null, null, null, null]);
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [endOffsetStr, setEndOffsetStr] = useState("");
 
-  /* ------------ Intro / fin de manche ------------ */
+  // Intro / fin de manche
   const [isIntro, setIsIntro] = useState(false);
   const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
   const [introRoundIndex, setIntroRoundIndex] = useState(null);
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
 
-  /* ------------ Live state ------------ */
+  // Live state
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
 
-  /* ------------ Création question ------------ */
+  // Création question
   const [newQ, setNewQ] = useState({
     text: "",
     answersCsv: "",
     timeMusicStr: "",
     imageFile: null,
   });
-
   const DEFAULT_REVEAL_PHRASES = [
     "La réponse était :",
     "Il fallait trouver :",
@@ -228,113 +341,98 @@ export default function Admin() {
     "La bonne réponse :",
     "Réponse :",
   ];
-  const [newRevealPhrases, setNewRevealPhrases] = useState([
-    "",
-    "",
-    "",
-    "",
-    "",
-  ]);
+  const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
 
-  /* ------------ Utilitaires temps ------------ */
-  const plannedTimes = useMemo(
-    () =>
-      items
-        .map(getTimeSec)
-        .filter((t) => Number.isFinite(t))
-        .sort((a, b) => a - b),
-    [items]
-  );
+  /* ------------------------------------- EFFECTS ------------------------------------- */
 
-  /* =================== Effects =================== */
-
-  // Charger questions
+  // 1) Charger questions (ordre asc)
   useEffect(() => {
     (async () => {
       setLoading(true);
-      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-      const snap = await getDocs(q);
-      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setItems(arr);
-      setLoading(false);
-      setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
+      try {
+        const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+        const snap = await getDocs(q);
+        const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setItems(arr);
+        setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
+      } catch (e) {
+        console.error("load LesQuestions error:", e);
+      } finally {
+        setLoading(false);
+      }
     })();
   }, []);
 
-  // Écouter config (rounds + fin)
+  // 2) Écouter config (rounds + fin)
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
-      const d = snap.data() || {};
-      if (Array.isArray(d.roundOffsetsSec)) {
-        const offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
-        setRoundOffsetsSec(offs);
-        setRoundOffsetsStr(
-          offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : ""))
-        );
-      }
-      if (typeof d.endOffsetSec === "number") {
-        setQuizEndSec(d.endOffsetSec);
-        setEndOffsetStr(formatHMS(d.endOffsetSec));
-      } else {
-        setQuizEndSec(null);
-        setEndOffsetStr("");
-      }
-    });
-    return () => unsub();
-  }, []);
-
-  // Écouter état live (Timestamp ou startEpochMs)
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
-      const d = snap.data() || {};
-
-      // startMs depuis startAt (Timestamp) OU startEpochMs (number)
-      let startMs = null;
-      if (d.startAt && typeof d.startAt.seconds === "number") {
-        startMs =
-          d.startAt.seconds * 1000 +
-          Math.floor((d.startAt.nanoseconds || 0) / 1e6);
-      } else if (typeof d.startEpochMs === "number") {
-        startMs = d.startEpochMs;
-      }
-
-      setIsRunning(!!d.isRunning);
-      setIsPaused(!!d.isPaused);
-
-      if (!startMs) {
-        setQuizStartMs(null);
-        setPauseAtMs(null);
-        setElapsedSec(0);
-      } else {
-        setQuizStartMs(startMs);
-        if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
-          const pms =
-            d.pauseAt.seconds * 1000 +
-            Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
-          setPauseAtMs(pms);
-        } else {
-          setPauseAtMs(null);
+    const unsub = onSnapshot(
+      doc(db, "quiz", "config"),
+      (snap) => {
+        const d = snap.data() || {};
+        if (Array.isArray(d.roundOffsetsSec)) {
+          const offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
+          setRoundOffsetsSec(offs);
+          setRoundOffsetsStr(offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : "")));
         }
-      }
-
-      // flags
-      setIsIntro(!!d.isIntro);
-      setIntroEndsAtMs(
-        typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null
-      );
-      setIntroRoundIndex(
-        Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null
-      );
-      setLastAutoPausedRoundIndex(
-        Number.isInteger(d.lastAutoPausedRoundIndex)
-          ? d.lastAutoPausedRoundIndex
-          : null
-      );
-    });
+        if (typeof d.endOffsetSec === "number") {
+          setQuizEndSec(d.endOffsetSec);
+          setEndOffsetStr(formatHMS(d.endOffsetSec));
+        } else {
+          setQuizEndSec(null);
+          setEndOffsetStr("");
+        }
+      },
+      (e) => console.error("onSnapshot config error:", e)
+    );
     return () => unsub();
   }, []);
 
-  // Timer local (avec clamp fin de quiz)
+  // 3) Écouter état live (Timestamp ou startEpochMs)
+  useEffect(() => {
+    const unsub = onSnapshot(
+      doc(db, "quiz", "state"),
+      (snap) => {
+        const d = snap.data() || {};
+
+        // startMs depuis startAt (Timestamp) OU startEpochMs (number)
+        let startMs = null;
+        if (d.startAt && typeof d.startAt.seconds === "number") {
+          startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
+        } else if (typeof d.startEpochMs === "number") {
+          startMs = d.startEpochMs;
+        }
+
+        setIsRunning(!!d.isRunning);
+        setIsPaused(!!d.isPaused);
+
+        if (!startMs) {
+          setQuizStartMs(null);
+          setPauseAtMs(null);
+          setElapsedSec(0);
+        } else {
+          setQuizStartMs(startMs);
+          if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
+            const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
+            setPauseAtMs(pms);
+          } else {
+            setPauseAtMs(null);
+          }
+        }
+
+        // flags UI/state
+        setIsIntro(!!d.isIntro);
+        setIntroEndsAtMs(typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null);
+        setIntroRoundIndex(Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null);
+        setLastAutoPausedRoundIndex(
+          Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
+        );
+      },
+      (e) => console.error("onSnapshot state error:", e)
+    );
+    return () => unsub();
+  }, []);
+
+  // 4) Timer local (avec clamp fin de quiz)
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
@@ -352,13 +450,7 @@ export default function Admin() {
 
     const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
     const first = computeNow();
-    setElapsedSec(
-      Number.isFinite(quizEndSec) && first >= quizEndSec
-        ? quizEndSec
-        : first < 0
-          ? 0
-          : first
-    );
+    setElapsedSec(Number.isFinite(quizEndSec) && first >= quizEndSec ? quizEndSec : first < 0 ? 0 : first);
 
     const id = setInterval(() => {
       const raw = computeNow();
@@ -372,16 +464,23 @@ export default function Admin() {
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
-  // Auto-pause à la fin de manche (boundary = nextStart - 1s)
+  // 5) Auto-pause à la fin de manche (boundary = nextStart - 1s)
   useEffect(() => {
     if (!isRunning || isPaused) return;
     if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null)) return;
 
-    const prevIdx = roundIndexOfTime(Math.max(0, elapsedSec - 1), roundOffsetsSec);
+    const prevIdx = (() => {
+      let idx = -1;
+      for (let i = 0; i < roundOffsetsSec.length; i++) {
+        const t = roundOffsetsSec[i];
+        if (Number.isFinite(t) && elapsedSec >= t) idx = i;
+      }
+      return idx;
+    })();
+
     const nextStart =
-      typeof roundOffsetsSec[prevIdx + 1] === "number"
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
+      typeof roundOffsetsSec[prevIdx + 1] === "number" ? roundOffsetsSec[prevIdx + 1] : null;
+
     if (typeof nextStart !== "number") return; // pas de manche suivante
 
     const boundary = Math.max(0, nextStart - 1); // marge 1s
@@ -398,7 +497,205 @@ export default function Admin() {
     }
   }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
 
-  /* =================== Actions =================== */
+  // 6) Écouter /quiz/state/players : normaliser nameNorm + couleur + ordre d’arrivée
+  useEffect(() => {
+    const playersCol = collection(db, "quiz", "state", "players");
+    const unsub = onSnapshot(playersCol, (snap) => {
+      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      // 1) Normaliser nameNorm + 2) Assigner une couleur si manquante
+      arr.forEach((p) => {
+        const pref = doc(db, "quiz", "state", "players", p.id);
+
+        // 1) nameNorm : utile pour la modération et le tri "insensible"
+        if ((!p.nameNorm || typeof p.nameNorm !== "string") && typeof p.name === "string") {
+          updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => { });
+        }
+
+        // 2) Couleur : si manquante, poser une couleur (anti-répétition locale)
+        if (!p.color && !assignedColorRef.current.has(p.id)) {
+          assignedColorRef.current.add(p.id);
+          const prev = lastAssignedColorRef.current;
+          const color = pickColorDifferent(prev);
+          lastAssignedColorRef.current = color;
+          updateDoc(pref, { color }).catch(() => { });
+        }
+      });
+
+      // Mémoriser l’ordre d’arrivée (local, stable)
+      arr.forEach((p) => {
+        if (!playerOrderRef.current.has(p.id)) {
+          playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
+        }
+      });
+
+      // Tri par ordre d’arrivée
+      arr.sort(
+        (a, b) =>
+          (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
+          (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
+      );
+
+      setPlayers(arr);
+      setPlayersLoading(false);
+    });
+
+    return () => unsub();
+  }, []);
+
+  /* ====================== DÉRIVÉS & ACTIONS (PARTIE 3/4) ====================== */
+
+  /* --------- Dérivés simples --------- */
+  const connectedCount = useMemo(
+    () => players.filter((p) => !p?.isKicked).length,
+    [players]
+  );
+
+  const plannedTimes = useMemo(
+    () =>
+      items
+        .map(getTimeSec)
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => a - b),
+    [items]
+  );
+
+  /* --------- Dérivés “rounds & reveal” --------- */
+  const currentRoundIndex = useMemo(() => {
+    let lastIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
+    }
+    if (lastIdx >= 0) return lastIdx;
+    const firstActiveIdx = roundOffsetsSec.findIndex((t) => Number.isFinite(t));
+    return firstActiveIdx !== -1 ? firstActiveIdx : 0;
+  }, [elapsedSec, roundOffsetsSec]);
+
+  const nextRoundIndex = useMemo(() => {
+    if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
+      const idx = lastAutoPausedRoundIndex + 1;
+      return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
+    }
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && t >= elapsedSec) return i;
+    }
+    return null;
+  }, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
+
+  const roundBoundarySec = useMemo(() => {
+    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
+      return null;
+    let prevIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
+    }
+    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+      ? roundOffsetsSec[prevIdx + 1]
+      : null;
+    return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
+  }, [elapsedSec, roundOffsetsSec]);
+
+  const atRoundBoundary = Boolean(
+    isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec
+  );
+
+  // Question courante bornée à la manche
+  const sortedQuestions = useMemo(
+    () => [...items].sort((a, b) => getTimeSec(a) - getTimeSec(b)),
+    [items]
+  );
+
+  const currentRoundStart = useMemo(() => {
+    let s = 0;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) s = t;
+    }
+    return s;
+  }, [elapsedSec, roundOffsetsSec]);
+
+  const currentRoundEnd = useMemo(() => {
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && t > currentRoundStart) return t;
+    }
+    return Infinity;
+  }, [roundOffsetsSec, currentRoundStart]);
+
+  let _activeIdx = -1;
+  for (let i = 0; i < sortedQuestions.length; i++) {
+    const t = getTimeSec(sortedQuestions[i]);
+    if (!Number.isFinite(t) || t < currentRoundStart) continue;
+    if (t <= elapsedSec && t < currentRoundEnd) _activeIdx = i;
+    else if (t >= currentRoundEnd) break;
+  }
+  const currentQuestion = _activeIdx >= 0 ? sortedQuestions[_activeIdx] : null;
+
+  // Prochain événement (question / frontière / fin)
+  let nextTimeSec = null;
+  for (let i = 0; i < sortedQuestions.length; i++) {
+    const t = getTimeSec(sortedQuestions[i]);
+    if (Number.isFinite(t) && t > elapsedSec) { nextTimeSec = t; break; }
+  }
+  const _nextRoundStart = (() => {
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const v = roundOffsetsSec[i];
+      if (typeof v === "number" && v > elapsedSec) return v;
+    }
+    return null;
+  })();
+  const nextRoundBoundary = Number.isFinite(_nextRoundStart) ? Math.max(0, _nextRoundStart - 1) : null;
+
+  const candidates = [];
+  if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
+  if (Number.isFinite(nextRoundBoundary)) candidates.push(nextRoundBoundary);
+  if (Number.isFinite(quizEndSec)) candidates.push(quizEndSec);
+  const effectiveNextTimeSec = candidates.length ? Math.min(...candidates) : null;
+
+  // Fenêtres reveal / countdown
+  const REVEAL_DURATION_SEC = DEFAULT_REVEAL_DURATION_SEC;
+  const COUNTDOWN_START_SEC = 5;
+  const revealStart = effectiveNextTimeSec != null ? (effectiveNextTimeSec - REVEAL_DURATION_SEC) : null;
+  const countdownStart = effectiveNextTimeSec != null ? (effectiveNextTimeSec - COUNTDOWN_START_SEC) : null;
+
+  const isRevealAnswerPhase = Boolean(
+    currentQuestion &&
+    revealStart != null &&
+    countdownStart != null &&
+    elapsedSec >= revealStart &&
+    elapsedSec < countdownStart &&
+    !isPaused
+  );
+
+  const isCountdownPhase = Boolean(
+    currentQuestion &&
+    countdownStart != null &&
+    effectiveNextTimeSec != null &&
+    elapsedSec >= countdownStart &&
+    elapsedSec < effectiveNextTimeSec &&
+    !isPaused
+  );
+
+  /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
+  useEffect(() => {
+    const qid = currentQuestion?.id || null;
+    const isReveal = isRevealAnswerPhase || isCountdownPhase;
+    if (!qid || !isReveal) return;
+
+    if (awardGuardRef.current[qid]) return; // garde UI locale (une fois par qid)
+
+    awardGuardRef.current[qid] = "pending";
+    ensureAwardsForQuestionTx(qid)
+      .catch((e) => {
+        console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
+        delete awardGuardRef.current[qid]; // autorise un retry si échec
+      });
+  }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase, elapsedSec, isPaused]);
+
+  /* ------------------------------- Actions: Questions ------------------------------- */
 
   async function recalcAllTimecodesFromOrder() {
     try {
@@ -425,7 +722,7 @@ export default function Admin() {
         await batch.commit();
       }
 
-      // Rafraîchit la table
+      // Rafraîchir le tableau
       const snap2 = await getDocs(q);
       setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
     } catch (e) {
@@ -434,7 +731,7 @@ export default function Admin() {
     }
   }
 
-  // Modifs inline des champs question
+  // Édits inline
   const handleFieldChange = (id, field, value) => {
     setItems((prev) =>
       prev.map((it) => {
@@ -459,20 +756,14 @@ export default function Admin() {
     try {
       const secs = nextStrs.map((s) => {
         const t = (s || "").trim();
-        if (!t) return null; // vide => désactivée
+        if (!t) return null;
         const v = parseHMS(t);
         if (v == null) throw new Error("format");
         return v;
       });
-      await setDoc(
-        doc(db, "quiz", "config"),
-        { roundOffsetsSec: secs },
-        { merge: true }
-      );
+      await setDoc(doc(db, "quiz", "config"), { roundOffsetsSec: secs }, { merge: true });
       setRoundOffsetsSec(secs);
-      setRoundOffsetsStr(
-        secs.map((s) => (typeof s === "number" ? formatHMS(s) : ""))
-      );
+      setRoundOffsetsStr(secs.map((s) => (typeof s === "number" ? formatHMS(s) : "")));
       setNotice("Offsets enregistrés");
       setTimeout(() => setNotice(null), 1500);
     } catch {
@@ -486,12 +777,9 @@ export default function Admin() {
       const t = (valStr || "").trim();
       const v = t ? parseHMS(t) : null; // null = pas de fin
       if (t && v == null) throw new Error("format");
-      await setDoc(
-        doc(db, "quiz", "config"),
-        { endOffsetSec: v },
-        { merge: true }
-      );
+      await setDoc(doc(db, "quiz", "config"), { endOffsetSec: v }, { merge: true });
       setEndOffsetStr(v != null ? formatHMS(v) : "");
+      setQuizEndSec(v);
       setNotice("Fin du quiz enregistrée");
       setTimeout(() => setNotice(null), 1500);
     } catch {
@@ -512,7 +800,7 @@ export default function Admin() {
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => {},
+          () => { },
           (err) => {
             console.error("[UPLOAD] Erreur:", err);
             alert("Échec de l’upload : " + (err?.message || err));
@@ -558,14 +846,12 @@ export default function Admin() {
             ? it.answers
             : [],
         timeMusicSec: nextTimeMusicSec,
-        // timecodeSec se recalculera automatiquement après changements d’ordre/TimeMusic
         timecodeSec: typeof it.timecodeSec === "number" ? it.timecodeSec : null,
         imageUrl: it.imageUrl || "",
         order:
           typeof it.order === "number"
             ? it.order
             : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
-        // revealPhrases inchangé (création uniquement)
       };
 
       await updateDoc(doc(db, "LesQuestions", it.id), payload);
@@ -584,6 +870,7 @@ export default function Admin() {
       })();
     }
   };
+
   const removeOne = async (id) => {
     if (!confirm("Supprimer cette question ?")) return;
     await deleteDoc(doc(db, "LesQuestions", id));
@@ -595,22 +882,11 @@ export default function Admin() {
 
   // Reorder
   const swapOrder = async (indexA, indexB) => {
-    if (
-      indexA < 0 ||
-      indexB < 0 ||
-      indexA >= items.length ||
-      indexB >= items.length
-    )
-      return;
-    const a = items[indexA],
-      b = items[indexB];
+    if (indexA < 0 || indexB < 0 || indexA >= items.length || indexB >= items.length) return;
+    const a = items[indexA], b = items[indexB];
     const batch = writeBatch(db);
-    batch.update(doc(db, "LesQuestions", a.id), {
-      order: b.order ?? (indexB + 1) * 1000,
-    });
-    batch.update(doc(db, "LesQuestions", b.id), {
-      order: a.order ?? (indexA + 1) * 1000,
-    });
+    batch.update(doc(db, "LesQuestions", a.id), { order: b.order ?? (indexB + 1) * 1000 });
+    batch.update(doc(db, "LesQuestions", b.id), { order: a.order ?? (indexA + 1) * 1000 });
     await batch.commit();
     const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
     const snap = await getDocs(q);
@@ -624,9 +900,7 @@ export default function Admin() {
     const snap = await getDocs(q);
     const arr = snap.docs.map((d, i) => ({ id: d.id, ...d.data(), idx: i }));
     const batch = writeBatch(db);
-    arr.forEach((it, i) =>
-      batch.update(doc(db, "LesQuestions", it.id), { order: (i + 1) * 1000 })
-    );
+    arr.forEach((it, i) => batch.update(doc(db, "LesQuestions", it.id), { order: (i + 1) * 1000 }));
     await batch.commit();
     const q2 = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
     const snap2 = await getDocs(q2);
@@ -656,20 +930,14 @@ export default function Admin() {
         text: newQ.text || "",
         answers,
         timeMusicSec,
-        timecodeSec: null, // sera calculé par recalcAllTimecodesFromOrder
+        timecodeSec: null, // recalculé par recalcAllTimecodesFromOrder
         imageUrl,
         createdAt: new Date(),
         order,
-        revealPhrases: cleanedRevealPhrases, // [] autorisé → fallback côté client
+        revealPhrases: cleanedRevealPhrases, // [] autorisé → fallback côté clients
       });
 
-      setNewQ({
-        text: "",
-        answersCsv: "",
-        timeMusicStr: "",
-        imageFile: null,
-      });
-
+      setNewQ({ text: "", answersCsv: "", timeMusicStr: "", imageFile: null });
       setNewRevealPhrases(["", "", "", "", ""]);
     } catch (err) {
       console.error("createOne error:", err);
@@ -683,7 +951,8 @@ export default function Admin() {
     }
   };
 
-  // Live controls
+  /* ------------------------------- Actions: Live ------------------------------- */
+
   const startQuiz = async () => {
     try {
       const nowMs = Date.now();
@@ -704,29 +973,6 @@ export default function Admin() {
     }
   };
 
-  const resetQuiz = async () => {
-    try {
-      await setDoc(
-        doc(db, "quiz", "state"),
-        {
-          isRunning: false,
-          isPaused: false,
-          startAt: null,
-          startEpochMs: null,
-          pauseAt: null,
-          isIntro: false,
-          introEndsAtMs: null,
-          introRoundIndex: null,
-          lastAutoPausedRoundIndex: null,
-        },
-        { merge: true }
-      );
-    } catch (err) {
-      console.error("resetQuiz error:", err);
-      alert("Impossible de réinitialiser : " + (err?.message || err));
-    }
-  };
-
   const pauseQuiz = async () => {
     try {
       await setDoc(
@@ -734,7 +980,7 @@ export default function Admin() {
         {
           isPaused: true,
           pauseAt: serverTimestamp(),
-          // Pause MANUELLE : on efface la sentinelle pour ne pas afficher "Fin de manche"
+          // Pause MANUELLE : effacer la sentinelle pour ne pas afficher "Fin de manche"
           lastAutoPausedRoundIndex: null,
         },
         { merge: true }
@@ -784,7 +1030,7 @@ export default function Admin() {
     try {
       const newStartMs = Date.now() - Math.max(0, Math.floor(elapsedSec)) * 1000;
 
-      // Si on est pile à la frontière (boundary = nextStart - 1), on arme la sentinelle
+      // Si on est pile à la frontière (boundary = nextStart - 1), armer la sentinelle
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
@@ -902,13 +1148,23 @@ export default function Admin() {
     //    - si elapsed < boundary (nextStart - 1) → SAUT au début de la manche suivante
     //    - sinon → reprise simple
     if (isPaused) {
-      const nextRoundStart = actives.find((t) => t > elapsedSec);
+      let nextRoundStart = null;
+      if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
+        const idx = lastAutoPausedRoundIndex + 1;
+        nextRoundStart = Number.isFinite(roundOffsetsSec[idx]) ? roundOffsetsSec[idx] : null;
+      } else {
+        nextRoundStart = actives.find((t) => t >= elapsedSec);
+      }
       if (typeof nextRoundStart !== "number") {
         setNotice("Aucune manche suivante");
         setTimeout(() => setNotice(null), 1800);
         return;
       }
       const boundary = Math.max(0, nextRoundStart - 1);
+
+      // PATCH(Admin): attribuer la question en pause avant de quitter la manche
+      await awardCurrentQuestionIfNeeded();
+
       if (elapsedSec < boundary) {
         await jumpToRoundStartAndPlay(nextRoundStart);
       } else {
@@ -917,6 +1173,21 @@ export default function Admin() {
       return;
     }
   };
+
+  // PATCH(Admin): helper pour attribuer la question active si besoin
+  async function awardCurrentQuestionIfNeeded() {
+    try {
+      const qid = currentQuestion?.id || null; // currentQuestion est déjà dérivé plus bas
+      if (!qid) return { ok: false, reason: "no-active-question" };
+      const res = await ensureAwardsForQuestionTx(qid);
+      if (res?.reason) console.log("[Admin] awardCurrentQuestionIfNeeded:", res.reason);
+      return res;
+    } catch (e) {
+      console.error("[Admin] awardCurrentQuestionIfNeeded error:", e);
+      return { ok: false, reason: "error" };
+    }
+  }
+
 
   const handleBack = async () => {
     if (!isPaused) return;
@@ -970,16 +1241,16 @@ export default function Admin() {
       return;
     }
 
-    const currentRoundStart =
+    const currentRoundStartLocal =
       roundOffsetsSec
         .filter((t) => typeof t === "number" && t <= elapsedSec)
         .slice(-1)[0] ?? 0;
-    const currentRoundEnd =
-      roundOffsetsSec.find((t) => typeof t === "number" && t > currentRoundStart) ??
-      Infinity;
+    const currentRoundEndLocal =
+      roundOffsetsSec.find((t) => typeof t === "number" && t > currentRoundStartLocal) ?? Infinity;
 
-    const next = plannedTimes.find((t) => t > elapsedSec && t < currentRoundEnd);
+    const next = plannedTimes.find((t) => t > elapsedSec && t < currentRoundEndLocal);
     if (typeof next === "number") {
+      await awardCurrentQuestionIfNeeded(); // PATCH(Admin): attribuer la question en pause avant de sauter
       await seekTo(next);
     } else {
       setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
@@ -1016,45 +1287,207 @@ export default function Admin() {
     }
   }
 
-  /* =================== Derived =================== */
-  const currentRoundIndex = useMemo(() => {
-    let lastIdx = -1;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
+  /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
+
+  // Récupère un N unique et libre pour "Player N"
+  async function getNextAliasNumber() {
+    const stateRef = doc(db, "quiz", "state");
+    let reservedN = await runTransaction(db, async (tx) => {
+      const snap = await tx.get(stateRef);
+      const data = snap.exists() ? snap.data() : {};
+      const current = Number.isFinite(data?.aliasCounter) ? data.aliasCounter : 1;
+      const next = current + 1;
+      tx.set(stateRef, { aliasCounter: next }, { merge: true });
+      return current; // on utilise la valeur actuelle
+    });
+
+    // Collision (rare) : si "Player reservedN" existe déjà -> on boucle
+    while (true) {
+      const nameNorm = normKey(`Player ${reservedN}`);
+      const playersCol = collection(db, "quiz", "state", "players");
+      const q = query(playersCol, where("nameNorm", "==", nameNorm));
+      const snap = await getDocs(q);
+      if (snap.empty) return reservedN;
+
+      reservedN = await runTransaction(db, async (tx) => {
+        const snap2 = await tx.get(stateRef);
+        const data2 = snap2.exists() ? snap2.data() : {};
+        const current2 = Number.isFinite(data2?.aliasCounter) ? data2.aliasCounter : 1;
+        const next2 = current2 + 1;
+        tx.set(stateRef, { aliasCounter: next2 }, { merge: true });
+        return current2;
+      });
     }
-    if (lastIdx >= 0) return lastIdx;
-    const firstActiveIdx = roundOffsetsSec.findIndex((t) => Number.isFinite(t));
-    return firstActiveIdx !== -1 ? firstActiveIdx : 0;
-  }, [elapsedSec, roundOffsetsSec]);
+  }
 
-  const nextRoundIndex = useMemo(() => {
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && t > elapsedSec) return i;
+  async function rejectPlayer(playerId, currentName) {
+    try {
+      const playersCol = collection(db, "quiz", "state", "players");
+      const ref = doc(playersCol, playerId);
+
+      // Lire l’état courant pour savoir si c’est un alias “Player N”
+      const snap = await getDoc(ref);
+      if (!snap.exists()) return;
+      const d = snap.data() || {};
+
+      const isAliased = !!d.isAlias; // flag posé par “Player N”
+      const norm = normKey(typeof d.name === "string" ? d.name : (currentName || ""));
+
+      // Base: passer en "rejected" et déverrouiller
+      const baseUpdates = {
+        nameStatus: "rejected",
+        nameLocked: false,
+        isAlias: false,
+        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+      };
+
+      // ⛔️ On n’ajoute PAS “player n” dans rejectedNames
+      const updates = isAliased
+        ? baseUpdates
+        : { ...baseUpdates, rejectedNames: arrayUnion(norm) };
+
+      await updateDoc(ref, updates);
+    } catch (e) {
+      console.error("rejectPlayer failed:", e);
     }
-    return null;
-  }, [elapsedSec, roundOffsetsSec]);
+  }
 
-  // Frontière de fin de manche avec marge 1s
-  const roundBoundarySec = useMemo(() => {
-    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
-      return null;
-    let prevIdx = -1;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
+  async function kickPlayer(id) {
+    try {
+      const playersCol = collection(db, "quiz", "state", "players");
+      await updateDoc(doc(playersCol, id), { isKicked: true });
+    } catch (e) {
+      console.error("kickPlayer", e);
     }
-    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
-      ? roundOffsetsSec[prevIdx + 1]
-      : null;
-    return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-  }, [elapsedSec, roundOffsetsSec]);
+  }
 
-  const atRoundBoundary = Boolean(
-    isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec
-  );
+  async function renameToAlias(playerId) {
+    try {
+      const n = await getNextAliasNumber();
+      const alias = `Player ${n}`;
+      const aliasNorm = normKey(alias);
 
+      const playersCol = collection(db, "quiz", "state", "players");
+      const ref = doc(playersCol, playerId);
+
+      await updateDoc(ref, {
+        name: alias,
+        nameNorm: aliasNorm,
+        nameLocked: true,        // verrouille le nom
+        nameStatus: "locked",    // UI: bouton "Player N" devient "Owned :)"
+        isAlias: true,
+        aliasNumber: n,
+        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+      });
+    } catch (e) {
+      console.error("renameToAlias", e);
+    }
+  }
+
+  // Supprime tous les joueurs (en batchs)
+  async function deleteAllPlayers() {
+    const playersCol = collection(db, "quiz", "state", "players");
+    const snap = await getDocs(playersCol);
+    const ids = snap.docs.map((d) => d.id);
+
+    while (ids.length) {
+      const chunk = ids.splice(0, 400);
+      const batch = writeBatch(db);
+      chunk.forEach((id) => batch.delete(doc(playersCol, id)));
+      await batch.commit();
+    }
+  }
+
+  // Purge complète de answers/* (submissions + awards + doc racine)
+  async function purgeAnswersTree() {
+    const answersCol = collection(db, "answers");
+    const answersSnap = await getDocs(answersCol);
+
+    for (const qDoc of answersSnap.docs) {
+      const qid = qDoc.id;
+
+      // Submissions/*
+      const subsCol = collection(db, "answers", qid, "submissions");
+      const subsSnap = await getDocs(subsCol);
+      if (!subsSnap.empty) {
+        const ids = subsSnap.docs.map((d) => d.id);
+        while (ids.length) {
+          const chunk = ids.splice(0, 400);
+          const batch = writeBatch(db);
+          chunk.forEach((sid) => batch.delete(doc(subsCol, sid)));
+          await batch.commit();
+        }
+      }
+
+      // Awards/*
+      const awardsCol = collection(db, "answers", qid, "awards");
+      const awardsSnap = await getDocs(awardsCol);
+      if (!awardsSnap.empty) {
+        const ids = awardsSnap.docs.map((d) => d.id);
+        while (ids.length) {
+          const chunk = ids.splice(0, 400);
+          const batch = writeBatch(db);
+          chunk.forEach((aid) => batch.delete(doc(awardsCol, aid)));
+          await batch.commit();
+        }
+      }
+
+      // Doc racine answers/{qid}
+      await deleteDoc(doc(answersCol, qid));
+    }
+  }
+
+  async function resetQuizAndPlayers() {
+    const ok = window.confirm("Tout remettre à zéro ? (quiz/state, joueurs, answers/*)");
+    if (!ok) return;
+
+    setNotice("Réinitialisation…");
+    try {
+      // 1) Stopper proprement /quiz/state
+      await setDoc(
+        doc(db, "quiz", "state"),
+        {
+          isRunning: false,
+          isPaused: false,
+          startAt: null,
+          startEpochMs: null,
+          pauseAt: null,
+          isIntro: false,
+          introEndsAtMs: null,
+          introRoundIndex: null,
+          lastAutoPausedRoundIndex: null,
+        },
+        { merge: true }
+      );
+
+      // 2) Purger toute l’arbo answers/*
+      await purgeAnswersTree();
+
+      // 3) Supprimer tous les joueurs
+      await deleteAllPlayers();
+
+      // 4) Marqueur de reset + compteur d’alias
+      await setDoc(
+        doc(db, "quiz", "state"),
+        {
+          playersResetAt: serverTimestamp(),
+          aliasCounter: 1,
+        },
+        { merge: true }
+      );
+
+      setNotice("Réinitialisation terminée ✔");
+      setTimeout(() => setNotice(null), 1800);
+    } catch (e) {
+      console.error("resetQuizAndPlayers error:", e);
+      setNotice("Échec de la réinitialisation");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  /* ================= UI DÉRIVÉES & RENDU (PARTIE 4/4) ================= */
+
+  /* --- Couleurs & libellés UI --- */
   const roundColors = [
     "#e96db1ff", // M1
     "#fb923c",  // M2
@@ -1065,8 +1498,6 @@ export default function Admin() {
     "#cf72f4ff",// M7
     "#2b7bf3ff",// M8
   ];
-
-  // Alpha de fond des lignes du tableau
   const ROUND_BG_ALPHA = 0.70;
 
   const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
@@ -1093,38 +1524,64 @@ export default function Admin() {
       ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
 
-  // Pause « soft-disabled »
   const canClickPause = isRunning && !isPaused && !isQuizEnded;
   const pauseCursor = canClickPause ? "pointer" : "not-allowed";
 
-  /* =================== UI =================== */
+  // ===== Rangs (égalité) pour l'affichage des médailles et du rang (sans toucher l'ordre du tableau)
+  const rankingForAdmin = useMemo(() => {
+    // On calcule un classement "virtuel" trié par score puis alpha,
+    // puis on assigne un _rank avec égalités (règle compétition).
+    const rows = (players || [])
+      .filter((p) => !p?.isKicked)
+      .map((p) => ({
+        id: p.id,
+        score: Number(p.score || 0),
+        _nameKey: normKey(p.name || ""), // réutilise ton helper
+      }));
+
+    rows.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score; // score desc
+      return a._nameKey.localeCompare(b._nameKey);        // alpha
+    });
+
+    // Rangs avec égalités
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = p.score;
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;    // égalité → même rang
+      } else {
+        p._rank = i + 1;       // rang = position (1-based)
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+
+    // Map id → _rank pour lookup rapide pendant le rendu
+    return new Map(rows.map((r) => [r.id, r._rank]));
+  }, [players]);
+
+  /* --- Tableau Questions (mémo) --- */
   const table = useMemo(() => {
     if (loading) return <p>Chargement…</p>;
     if (!items.length) return <p>Aucune question.</p>;
 
     return (
       <div style={{ overflowX: "auto" }}>
-        <table
-          style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}
-        >
+        <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
           <thead style={{ background: "#2c5d8bff", color: "white" }}>
             <tr>
               <th style={{ width: 110, textAlign: "left", padding: "10px" }}>Ordre</th>
-              <th style={{ width: "20%", textAlign: "left", padding: "10px" }}>
-                Question
-              </th>
-              <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>
-                Réponses acceptées
-              </th>
-              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>
-                TimeMusic
-              </th>
-              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>
-                TimeCode
-              </th>
-              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>
-                Image
-              </th>
+              <th style={{ width: "20%", textAlign: "left", padding: "10px" }}>Question</th>
+              <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>Réponses acceptées</th>
+              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>TimeMusic</th>
+              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>TimeCode</th>
+              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>Image</th>
               <th style={{ width: 180, padding: "10px" }}>Actions</th>
             </tr>
           </thead>
@@ -1147,10 +1604,9 @@ export default function Admin() {
                     ? formatHMS(it.timeMusicSec)
                     : "";
 
-              // Détermine la couleur de fond de la ligne en fonction de la manche
+              // Couleur de fond par manche
               const tSec = getTimeSec(it);
               let rowBg = undefined;
-
               if (Number.isFinite(tSec) && !(Number.isFinite(quizEndSec) && tSec >= quizEndSec)) {
                 let rIdx = -1;
                 for (let k = 0; k < roundOffsetsSec.length; k++) {
@@ -1164,15 +1620,8 @@ export default function Admin() {
               return (
                 <tr key={it.id} style={{ borderTop: "1px solid #333", background: rowBg }}>
                   <td style={{ verticalAlign: "top", padding: "12px", whiteSpace: "nowrap" }}>
-                    <button onClick={() => swapOrder(i, i - 1)} disabled={i === 0}>
-                      ↑
-                    </button>{" "}
-                    <button
-                      onClick={() => swapOrder(i, i + 1)}
-                      disabled={i === items.length - 1}
-                    >
-                      ↓
-                    </button>
+                    <button onClick={() => swapOrder(i, i - 1)} disabled={i === 0}>↑</button>{" "}
+                    <button onClick={() => swapOrder(i, i + 1)} disabled={i === items.length - 1}>↓</button>
                     <div style={{ fontSize: 12, opacity: 0.7 }}>({it.order ?? "—"})</div>
                   </td>
 
@@ -1181,12 +1630,7 @@ export default function Admin() {
                       rows={2}
                       value={it.text || ""}
                       onChange={(e) => handleFieldChange(it.id, "text", e.target.value)}
-                      style={{
-                        width: "100%",
-                        boxSizing: "border-box",
-                        margin: "4px 0",
-                        resize: "vertical",
-                      }}
+                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0", resize: "vertical" }}
                     />
                   </td>
 
@@ -1198,9 +1642,7 @@ export default function Admin() {
                       placeholder="ex: Goku, Son Goku"
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
-                    <div style={{ fontSize: 12, opacity: 0.7 }}>
-                      Sépare par des virgules
-                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.7 }}>Sépare par des virgules</div>
                   </td>
 
                   <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
@@ -1244,22 +1686,13 @@ export default function Admin() {
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(e) =>
-                        handleImageChange(it.id, e.target.files?.[0] || null)
-                      }
+                      onChange={(e) => handleImageChange(it.id, e.target.files?.[0] || null)}
                       disabled={it._imageUploading}
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
                   </td>
 
-                  <td
-                    style={{
-                      textAlign: "center",
-                      whiteSpace: "nowrap",
-                      verticalAlign: "top",
-                      padding: "12px",
-                    }}
-                  >
+                  <td style={{ textAlign: "center", whiteSpace: "nowrap", verticalAlign: "top", padding: "12px" }}>
                     <button onClick={() => saveOne(it)} disabled={savingId === it.id}>
                       {savingId === it.id ? "Modification…" : "Modifier"}
                     </button>{" "}
@@ -1279,175 +1712,8 @@ export default function Admin() {
     );
   }, [items, loading, savingId, savedRowId, roundOffsetsSec, quizEndSec]);
 
-  useEffect(() => {
-    const playersCol = collection(doc(db, "quiz", "state"), "players");
 
-    const unsub = onSnapshot(playersCol, (snap) => {
-      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-      // Assigner une couleur random si absente (une seule fois par id)
-      arr.forEach((p) => {
-        if (!p.color && !assignedColorRef.current.has(p.id)) {
-          assignedColorRef.current.add(p.id);
-          const prev = lastAssignedColorRef.current;
-          const color = pickColorDifferent(prev);
-          lastAssignedColorRef.current = color;
-
-          // Fire & forget (ne bloque pas l'UI si échec)
-          updateDoc(doc(playersCol, p.id), { color }).catch(() => {});
-        }
-      });
-
-      // 🔢 Ordre d'arrivée local : on mémorise la première apparition
-      arr.forEach((p) => {
-        if (!playerOrderRef.current.has(p.id)) {
-          playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
-        }
-      });
-
-      // Tri par ordre d'arrivée (stable vis-à-vis des renommages/refus)
-      arr.sort(
-        (a, b) =>
-          (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
-          (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
-      );
-
-      setPlayers(arr);
-      setPlayersLoading(false);
-    });
-
-    return () => unsub();
-  }, []);
-
-  // Récupère un N unique et libre pour "Player N"
-  async function getNextAliasNumber() {
-    const stateRef = doc(db, "quiz", "state");
-    let reservedN = await runTransaction(db, async (tx) => {
-      const snap = await tx.get(stateRef);
-      const data = snap.exists() ? snap.data() : {};
-      const current = Number.isFinite(data?.aliasCounter) ? data.aliasCounter : 1;
-      const next = current + 1;
-      tx.update(stateRef, { aliasCounter: next });
-      return current; // on utilise la valeur actuelle
-    });
-
-    // Collision (rare) : si "Player reservedN" existe déjà -> on boucle
-    while (true) {
-      const nameNorm = normKey(`Player ${reservedN}`);
-      const playersCol = collection(doc(db, "quiz", "state"), "players");
-      const q = query(playersCol, where("nameNorm", "==", nameNorm));
-      const snap = await getDocs(q);
-      if (snap.empty) return reservedN;
-      reservedN = await runTransaction(db, async (tx) => {
-        const snap2 = await tx.get(stateRef);
-        const data2 = snap2.exists() ? snap2.data() : {};
-        const current2 = Number.isFinite(data2?.aliasCounter) ? data2.aliasCounter : 1;
-        const next2 = current2 + 1;
-        tx.update(stateRef, { aliasCounter: next2 });
-        return current2;
-      });
-    }
-  }
-
-  // Actions panneau joueurs
-  async function rejectPlayer(playerId, currentName) {
-    try {
-      const playersCol = collection(doc(db, "quiz", "state"), "players");
-      const ref = doc(playersCol, playerId);
-
-      // Lire l’état courant pour savoir si c’est un alias “Player N”
-      const snap = await getDoc(ref);
-      if (!snap.exists()) return;
-      const d = snap.data() || {};
-
-      const isAliased = !!d.isAlias; // flag posé par “Player N”
-      const norm = normKey(typeof d.name === "string" ? d.name : (currentName || ""));
-
-      // Base: passer en "rejected" et déverrouiller
-      const baseUpdates = {
-        nameStatus: "rejected",
-        nameLocked: false,
-        isAlias: false,
-        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
-      };
-
-      // ⛔️ On n’ajoute PAS “player n” dans rejectedNames
-      const updates = isAliased
-        ? baseUpdates
-        : { ...baseUpdates, rejectedNames: arrayUnion(norm) };
-
-      await updateDoc(ref, updates);
-    } catch (e) {
-      console.error("rejectPlayer failed:", e);
-    }
-  }
-
-  async function kickPlayer(id) {
-    try {
-      const playersCol = collection(doc(db, "quiz", "state"), "players");
-      await updateDoc(doc(playersCol, id), { isKicked: true });
-    } catch (e) {
-      console.error("kickPlayer", e);
-    }
-  }
-
-  async function renameToAlias(playerId) {
-    try {
-      const n = await getNextAliasNumber();
-      const alias = `Player ${n}`;
-      const aliasNorm = normKey(alias);
-
-      const playersCol = collection(doc(db, "quiz", "state"), "players");
-      const ref = doc(playersCol, playerId);
-
-      await updateDoc(ref, {
-        name: alias,
-        nameNorm: aliasNorm,
-        nameLocked: true,        // verrouille le nom
-        nameStatus: "locked",    // UI: bouton "Player N" devient "Owned :)"
-        isAlias: true,
-        aliasNumber: n,
-        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
-      });
-    } catch (e) {
-      console.error("renameToAlias", e);
-    }
-  }
-
-  // Supprime tous les joueurs (en batchs de 400)
-  async function deleteAllPlayers() {
-    const playersCol = collection(doc(db, "quiz", "state"), "players");
-    const snap = await getDocs(playersCol);
-    const ids = snap.docs.map((d) => d.id);
-
-    while (ids.length) {
-      const chunk = ids.splice(0, 400);
-      const batch = writeBatch(db);
-      chunk.forEach((id) => batch.delete(doc(playersCol, id)));
-      await batch.commit();
-    }
-  }
-
-  async function resetQuizAndPlayers() {
-    const ok = window.confirm("Réinitialiser le quiz ET supprimer tous les joueurs ?");
-    if (!ok) return;
-    try {
-      await Promise.resolve(resetQuiz());
-    } catch (e) {
-      console.warn("resetQuiz a échoué ou n'est pas async, on continue la purge des joueurs.", e);
-    }
-    try {
-      await deleteAllPlayers();
-    } catch (e) {
-      console.error("Suppression des joueurs échouée :", e);
-    }
-    await updateDoc(doc(db, "quiz", "state"), {
-      playersResetAt: serverTimestamp(),
-      aliasCounter: 1,
-    });
-  }
-
-  /* =================== Render =================== */
+  /* --------------------------------- Rendu --------------------------------- */
   return (
     <div style={{ background: "#0a0a1a", color: "white", minHeight: "100vh", padding: 20 }}>
       {/* Header */}
@@ -1750,20 +2016,15 @@ export default function Admin() {
                   width: "100%",
                   borderCollapse: "collapse",
                   tableLayout: "fixed",
-                  minWidth: 820
+                  minWidth: 820,
                 }}
               >
                 <thead>
                   <tr style={{ background: "#0b1e3d" }}>
-                    <th style={{ textAlign: "left", padding: "10px 8px" }}>
-                      Joueur
-                    </th>
-                    <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>
-                      Statut
-                    </th>
-                    <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>
-                      Actions
-                    </th>
+                    <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueurs</th>
+                    <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score</th>
+                    <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>Statut</th>
+                    <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1773,6 +2034,14 @@ export default function Admin() {
                       p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
                     const statusColor =
                       p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
+
+                    const isAliased = !!p.nameLocked || p.nameStatus === "locked";
+                    // Rang (égalité) + médaille
+                    const rank = rankingForAdmin.get(p.id) ?? null;
+                    const s = Number(p.score || 0);
+                    const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+
+
 
                     return (
                       <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
@@ -1806,6 +2075,19 @@ export default function Admin() {
                           </div>
                         </td>
 
+                        <td style={{ padding: "8px", textAlign: "center" }} title={rank != null ? `Rang #${rank}` : undefined}>
+                          <span
+                            style={{
+                              fontVariantNumeric: "tabular-nums",
+                              fontWeight: 800,
+                              letterSpacing: 0.2,
+                            }}
+                          >
+                            {Number(p.score || 0)}
+                          </span>
+                          {medal && <span style={{ marginLeft: 6 }}>{medal}</span>}
+                        </td>
+
                         <td style={{ padding: "8px", textAlign: "center" }}>
                           <span
                             style={{
@@ -1820,6 +2102,7 @@ export default function Admin() {
                             {status}
                           </span>
                         </td>
+
                         <td style={{ padding: "8px" }}>
                           <button
                             onClick={() => rejectPlayer(p.id, p.name)}
@@ -1840,34 +2123,31 @@ export default function Admin() {
                           >
                             Refuser
                           </button>
-                          {(() => {
-                            const isAliased = !!p.nameLocked || p.nameStatus === "locked";
-                            return (
-                              <button
-                                onClick={() => renameToAlias(p.id)}
-                                disabled={!isRunning || isAliased}
-                                title={
-                                  !isRunning
-                                    ? "Disponible une fois le quiz lancé"
-                                    : isAliased
-                                      ? "Nom modéré (verrouillé)"
-                                      : "Fixer le nom sur « Player N »"
-                                }
-                                style={{
-                                  padding: "6px 10px",
-                                  borderRadius: 6,
-                                  border: "1px solid #2a2a2a",
-                                  background: isAliased ? "#e5e7eb" : "#c7d2fe",
-                                  color: "#111827",
-                                  fontWeight: 600,
-                                  opacity: !isRunning || isAliased ? 0.6 : 1,
-                                  cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
-                                }}
-                              >
-                                {isAliased ? "Owned :)" : "Player N"}
-                              </button>
-                            );
-                          })()}
+
+                          <button
+                            onClick={() => renameToAlias(p.id)}
+                            disabled={!isRunning || isAliased}
+                            title={
+                              !isRunning
+                                ? "Disponible une fois le quiz lancé"
+                                : isAliased
+                                  ? "Nom modéré (verrouillé)"
+                                  : "Fixer le nom sur « Player N »"
+                            }
+                            style={{
+                              padding: "6px 10px",
+                              borderRadius: 6,
+                              border: "1px solid #2a2a2a",
+                              background: isAliased ? "#e5e7eb" : "#c7d2fe",
+                              color: "#111827",
+                              fontWeight: 600,
+                              opacity: !isRunning || isAliased ? 0.6 : 1,
+                              cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {isAliased ? "Owned :)" : "Player N"}
+                          </button>
+
                           <button
                             onClick={() => kickPlayer(p.id)}
                             disabled={p.isKicked}
@@ -1890,6 +2170,7 @@ export default function Admin() {
                       </tr>
                     );
                   })}
+
                   {players.length === 0 && !playersLoading && (
                     <tr>
                       <td colSpan={3} style={{ padding: 12, opacity: 0.7 }}>

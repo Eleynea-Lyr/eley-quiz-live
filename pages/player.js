@@ -1,10 +1,14 @@
 // /pages/player.js
+
+/*Partie 1/4 (imports, constantes, helpers) */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
 import {
   collection,
   doc,
   getDocs,
+  getDoc,
+  setDoc,
   onSnapshot,
   orderBy,
   query,
@@ -13,9 +17,88 @@ import {
   where,
   serverTimestamp,
   deleteDoc,
+  runTransaction,
 } from "firebase/firestore";
 
 /* ============================== CONSTANTES ============================== */
+
+/* ===== Instant Win (helpers) ===== */
+const FALLBACK_SCORING_TABLE = [
+  30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
+];
+
+let _cachedScoring = null;
+async function getScoringTable(db) {
+  if (_cachedScoring) return _cachedScoring;
+  try {
+    const cfgRef = doc(db, "quiz", "config");
+    const snap = await getDoc(cfgRef);
+    const table = (snap.exists() && Array.isArray(snap.data().scoringTable))
+      ? snap.data().scoringTable
+      : FALLBACK_SCORING_TABLE;
+    _cachedScoring = table;
+    return table;
+  } catch (e) {
+    console.error("[getScoringTable] fallback due to error:", e);
+    _cachedScoring = FALLBACK_SCORING_TABLE;
+    return FALLBACK_SCORING_TABLE;
+  }
+}
+
+/**
+ * Marque la première bonne réponse du joueur et calcule rang/points prédits.
+ * Écrit/merge dans:
+ *   - answers/{qid}             → { correctCount: N }
+ *   - answers/{qid}/submissions/{playerId}
+ *       → { isCorrect, firstCorrectAt, predictedRank, predictedPoints }
+ * Retourne { predictedRank, predictedPoints }.
+ * Idempotent: si déjà correct, ne double-compte pas.
+ */
+async function recordFirstCorrectAndPredict({ db, qid, playerId }) {
+  if (!qid || !playerId) {
+    throw new Error("[recordFirstCorrectAndPredict] Missing qid or playerId");
+  }
+  const table = await getScoringTable(db);
+  const qRef = doc(db, "answers", qid);
+  const subRef = doc(db, "answers", qid, "submissions", playerId);
+
+  return await runTransaction(db, async (tx) => {
+    const subSnap = await tx.get(subRef);
+
+    // Si déjà marqué correct, retourner ce qu'on a (évite double incrément).
+    if (subSnap.exists() && subSnap.data().isCorrect) {
+      const d = subSnap.data() || {};
+      const predictedRank = d.predictedRank ?? null;
+      const predictedPoints = d.predictedPoints ?? null;
+      if (predictedRank != null && predictedPoints != null) {
+        return { predictedRank, predictedPoints };
+      }
+      return { predictedRank: 0, predictedPoints: 0 };
+    }
+
+    // Lire compteur de corrects pour cette question
+    const qSnap = await tx.get(qRef);
+    const cur = qSnap.exists() ? (qSnap.data().correctCount || 0) : 0;
+    const next = cur + 1;
+
+    // Mettre à jour le compteur
+    tx.set(qRef, { correctCount: next }, { merge: true });
+
+    const predictedRank = next;
+    const predictedPoints = table[predictedRank - 1] ?? 0;
+
+    // Marquer la submission du joueur
+    tx.set(subRef, {
+      isCorrect: true,
+      firstCorrectAt: serverTimestamp(),
+      predictedRank,
+      predictedPoints,
+    }, { merge: true });
+
+    return { predictedRank, predictedPoints };
+  });
+}
+
 // Anti-spam
 const RATE_LIMIT_ENABLED = true;
 const MAX_WRONG_ATTEMPTS = 5;        // nb de tentatives avant blocage
@@ -208,7 +291,7 @@ function moderationReason(raw) {
     if (joined.includes(` ${phrase} `)) return "politics";
   }
 
-  // Mots politiques (si un token politique apparaît)
+  // Mots politiques
   const hasPoliticalWord = tokens.some((t) => POLITICS_TOKENS.has(t));
   if (hasPoliticalWord) return "politics";
 
@@ -245,16 +328,62 @@ function Splash() {
   );
 }
 
+function normalizeNameAlpha(s) {
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function messageForRank(rank) {
+  if (rank === 1) return "Quel talent, tu es premier !";
+  if (rank === 2) return "Félicitations, tu termines second !";
+  if (rank === 3) return "Bravo, tu es 3e avec un très beau score !";
+  if (rank === 4) return "Bravo, tu finis quatrième, si proche du podium !";
+  if (Number.isInteger(rank))
+    return `C'était le Quiz d'Eley. Tu finis à la ${rank}ᵉ place. Merci pour ta participation !`;
+  return "Merci pour ta participation !";
+}
+function medalForRank(rank) {
+  return rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "";
+}
+
+/* Partie 2/4 — état React + abonnements Firestore + timers*/
+
 /* =============================== COMPOSANT =============================== */
+
 export default function Player() {
-  const [hydrated, setHydrated] = useState(false);            // localStorage lu
-  const [stateLoaded, setStateLoaded] = useState(false);       // 1er /quiz/state reçu
-  const [playerDocLoaded, setPlayerDocLoaded] = useState(false); // 1er doc joueur reçu
-  const [splashReleased, setSplashReleased] = useState(false); // Splash affiché seulement au premier boot
+  /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
-  /* -------- Données & timing -------- */
+  // Leaderboard (fin de quiz)
+  const [playersLB, setPlayersLB] = useState([]);
+
+  // Id local (persisté)
+  const myIdRef = useRef(null);
+  useEffect(() => {
+    try {
+      myIdRef.current =
+        localStorage.getItem("playerId") ||
+        localStorage.getItem("playerID") ||
+        localStorage.getItem("player_id") ||
+        null;
+    } catch { }
+  }, []);
+
+  // Instant win (affichage immédiat + anti double-appel)
+  const [instantWin, setInstantWin] = useState(null);
+  const lastInstantWinQidRef = useRef(null);
+
+  // Boot flags
+  const [hydrated, setHydrated] = useState(false);              // localStorage lu
+  const [stateLoaded, setStateLoaded] = useState(false);        // 1er /quiz/state reçu
+  const [playerDocLoaded, setPlayerDocLoaded] = useState(false);// 1er doc joueur reçu
+  const [splashReleased, setSplashReleased] = useState(false);  // Splash affiché 1x
+
+  // Données & timing globaux
   const [questionsList, setQuestionsList] = useState([]);
-
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
@@ -263,8 +392,9 @@ export default function Player() {
 
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
+  const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
 
-  // Inscription
+  // Joueur / inscription
   const [playerId, setPlayerId] = useState(null);
   const [playerName, setPlayerName] = useState("");
   const [inputName, setInputName] = useState("");
@@ -273,15 +403,28 @@ export default function Player() {
   const [busy, setBusy] = useState(false);
   const [isKicked, setIsKicked] = useState(false);
   const [rejectedNames, setRejectedNames] = useState([]);
-  const selfRenameRef = useRef(false); // true si le joueur déclenche "Modifier mon nom"
+  const selfRenameRef = useRef(false); // true si le joueur a déclenché un renommage
 
-  // Fin de manche (pilotée via /quiz/state)
+  // Sentinelle fin de manche (posée côté Admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
 
-  // Joueur / input
+  // Réponse / saisie
   const [answer, setAnswer] = useState("");
   const [result, setResult] = useState(null);
   const answerInputRef = useRef(null);
+  const lastAnswerQidRef = useRef(null); // sécurité anti-stale
+  // Horodatage (elapsedSec) de la 1ʳᵉ bonne réponse par question
+  const answeredAtRef = useRef({}); // { [qid]: number }
+
+
+  // ---- Détection Back (rewind) ----
+  const prevElapsedSecRef = useRef(null);
+  const prevQuestionIdRef = useRef(null);
+  const prevQidRef = useRef(null);
+  // Mémo Back : question concernée + si le joueur avait DÉJÀ trouvé avant le Back
+  const backInfoRef = useRef({ lastBackQid: null, hadCorrectBeforeBack: false });
+  const [backTick, setBackTick] = useState(0); // force un re-render lors d'un Back
+
 
   // Anti-spam
   const [wrongTimes, setWrongTimes] = useState([]); // timestamps ms des erreurs
@@ -289,16 +432,17 @@ export default function Player() {
   const [cooldownTick, setCooldownTick] = useState(0);
   const [lockPhraseIndex, setLockPhraseIndex] = useState(null);
 
-  /* =============================== Effects =============================== */
-
-  // Charger identité locale
+  // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
 
+  /* =============================== EFFECTS =============================== */
+
+  // 1) Charger identité locale + cache rejets + gestion param ?reset=1
   useEffect(() => {
     const url = new URL(window.location.href);
     if (url.searchParams.get("reset") === "1") {
-      pendingResetRef.current = true; // on note la demande
-      url.searchParams.delete("reset"); // on nettoie l'URL
+      pendingResetRef.current = true;
+      url.searchParams.delete("reset");
       window.history.replaceState({}, "", url.toString());
     } else {
       const pid = localStorage.getItem("playerId");
@@ -307,7 +451,6 @@ export default function Player() {
       if (pname) setPlayerName(pname);
     }
 
-    // Recharger la cache locale des noms refusés
     try {
       const raw = localStorage.getItem("rejectedNamesCache");
       if (raw) {
@@ -318,32 +461,29 @@ export default function Player() {
     setHydrated(true);
   }, []);
 
+  // 2) Si ?reset=1 et quiz pas lancé → autoriser rename (suppr doc + reset local)
   useEffect(() => {
     if (!pendingResetRef.current) return;
     if (isRunning) {
-      // Quiz lancé → on ignore la demande utilisateur
-      pendingResetRef.current = false;
+      pendingResetRef.current = false; // quiz lancé → ignorer
       return;
     }
-    // Quiz pas lancé → on autorise le "Modifier mon nom" via resetAndDeletePlayer
     pendingResetRef.current = false;
     resetAndDeletePlayer();
   }, [isRunning]);
 
-  // Suivre mon doc joueur pour voir si refusé / kické / verrouillé
+  // 3) Suivre mon doc joueur (kick, nom, rejectedNames, lock)
   useEffect(() => {
     if (!playerId) return;
-    
+
     const playersCol = collection(doc(db, "quiz", "state"), "players");
     const ref = doc(playersCol, playerId);
 
     const unsub = onSnapshot(ref, (snap) => {
-      // 1) Le doc n'existe plus
       if (!snap.exists()) {
         const selfInitiated = selfRenameRef.current === true;
         selfRenameRef.current = false;
 
-        // Invalider l'identité locale
         localStorage.removeItem("playerId");
         localStorage.removeItem("playerName");
         setPlayerId(null);
@@ -353,44 +493,34 @@ export default function Player() {
         setIsKicked(false);
 
         if (!selfInitiated) {
-          // Reset Admin → purge aussi la blocklist locale
           localStorage.removeItem("rejectedNamesCache");
           setRejectedNames([]);
         }
         return;
       }
 
-      // 2) Le doc existe : lecture des champs
       const d = snap.data() || {};
 
-      // KICK → écran bloquant + message
       setIsKicked(!!d.isKicked);
       if (d.isKicked) {
         setError("Vous avez été retiré de la partie.");
       } else if (d.nameStatus === "rejected") {
-        // Nom refusé par l’admin → retour au formulaire avec champ vidé
         setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
-        setInputName(""); // on efface pour réafficher le placeholder
+        setInputName("");
       } else {
         setError("");
       }
 
-      // Nom courant (affichage / badge)
       if (typeof d.name === "string") {
         setPlayerName(d.name);
         localStorage.setItem("playerName", d.name);
       }
-
-      // Verrouillage (après “Player N”)
       setNameLocked(!!d.nameLocked);
 
-      // 3) Blocklist (noms refusés) : serveur + cache local (union)
       let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
+      const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
+      serverRejected = serverRejected.filter((n) => !isAliasNameLocal(n));
 
-      // Filtre défensif : on ne garde pas les alias "player N"
-      serverRejected = serverRejected.filter((n) => !isAliasName(n));
-
-      // Charger le cache local (tolérant)
       let prev = [];
       try {
         const raw = localStorage.getItem("rejectedNamesCache");
@@ -399,66 +529,26 @@ export default function Player() {
       } catch {
         prev = [];
       }
-
-      // Union unique (serveur ∪ cache local), en filtrant aussi le local par sécurité
-      const union = Array.from(new Set([...prev.filter((n) => !isAliasName(n)), ...serverRejected]));
-
-      // Persister et mémoriser
+      const union = Array.from(new Set([...prev.filter((n) => !isAliasNameLocal(n)), ...serverRejected]));
       localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
       setRejectedNames(union);
+
       setPlayerDocLoaded(true);
     });
 
     return () => unsub();
   }, [playerId]);
 
+  // 4) Si aucun playerId → considérer le doc joueur "chargé"
   useEffect(() => {
     if (!playerId) setPlayerDocLoaded(true);
   }, [playerId]);
 
-  // État "running" simple (utilisé pour l'écran d'attente et reset URL)
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
-      const d = snap.data() || {};
-      setIsRunning(!!d.isRunning);
-    });
-    return () => unsub();
-  }, []);
-
-  //forcer la purge locale
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
-      const d = snap.data() || {};
-      const t = d.playersResetAt;
-      if (t && typeof t.seconds === "number") {
-        const ms = t.seconds * 1000 + Math.floor((t.nanoseconds || 0) / 1e6);
-        const prev = Number(localStorage.getItem("playersResetAt") || 0);
-        if (!Number.isFinite(prev) || ms > prev) {
-          // Nouveau reset détecté → purge des caches liés aux noms refusés
-          localStorage.setItem("playersResetAt", String(ms));
-          localStorage.removeItem("rejectedNamesCache");
-          setRejectedNames([]);
-        }
-      }
-    });
-    return () => unsub();
-  }, []);
-
-  // Récup questions
-  useEffect(() => {
-    (async () => {
-      const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
-      const snapshot = await getDocs(q);
-      setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
-    })();
-  }, []);
-
-  // État live (Timestamp OU startEpochMs)
+  // 5) Abonnement principal /quiz/state
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
 
-      // startMs depuis startAt (Timestamp) OU startEpochMs (number)
       let startMs = null;
       if (d.startAt && typeof d.startAt.seconds === "number") {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
@@ -489,28 +579,77 @@ export default function Player() {
         }
       }
 
-      // Fin de manche (sentinelle posée côté admin)
       setLastAutoPausedRoundIndex(
         Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
       );
+
       setStateLoaded(true);
     });
     return () => unsub();
   }, []);
 
-  // Config (manches + fin)
+  // 6) Purge blocklist locale à chaque reset global
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
+      const d = snap.data() || {};
+      const t = d.playersResetAt;
+      if (t && typeof t.seconds === "number") {
+        const ms = t.seconds * 1000 + Math.floor((t.nanoseconds || 0) / 1e6);
+        const prev = Number(localStorage.getItem("playersResetAt") || 0);
+        if (!Number.isFinite(prev) || ms > prev) {
+          localStorage.setItem("playersResetAt", String(ms));
+          localStorage.removeItem("rejectedNamesCache");
+          setRejectedNames([]);
+        }
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // 7) Récupérer les questions
+  useEffect(() => {
+    (async () => {
+      const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
+      const snapshot = await getDocs(q);
+      setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+    })();
+  }, []);
+
+  // 8) Config (manches + fin + durée de révélation)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
       const d = snap.data();
       setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
       setRoundOffsetsSec(
-        Array.isArray(d?.roundOffsetsSec) ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null)) : []
+        Array.isArray(d?.roundOffsetsSec)
+          ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null))
+          : []
       );
+      const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
+      setRevealDurationSec(rv);
     });
     return () => unsub();
   }, []);
 
-  // Timer local (avec clamp fin de quiz)
+  // 8.5) Abonnement players → alimente le leaderboard local
+  useEffect(() => {
+    const col = collection(doc(db, "quiz", "state"), "players");
+    const unsub = onSnapshot(col, (snap) => {
+      const arr = snap.docs.map((d) => {
+        const v = d.data() || {};
+        return {
+          id: d.id,
+          name: v.name || "",
+          score: Number(v.score || 0),
+          isKicked: !!v.isKicked,
+        };
+      });
+      setPlayersLB(arr);
+    });
+    return () => unsub();
+  }, []);
+
+  // 9) Timer local (avec clamp fin de quiz)
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
@@ -547,14 +686,9 @@ export default function Player() {
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
-  // Ticker cooldown (anti-spam)
-  useEffect(() => {
-    if (!cooldownUntilMs) return;
-    const id = setInterval(() => setCooldownTick((t) => t + 1), 250);
-    return () => clearInterval(id);
-  }, [cooldownUntilMs]);
-
+  /* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
   /* ===================== Dérivés & calculs d'écran ===================== */
+
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
 
   // Début/fin de la manche courante
@@ -574,7 +708,7 @@ export default function Player() {
     return Infinity;
   })();
 
-  // Question courante (dernière question dans la fenêtre de la manche actuelle)
+  // Question courante
   let activeIndex = -1;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
@@ -604,7 +738,7 @@ export default function Player() {
   const inRoundBoundaryWindow =
     secondsToRoundBoundary != null &&
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
-    secondsToRoundBoundary >= -0.25; // petite tolérance
+    secondsToRoundBoundary >= -0.25;
 
   let effectiveNextTimeSec = null;
   let nextKind = null; // "question" | "round" | "end"
@@ -621,14 +755,14 @@ export default function Player() {
   // Bornes de la question courante
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
   const boundary = effectiveNextTimeSec;
-  const qEnd = boundary != null ? boundary - REVEAL_DURATION_SEC : null;
+  const qEnd = boundary != null ? boundary - revealDurationSec : null;
 
   // 1ʳᵉ question de la manche courante ?
   const firstQuestionTimeInCurrentRound = (() => {
     for (let i = 0; i < sorted.length; i++) {
       const t = getTimeSec(sorted[i]);
       if (!Number.isFinite(t)) continue;
-      if (t >= currentRoundStart && t < currentRoundEnd) return t; // sorted asc → premier suffit
+      if (t >= currentRoundStart && t < currentRoundEnd) return t;
     }
     return null;
   })();
@@ -638,7 +772,7 @@ export default function Player() {
     Number.isFinite(firstQuestionTimeInCurrentRound) &&
     qStart === firstQuestionTimeInCurrentRound;
 
-  // Fenêtre d’intro (compte à rebours 5→1) au S.D. de la 1ʳᵉ question de la manche
+  // Fenêtre d’intro
   const introStart = isFirstQuestionOfRound ? qStart : null;
   const introEnd = isFirstQuestionOfRound && Number.isFinite(qStart)
     ? qStart + ROUND_START_INTRO_SEC
@@ -675,7 +809,7 @@ export default function Player() {
 
   // Phases
   const nextEvent = effectiveNextTimeSec;
-  const revealStart = nextEvent != null ? nextEvent - REVEAL_DURATION_SEC : null;
+  const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
 
   const isQuestionPhase = Boolean(
@@ -737,22 +871,52 @@ export default function Player() {
 
   // Reset UI quand la question change
   const currentQuestionId = currentQuestion?.id ?? null;
+  // Reset UI complet à chaque changement de question
   useEffect(() => {
+    lastAnswerQidRef.current = null;
+    lastInstantWinQidRef.current = null;
+    setInstantWin(null);
     setResult(null);
     setAnswer("");
     setWrongTimes([]);
     setCooldownUntilMs(null);
     setLockPhraseIndex(null);
+
+    // reset détection Back pour la nouvelle question
+    prevElapsedSecRef.current = null;
+    prevQuestionIdRef.current = null;
+    backInfoRef.current = { lastBackQid: null, hadCorrectBeforeBack: false };
   }, [currentQuestionId]);
 
+  // Phrase de révélation et réponse primaire (pour l’écran Reveal)
   const revealPhrase = useMemo(
     () => (currentQuestion ? pickRevealPhrase(currentQuestion) : ""),
     [currentQuestionId]
   );
+
   const primaryAnswer = useMemo(() => {
     const a = currentQuestion?.answers;
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
+
+
+  // Préchargement image
+  useEffect(() => {
+    if (currentQuestion?.imageUrl) {
+      const img = new Image();
+      img.src = currentQuestion.imageUrl;
+    }
+  }, [currentQuestion?.imageUrl]);
+
+  // Flags de rendu global
+  const showPreStart = !(quizStartMs && isRunning);
+  const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
+
+  // Splash : relâcher après boot initial
+  const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
+  useEffect(() => {
+    if (initialBootReady) setSplashReleased(true);
+  }, [initialBootReady]);
 
   // Anti-spam (dérivés)
   const nowMs = Date.now() + cooldownTick; // force re-render pendant cooldown
@@ -767,7 +931,58 @@ export default function Player() {
   const answersOpen = Boolean(isQuestionPhase && !isLocked);
   const showInput = Boolean(answersOpen && result !== "correct");
 
-  /* ============================ Vérification ============================ */
+  // Bannière réponse persistante pendant la phase question
+  const hasAnsweredThisQuestion =
+    (instantWin && instantWin.qid === currentQuestionId) ||
+    lastAnswerQidRef.current === currentQuestionId ||
+    result === "correct";
+
+  const gainedPoints =
+    instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
+
+  /* ======= Effets dépendant des dérivés (APRES le bloc de dérivés) ======= */
+
+  // 9.5) Watcher Back : si elapsedSec recule sur la même question → Back détecté.
+  //     On mémorise si le joueur AVAIT déjà la bonne réponse avant ce Back.
+  useEffect(() => {
+    const qid = currentQuestionId;
+
+    // reset si on change de question
+    if (qid && prevQidRef.current && prevQidRef.current !== qid) {
+      backInfoRef.current = { lastBackQid: null, hadCorrectBeforeBack: false };
+    }
+
+    // détection Back : elapsedSec qui diminue d’au moins 1s
+    if (
+      qid &&
+      prevQidRef.current === qid &&
+      typeof prevElapsedSecRef.current === "number" &&
+      elapsedSec < prevElapsedSecRef.current - 0.9
+    ) {
+      // Avais-je déjà répondu juste AVANT ce Back ?
+      const tAnswer = answeredAtRef.current[qid];
+      const hadAlready =
+        Number.isFinite(tAnswer) && Number.isFinite(prevElapsedSecRef.current)
+          ? tAnswer <= prevElapsedSecRef.current   // la réponse existait et était antérieure au Back
+          : tAnswer != null; // fallback si pas d’horodatage
+      backInfoRef.current = { lastBackQid: qid, hadCorrectBeforeBack: !!hadAlready };
+      setBackTick((t) => t + 1); // re-render pour rafraîchir le texte de la bannière
+
+    }
+
+    prevQidRef.current = qid;
+    prevElapsedSecRef.current = elapsedSec;
+  }, [elapsedSec, currentQuestionId, result]);
+
+  // 10) Ticker de cooldown (anti-spam)
+  useEffect(() => {
+    if (!cooldownUntilMs) return;
+    const id = setInterval(() => setCooldownTick((t) => t + 1), 250);
+    return () => clearInterval(id);
+  }, [cooldownUntilMs]);
+
+  /* ============================ Vérification & Handlers ============================ */
+
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
     const userInput = normalize(answer);
@@ -777,13 +992,21 @@ export default function Player() {
     );
 
     if (isCorrect) {
+      lastAnswerQidRef.current = currentQuestion?.id || null;
       setResult("correct");
       setAnswer("");
+      // Mémorise quand la bonne réponse a été donnée (robuste aux Back)
+      if (currentQuestion?.id && Number.isFinite(elapsedSec)) {
+        const qid = currentQuestion.id;
+        if (answeredAtRef.current[qid] == null) {
+          answeredAtRef.current[qid] = elapsedSec;
+        }
+      }
+
     } else {
       setResult("wrong");
       setAnswer("");
 
-      // fenêtre glissante 15s
       setWrongTimes((prev) => {
         const now = Date.now();
         const pruned = prev.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
@@ -791,12 +1014,11 @@ export default function Player() {
         if (RATE_LIMIT_ENABLED && nextArr.length >= MAX_WRONG_ATTEMPTS && !isLocked) {
           setCooldownUntilMs(now + COOLDOWN_MS);
           setLockPhraseIndex(() => Math.floor(Math.random() * LOCK_PHRASES.length));
-          return []; // reset après blocage
+          return [];
         }
         return nextArr;
       });
 
-      // refocus + animations
       setTimeout(() => {
         const el = answerInputRef.current;
         if (el) {
@@ -821,17 +1043,101 @@ export default function Player() {
     checkAnswer();
   };
 
-  // Préchargement image
+  // === Instant win (prédiction rang/points dès qu'une réponse devient correcte) ===
   useEffect(() => {
-    if (currentQuestion?.imageUrl) {
-      const img = new Image();
-      img.src = currentQuestion.imageUrl;
+    const qid = currentQuestionId;
+    if (!qid) return;
+    if (!(result === "correct" && isQuestionPhase)) return;
+    if (lastAnswerQidRef.current !== qid) return;
+    if (lastInstantWinQidRef.current === qid) return;
+    if (!playerId) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const { predictedRank, predictedPoints } = await recordFirstCorrectAndPredict({
+          db,
+          qid,
+          playerId,
+        });
+        if (cancelled) return;
+        setInstantWin({ qid, rank: predictedRank, points: predictedPoints, at: Date.now() });
+        lastInstantWinQidRef.current = qid;
+        // Mémorise aussi l’instant de la 1ʳᵉ bonne réponse (utile pour savoir si c’était AVANT un Back)
+        if (Number.isFinite(elapsedSec) && answeredAtRef.current[qid] == null) {
+          answeredAtRef.current[qid] = elapsedSec;
+        }
+      } catch (e) {
+        console.error("[instantWin effect] error:", e);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [currentQuestionId, result, isQuestionPhase, playerId, elapsedSec]);
+
+  // ==== Classement (TOP-LEVEL; jamais dans un if / fonction) ====
+  const ranking = useMemo(() => {
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .map((p) => ({
+        ...p,
+        _nameKey: normalizeNameAlpha(p.name || ""),
+        score: Number(p.score || 0),
+      }));
+    rows.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score; // score desc
+      return a._nameKey.localeCompare(b._nameKey);
+    });
+    // RANGS AVEC ÉGALITÉS
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = Number(p.score || 0);
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;
+      } else {
+        p._rank = i + 1;
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+    return rows;
+  }, [playersLB]);
+
+  const meRow = useMemo(() => {
+    if (playerId) {
+      const byId = ranking.find((p) => p.id === playerId);
+      if (byId) return byId;
     }
-  }, [currentQuestion?.imageUrl]);
+    if (myIdRef.current) {
+      const byRef = ranking.find((p) => p.id === myIdRef.current);
+      if (byRef) return byRef;
+    }
+    if (playerName) {
+      const key = normalizeNameAlpha(playerName);
+      const byName = ranking.find((p) => normalizeNameAlpha(p.name || "") === key);
+      if (byName) return byName;
+    }
+    return null;
+  }, [ranking, playerId, playerName]);
 
-  const showPreStart = !(quizStartMs && isRunning);
-  const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
+  const myRank = useMemo(() => (meRow ? meRow._rank : null), [meRow]);
+  const myScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
+  const myMedal = useMemo(
+    () => (Number(myScore) > 0 ? medalForRank(myRank) : ""),
+    [myRank, myScore]
+  );
+  const myEndMessage = useMemo(() => {
+    return Number(myScore) > 0
+      ? messageForRank(myRank)
+      : "Merci pour ta participation !";
+  }, [myRank, myScore]);
 
+  /* ===== Helpers Firestore pour le nom ===== */
   async function nameExists(nameNorm, excludeId = null) {
     const playersCol = collection(doc(db, "quiz", "state"), "players");
     const q = query(playersCol, where("nameNorm", "==", nameNorm));
@@ -853,7 +1159,6 @@ export default function Player() {
       return;
     }
 
-    // Blocklist locale/serveur — alias "Player N" autorisé
     const nameIsAlias = isAliasName(inputName);
     const nameNorm = normalizeName(v.value);
     if (!nameIsAlias && Array.isArray(rejectedNames) && rejectedNames.includes(nameNorm)) {
@@ -871,7 +1176,6 @@ export default function Player() {
       const playersCol = collection(doc(db, "quiz", "state"), "players");
 
       if (!playerId) {
-        // 1ʳᵉ inscription : créer un doc
         const ref = await addDoc(playersCol, {
           name: v.value,
           nameNorm,
@@ -879,7 +1183,7 @@ export default function Player() {
           score: 0,
           isKicked: false,
           nameStatus: "ok",
-          rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [], // réinjecte l’historique local
+          rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [],
         });
         setPlayerId(ref.id);
         localStorage.setItem("playerId", ref.id);
@@ -887,7 +1191,6 @@ export default function Player() {
         setPlayerName(v.value);
         setInputName("");
       } else {
-        // Renommage (après refus ou volontaire)
         await updateDoc(doc(playersCol, playerId), {
           name: v.value,
           nameNorm,
@@ -907,15 +1210,14 @@ export default function Player() {
 
   async function resetAndDeletePlayer() {
     try {
-      selfRenameRef.current = true; // indique que la suppression du doc vient du joueur
+      selfRenameRef.current = true;
       const pid = playerId || localStorage.getItem("playerId");
       if (pid) {
         const playersCol = collection(doc(db, "quiz", "state"), "players");
-        await deleteDoc(doc(playersCol, pid)); // supprime le doc joueur
+        await deleteDoc(doc(playersCol, pid));
       }
     } catch (e) {
       console.error("Suppression du joueur échouée :", e);
-      // On continue malgré tout pour nettoyer localement
     } finally {
       localStorage.removeItem("playerId");
       localStorage.removeItem("playerName");
@@ -926,7 +1228,9 @@ export default function Player() {
     }
   }
 
-  // Flags d’état pour le bouton
+  /* ============================ RENDER (PARTIE 4/4) ============================ */
+
+  // Flags d’état pour le bouton d’inscription
   const normInput = normalizeName(inputName);
 
   // Refusé par l’admin ET ce n’est PAS un alias "Player N"
@@ -942,22 +1246,12 @@ export default function Player() {
     normalizeName(inputName) === normalizeName(playerName || "") &&
     !isAliasName(inputName);
 
-  // Bouton désactivé si occupation, ou nom refusé (hors alias), ou même nom refusé courant (hors alias)
   const isSubmitDisabled = busy || isRejectedInput || isSameAsRejectedCurrent;
 
-  /* ================================ RENDER =============================== */
-  // Garde initiale : on attend la toute première disponibilité, puis on "relâche" le Splash définitivement
-  const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
-
-  // dès que le boot initial est prêt une fois, on ne réaffiche plus jamais le Splash (même si playerDocLoaded rebouge)
-  useEffect(() => {
-    if (initialBootReady) setSplashReleased(true);
-  }, [initialBootReady]);
-
+  // Splash avant 1er boot complet
   if (!splashReleased) return <Splash />;
 
-
-  // 1) Écran d’inscription (P6)
+  // 1) Écran d’inscription (nom refusé ou pas encore inscrit)
   if (!playerId || (typeof error === "string" && error.startsWith("Nom refusé"))) {
     return (
       <div
@@ -987,9 +1281,13 @@ export default function Player() {
               maxLength={30}
               placeholder="ex : Les Quichettes"
               style={{
-                width: "100%", padding: "10px 12px",
-                borderRadius: 10, border: "1px solid #334155",
-                background: "#0b1220", color: "white", fontSize: 16,
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #334155",
+                background: "#0b1220",
+                color: "white",
+                fontSize: 16,
               }}
               autoFocus
             />
@@ -1034,14 +1332,13 @@ export default function Player() {
                   Ce nom a été refusé par l’animateur. Choisis-en un autre.
                 </div>
               )}
-
           </form>
         </div>
       </div>
     );
   }
 
-  // Écran bloquant si le joueur a été retiré
+  // 2) Écran bloquant si le joueur a été retiré
   if (isKicked && playerId) {
     return (
       <div
@@ -1070,7 +1367,7 @@ export default function Player() {
     );
   }
 
-  // Écran d’attente une fois inscrit (avant le lancement par l’Admin)
+  // 3) Écran d’attente une fois inscrit (avant lancement par l’Admin)
   if (showPreStart && playerId) {
     return (
       <div
@@ -1088,7 +1385,10 @@ export default function Player() {
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
             ELEY&nbsp;Quiz — En attente du départ
           </h1>
-          <p style={{ opacity: 0.85, marginTop: 12 }}>
+        </div>
+
+        <div style={{ width: 380, maxWidth: "90vw", marginTop: 12, textAlign: "center" }}>
+          <p style={{ opacity: 0.85 }}>
             {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
             L’Admin n’a pas encore lancé le quiz.
           </p>
@@ -1098,7 +1398,13 @@ export default function Player() {
               Envie de changer de nom ?{" "}
               <button
                 onClick={resetAndDeletePlayer}
-                style={{ color: "#93c5fd", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}
+                style={{
+                  color: "#93c5fd",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  textDecoration: "underline",
+                }}
               >
                 Modifier mon nom
               </button>
@@ -1110,12 +1416,12 @@ export default function Player() {
               </div>
             )
           )}
-
         </div>
       </div>
     );
   }
 
+  // 4) Écran principal pendant le quiz
   return (
     <div
       style={{
@@ -1127,6 +1433,7 @@ export default function Player() {
         position: "relative",
       }}
     >
+      {/* Timer discret en haut-droite */}
       <div
         style={{
           position: "absolute",
@@ -1143,7 +1450,7 @@ export default function Player() {
         ⏱ {formatHMS(elapsedSec)}
       </div>
 
-      {/* Badge nom joueur en haut (quiz lancé) */}
+      {/* Badge nom joueur en haut-gauche */}
       {isRunning && playerName && (
         <div
           style={{
@@ -1169,10 +1476,29 @@ export default function Player() {
         </div>
       )}
 
+      {/* Fin du quiz : message perso + classement */}
       {isQuizEnded ? (
         <>
           <h2 style={{ fontSize: "2rem", marginTop: 24 }}>Fin du quiz</h2>
-          <p style={{ fontSize: "1.2rem", opacity: 0.9 }}>Bravo, tu es troisième !</p>
+          <div
+            style={{
+              marginTop: 8,
+              padding: 12,
+              borderRadius: 12,
+              background: "#0b0f1a",
+              border: "1px solid #1f2a44",
+              textAlign: "center",
+            }}
+          >
+            <div style={{ fontSize: "1.5rem", fontWeight: 800 }}>
+              {myMedal ? `${myMedal} ` : ""}{myEndMessage}
+            </div>
+            {myRank != null && (
+              <div style={{ marginTop: 6, opacity: 0.9 }}>
+                Ton score : <b>{myScore}</b> • Classement : <b>{Number(myScore) > 0 ? `#${myRank}` : "dernier"}</b>
+              </div>
+            )}
+          </div>
         </>
       ) : isRoundBreak ? (
         // Fin de manche — priorité absolue
@@ -1181,8 +1507,27 @@ export default function Player() {
             Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
           </h2>
           <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>
-            (placeholder scoring)
+            (pause de manche)
           </div>
+          <div style={{ marginTop: 10, opacity: 0.9 }}>
+            Ton score actuel est : <b>{myScore}</b>
+          </div>
+          {myRank != null && (
+            <div
+              style={{
+                marginTop: 6,
+                opacity: 0.9,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              {myMedal ? <span aria-label="médaille" title="médaille">{myMedal}</span> : null}
+              <span>Tu es {myRank === 1 ? "1er" : `${myRank}ᵉ`} dans le classement</span>
+            </div>
+          )}
+
+
         </div>
       ) : inRoundBoundaryWindow ? (
         // Fenêtre morte juste avant la frontière
@@ -1199,6 +1544,16 @@ export default function Player() {
           <div style={{ opacity: 0.75, marginTop: 8, fontSize: 14 }}>
             Le quiz est momentanément en pause.
           </div>
+          {/* INFO (pause) : déjà répondu à la question active */}
+          {currentQuestion && (instantWin?.qid === currentQuestion.id || result === "correct") && (
+            <div style={{ marginTop: 10, fontSize: 14, opacity: 0.9 }}>
+              Tu as déjà bien répondu
+              {instantWin?.qid === currentQuestion.id && Number.isFinite(instantWin.points)
+                ? <> (+{instantWin.points} pts)</>
+                : null}
+              .
+            </div>
+          )}
         </div>
       ) : currentQuestion ? (
         <>
@@ -1295,6 +1650,13 @@ export default function Player() {
             </div>
           ) : null}
 
+          {/* Score pendant le REVEAL uniquement (visible pour tous les joueurs) */}
+          {isRevealAnswerPhase && (
+            <div style={{ marginTop: 8, fontWeight: 700 }}>
+              Ton score actuel est de : <b>{myScore}</b>
+            </div>
+          )}
+
           {/* Saisie / anti-spam */}
           <form onSubmit={handleAnswerSubmit}>
             {showInput ? (
@@ -1326,17 +1688,26 @@ export default function Player() {
             ) : null}
           </form>
 
-          {result === "correct" && isQuestionPhase && (
-            <p
+          {/* Réponse : bannière persistante pendant la phase question */}
+          {isQuestionPhase && hasAnsweredThisQuestion && (
+            <div
               style={{
-                color: "lime",
-                fontSize: "2.2rem",
-                fontWeight: 800,
-                marginTop: 20,
+                marginTop: 8,
+                padding: "8px 10px",
+                borderRadius: 10,
+                border: "1px solid #2a2a2a",
+                background: "#0b3a1e",
+                fontWeight: 700,
               }}
             >
-              Bonne réponse
-            </p>
+              {(backInfoRef.current.lastBackQid === currentQuestionId &&
+                backInfoRef.current.hadCorrectBeforeBack === true)
+                ? "Tu as déjà bien répondu à cette question"
+                : "Bonne réponse !"}
+
+              {Number.isFinite(gainedPoints) ? ` +${gainedPoints} pts` : ""}{" "}
+              {instantWin?.rank ? medalForRank(instantWin.rank) : ""}
+            </div>
           )}
         </>
       ) : (

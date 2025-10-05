@@ -1,9 +1,14 @@
 // /pages/screen.js
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
-import { collection, doc, getDocs, onSnapshot, orderBy, query } from "firebase/firestore";
+import {
+  collection, doc, getDocs, getDoc, onSnapshot, orderBy, query,
+  where, runTransaction, serverTimestamp, increment
+} from "firebase/firestore";
 
 /* ============================ CONSTANTES & HELPERS ============================ */
+
+// Phrases de révélation par défaut
 const DEFAULT_REVEAL_PHRASES = [
   "La réponse était :",
   "Il fallait trouver :",
@@ -12,6 +17,7 @@ const DEFAULT_REVEAL_PHRASES = [
   "Réponse :",
 ];
 
+// Phases / timings
 const REVEAL_DURATION_SEC = 20; // 15s avec la réponse + 5s de décompte
 const COUNTDOWN_START_SEC = 5;
 const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
@@ -26,6 +32,7 @@ const BAR_BLUE = "#3b82f6";
 const BAR_RED = "#ef4444";
 const HANDLE_COLOR = "#f8fafc";
 
+// Panneau "Rejoindre" (inline)
 function JoinPanelInline({ size = "md" }) {
   const imgSize = size === "lg" ? 320 : 160;
   const panelStyle = {
@@ -58,6 +65,7 @@ function JoinPanelInline({ size = "md" }) {
   );
 }
 
+// Panneau "Rejoindre" fixé en bas-gauche pendant le quiz
 function JoinPanelFixedBottom() {
   return (
     <div
@@ -75,12 +83,13 @@ function JoinPanelFixedBottom() {
   );
 }
 
-const SCREEN_IMG_MAX = 300; // px
+const SCREEN_IMG_MAX = 300; // px (image de révélation, côté public)
 
+// Time helpers
 function getTimeSec(q) {
   if (!q || typeof q !== "object") return Infinity;
-  if (typeof q.timecodeSec === "number") return q.timecodeSec;
-  if (typeof q.timecode === "number") return Math.round(q.timecode * 60);
+  if (typeof q.timecodeSec === "number") return q.timecodeSec;           // secondes (nouveau)
+  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
   return Infinity;
 }
 function formatHMS(sec) {
@@ -101,6 +110,7 @@ function pickRevealPhrase(q) {
   for (let i = 0; i < seedStr.length; i++) hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
   return pool[hash % pool.length];
 }
+
 // Manches
 function roundIndexOfTime(t, offsets) {
   if (!Array.isArray(offsets)) return 0;
@@ -120,6 +130,7 @@ function nextRoundStartAfter(t, offsets) {
   return null;
 }
 
+// Splash (plein bleu foncé au boot)
 function Splash() {
   return (
     <div
@@ -132,13 +143,124 @@ function Splash() {
   );
 }
 
+// leaderboard
+const DEFAULT_LEADERBOARD_TOP_N = 20;
+
+function normalizeNameAlpha(s) {
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ===== Scoring (défaut) + helpers attribution TX =====
+const DEFAULT_SCORING_TABLE = [30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+
+async function getScoringTableScreen() {
+  try {
+    const snap = await getDoc(doc(db, "quiz", "config"));
+    return (snap.exists() && Array.isArray(snap.data()?.scoringTable))
+      ? snap.data().scoringTable
+      : DEFAULT_SCORING_TABLE;
+  } catch {
+    return DEFAULT_SCORING_TABLE;
+  }
+}
+
+// Attribution transactionnelle et idempotente (robuste aux différents schémas de timestamps)
+async function ensureAwardsForQuestionTx(qid) {
+  if (!qid) return { ok: false, reason: "no-qid" };
+
+  // 1) Lire toutes les bonnes réponses (pas d'ordre imposé)
+  const subsCol = collection(db, "answers", qid, "submissions");
+  let subsSnap;
+  try {
+    subsSnap = await getDocs(query(subsCol, where("isCorrect", "==", true)));
+  } catch (e) {
+    console.error("[Screen] read submissions failed:", e);
+    return { ok: false, reason: "read-failed" };
+  }
+
+  // 2) Normaliser un "temps" en ms pour trier localement
+  function toMs(obj) {
+    if (!obj) return Infinity;
+    if (typeof obj.toMillis === "function") return obj.toMillis(); // Timestamp Firestore
+    if (typeof obj.seconds === "number") {
+      return obj.seconds * 1000 + Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6);
+    }
+    if (typeof obj === "number" && Number.isFinite(obj)) return Math.floor(obj);
+    return Infinity;
+  }
+
+  const raw = subsSnap.docs.map(d => ({ id: d.id, data: d.data() || {} }));
+  const ranked = raw
+    .map(({ id, data }) => {
+      const candidates = [
+        toMs(data.firstCorrectAt),
+        toMs(data.firstCorrectAtMs),
+        toMs(data.createdAt),
+        toMs(data.updatedAt),
+      ];
+      const t = Math.min(...candidates);
+      return { id, t };
+    })
+    .filter(x => Number.isFinite(x.t))
+    .sort((a, b) => a.t - b.t); // plus rapide d’abord
+
+  if (ranked.length === 0) {
+    console.warn("[Screen] no correct submissions for qid=", qid);
+    return { ok: true, reason: "no-correct-submissions" };
+  }
+
+  const table = await getScoringTableScreen();
+  const qDocRef = doc(db, "answers", qid);
+  const playersCol = collection(doc(db, "quiz", "state"), "players");
+
+  // 3) Transaction : idempotence + écritures atomiques
+  return await runTransaction(db, async (tx) => {
+    const snap = await tx.get(qDocRef);
+    if (snap.exists() && snap.data()?.awarded === true) {
+      return { ok: true, reason: "already-awarded" };
+    }
+
+    tx.set(qDocRef, {
+      awarded: true,
+      awardedAt: serverTimestamp(),
+      awardedCount: ranked.length,
+    }, { merge: true });
+
+    for (let i = 0; i < ranked.length; i++) {
+      const pid = ranked[i].id;
+      const points = table[i] ?? 0;
+
+      tx.set(doc(db, "answers", qid, "awards", pid), {
+        points, rank: i + 1, awardedAt: serverTimestamp()
+      }, { merge: true });
+
+      tx.set(doc(playersCol, pid), {
+        score: increment(points),
+        lastDelta: points,
+        lastDeltaForQuestionId: qid,
+      }, { merge: true });
+    }
+
+    return { ok: true, reason: "awarded", count: ranked.length };
+  });
+}
+
 /* ================================== COMPOSANT ================================= */
+
 export default function Screen() {
+  /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
+
+  // Flags de chargement
   const [stateLoaded, setStateLoaded] = useState(false);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [questionsLoaded, setQuestionsLoaded] = useState(false);
 
-  // Données / timing
+  // Données & timing globaux
   const [questionsList, setQuestionsList] = useState([]);
   const [isRunning, setIsRunning] = useState(false);
   const [quizStartMs, setQuizStartMs] = useState(null);
@@ -148,6 +270,12 @@ export default function Screen() {
 
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
+  const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
+
+  // leaderboard
+  const [playersLB, setPlayersLB] = useState([]);
+  const [leaderboardTopN, setLeaderboardTopN] = useState(DEFAULT_LEADERBOARD_TOP_N);
+  const awardGuardRef = useRef({}); // utilisé en Partie 3/4 pour l’attribution des points
 
   // Fin de manche (poussée par l’admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
@@ -162,12 +290,55 @@ export default function Screen() {
     })();
   }, []);
 
-  /* ---- Écouter /quiz/state (startAt Timestamp OU startEpochMs) ---- */
+  /* ----------------------------- Écouter players ------------------------------ */
+  useEffect(() => {
+    const col = collection(doc(db, "quiz", "state"), "players");
+    const unsub = onSnapshot(col, (snap) => {
+      const arr = snap.docs.map((d) => {
+        const v = d.data() || {};
+        return {
+          id: d.id,
+          name: v.name || "",
+          score: Number(v.score || 0),
+          color: v.color || null,
+          isKicked: !!v.isKicked,
+          lastDelta: Number(v.lastDelta || 0),
+          lastDeltaForQuestionId: v.lastDeltaForQuestionId || null,
+          _nameKey: normalizeNameAlpha(v.name || ""),
+        };
+      });
+      setPlayersLB(arr);
+    });
+    return () => unsub();
+  }, []);
+
+  /* ------------------------------- Écouter config ------------------------------ */
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
+      const d = snap.data() || {};
+      // taille du top
+      const topN = Number.isFinite(d?.leaderboardTopN) ? d.leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
+      setLeaderboardTopN(topN);
+      // bornes quiz & manches
+      setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
+      setRoundOffsetsSec(
+        Array.isArray(d?.roundOffsetsSec)
+          ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null))
+          : []
+      );
+      const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
+      setRevealDurationSec(rv);
+      setConfigLoaded(true);
+    });
+    return () => unsub();
+  }, []);
+
+  /* ------------------------------ Écouter /state ------------------------------ */
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = (snap && snap.data()) || {};
 
-      // calcule startMs depuis startAt (Timestamp) OU startEpochMs (number)
+      // startMs depuis startAt (Timestamp) OU startEpochMs (number)
       let startMs = null;
       if (d.startAt && typeof d.startAt.seconds === "number") {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
@@ -200,20 +371,8 @@ export default function Screen() {
       setLastAutoPausedRoundIndex(
         Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
       );
-      setStateLoaded(true);
-    });
-    return () => unsub();
-  }, []);
 
-  /* ------------------------------- Écouter config ------------------------------ */
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
-      const d = snap.data();
-      setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
-      setRoundOffsetsSec(
-        Array.isArray(d?.roundOffsetsSec) ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null)) : []
-      );
-      setConfigLoaded(true);
+      setStateLoaded(true);
     });
     return () => unsub();
   }, []);
@@ -254,6 +413,76 @@ export default function Screen() {
     }, 500);
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+
+  /* ----------------------- Leaderboard (tri & top N) ----------------------- */
+  const leaderboard = useMemo(() => {
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .slice();
+
+    rows.sort((a, b) => {
+      const sa = Number(a.score || 0);
+      const sb = Number(b.score || 0);
+      if (sa !== sb) return sb - sa; // score desc
+      const ak = a._nameKey;
+      const bk = b._nameKey;
+      if (ak < bk) return -1;
+      if (ak > bk) return 1;
+      return 0;
+    });
+
+    // === RANGS AVEC ÉGALITÉS (compétition) ===
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = Number(p.score || 0);
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;           // égalité → même rang
+      } else {
+        p._rank = i + 1;              // rang = position (1-based)
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+
+
+    const top = Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
+    return rows.slice(0, top);
+  }, [playersLB, leaderboardTopN]);
+
+  // Podium (fin de quiz) : groupes de médailles avec égalités, uniquement si score > 0
+  const podium = useMemo(() => {
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .map((p) => ({
+        id: p.id,
+        name: p.name || "",
+        score: Number(p.score || 0),
+        _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+      }))
+      .sort((a, b) => {
+        if (a.score !== b.score) return b.score - a.score; // score desc
+        return a._nameKey.localeCompare(b._nameKey);
+      });
+
+    const distinct = Array.from(new Set(rows.map((r) => r.score))).filter((s) => s > 0);
+    const goldScore = distinct[0];
+    const silverScore = distinct[1];
+    const bronzeScore = distinct[2];
+
+    return {
+      gold: typeof goldScore === "number" ? rows.filter((r) => r.score === goldScore) : [],
+      silver: typeof silverScore === "number" ? rows.filter((r) => r.score === silverScore) : [],
+      bronze: typeof bronzeScore === "number" ? rows.filter((r) => r.score === bronzeScore) : [],
+    };
+  }, [playersLB]);
+
+
+  /* ===================== DÉRIVÉS & LOGIQUE (PARTIE 3/4) ===================== */
 
   /* --------------- Choix question active (borné à la manche courante) --------- */
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
@@ -380,7 +609,7 @@ export default function Screen() {
 
   // Phases bornées (pas de flash)
   const nextEvent = effectiveNextTimeSec;
-  const revealStart = nextEvent != null ? nextEvent - REVEAL_DURATION_SEC : null;
+  const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
 
   const isQuestionPhase = Boolean(
@@ -413,6 +642,26 @@ export default function Screen() {
     !isRoundBreak
   );
 
+  /* ===== Attribution des points : déclenche pendant la fenêtre de révélation ===== */
+  useEffect(() => {
+    const qid = currentQuestion?.id || null;
+    if (!qid) return;
+
+    const inRevealWindow = isRevealAnswerPhase || isCountdownPhase;
+    if (!inRevealWindow) return;
+
+    // Anti double-run (par écran) pour ce qid
+    if (awardGuardRef.current[qid]) return;
+    awardGuardRef.current[qid] = "pending";
+
+    ensureAwardsForQuestionTx(qid).catch((e) => {
+      console.error("[Screen] awards TX error:", e);
+      delete awardGuardRef.current[qid]; // autorise un retry si la TX échoue
+    });
+  }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase]);
+
+  /* ====================== Variables d’UI dérivées (4/4) ====================== */
+
   // Décompte (jamais 0s)
   const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
   const countdownSec = isCountdownPhase
@@ -429,7 +678,7 @@ export default function Screen() {
   }
 
   // Barre de progression
-  const qEndLocal = nextEvent != null ? nextEvent - REVEAL_DURATION_SEC : null;
+  const qEndLocal = nextEvent != null ? nextEvent - revealDurationSec : null;
   const canShowTimeBar = Boolean(
     isQuestionPhase && qStartEffective != null && qEndLocal != null && qEndLocal > qStartEffective
   );
@@ -459,12 +708,17 @@ export default function Screen() {
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
 
+  // Pré-start
   const showPreStart = !(quizStartMs && isRunning);
 
-  /* ================================== RENDER ================================== */
+  // Variables spécifiques au leaderboard pendant reveal
+  const currentQuestionIdForLB = currentQuestionId;
+  const inRevealWindowForLB = Boolean(isRevealAnswerPhase || isCountdownPhase);
+
+  /* ============================ RENDER (PARTIE 4/4) ============================ */
 
   if (!stateLoaded || !configLoaded || !questionsLoaded) {
-    return <Splash />; // 👈 plein bleu pendant le tout premier chargement
+    return <Splash />; // plein écran de boot
   }
 
   if (showPreStart) {
@@ -526,17 +780,125 @@ export default function Screen() {
       {/* Zone question (gauche) */}
       <div style={{ flex: 2, padding: "40px", display: "flex", flexDirection: "column", alignItems: "center", gap: 12, textAlign: "center" }}>
         {isQuizEnded ? (
-          <>
-            <h1 style={{ fontSize: "2.4rem", marginTop: 6 }}>Le gagnant est…</h1>
-            <p style={{ opacity: 0.85, marginTop: 8 }}>(écran de fin — scoring à venir)</p>
-          </>
+          <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
+            <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Voici le podium :</h1>
+
+            {podium.gold.length + podium.silver.length + podium.bronze.length === 0 ? (
+              <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
+                Aucun point n’a été marqué. Merci à tous pour votre participation !
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
+                {/* 🥇 Or — 2× plus gros */}
+                {podium.gold.length > 0 && (
+                  <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                    {podium.gold.map((p) => (
+                      <div
+                        key={p.id}
+                        style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
+                      >
+                        <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 🥈 Argent */}
+                {podium.silver.length > 0 && (
+                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                    {podium.silver.map((p) => (
+                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 🥉 Bronze */}
+                {podium.bronze.length > 0 && (
+                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                    {podium.bronze.map((p) => (
+                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         ) : isRoundBreak ? (
-          <div style={{ marginTop: 8, marginBottom: 4 }}>
+          <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
             <h1 style={{ fontSize: "2rem", margin: 0 }}>
               Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
             </h1>
-            <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>
-              (Ici, le tableau des scores — placeholder)
+
+            <h2 style={{ fontSize: "1.6rem", marginTop: 10, marginBottom: 6 }}>Podium provisoire :</h2>
+
+            {podium.gold.length + podium.silver.length + podium.bronze.length === 0 ? (
+              <div style={{ opacity: 0.85, fontSize: 16, marginTop: 6 }}>
+                Aucun point n’a été marqué pour l’instant.
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 8 }}>
+                {/* 🥇 Or — 2× plus gros */}
+                {podium.gold.length > 0 && (
+                  <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                    {podium.gold.map((p) => (
+                      <div
+                        key={p.id}
+                        style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
+                      >
+                        <span style={{ fontWeight: 900, fontSize: 28 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85, fontSize: 18 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 24 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 🥈 Argent */}
+                {podium.silver.length > 0 && (
+                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                    {podium.silver.map((p) => (
+                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* 🥉 Bronze */}
+                {podium.bronze.length > 0 && (
+                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                    {podium.bronze.map((p) => (
+                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                        <span style={{ opacity: 0.85 }}>•</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ opacity: 0.8, marginTop: 10, fontSize: 14 }}>
+              … mais rien n’est joué encore.
             </div>
           </div>
         ) : inRoundBoundaryWindow ? (
@@ -665,14 +1027,146 @@ export default function Screen() {
         {!isRunning && <JoinPanelInline size="md" />}
       </div>
 
-      {/* Zone scores (droite) */}
-      <div style={{ flex: 1, padding: "20px", background: "#0b1e3d" }}>
-        <h2>Tableau des scores</h2>
-        <p>(Les scores seront ajoutés ici plus tard)</p>
-      </div>
+      {/* ===== Colonne scores (droite) ===== */}
+      <aside
+        aria-label="Classement"
+        style={{
+          position: "fixed",
+          top: 12,
+          right: 12,
+          bottom: 12,
+          width: 320,
+          maxWidth: "35vw",
+          background: "#0b0f1a",
+          border: "1px solid #1f2a44",
+          borderRadius: 12,
+          padding: 12,
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          zIndex: 30,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
+            Classement
+          </h3>
+          <div style={{ opacity: 0.7, fontSize: 12 }}>
+            Top {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
+          </div>
+        </div>
+
+        <div
+          role="list"
+          style={{
+            marginTop: 4,
+            overflowY: "auto",
+            paddingRight: 4,
+          }}
+        >
+          {leaderboard.map((p, idx) => {
+            const rank = Number(p._rank ?? (idx + 1));
+            const s = Number(p.score || 0);
+            const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+            const showDelta = Boolean(
+              inRevealWindowForLB &&
+              currentQuestionIdForLB &&
+              p.lastDeltaForQuestionId === currentQuestionIdForLB &&
+              Number(p.lastDelta) > 0
+            );
+
+            return (
+              <div
+                key={p.id}
+                role="listitem"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "28px 1fr auto",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 10px",
+                  borderBottom: "1px solid #16233b",
+                }}
+              >
+                <div style={{ textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
+                  {rank}.
+                </div>
+
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: 3,
+                        background: p.color || "#64748b",
+                        border: "1px solid rgba(255,255,255,0.25)",
+                        flex: "0 0 auto",
+                      }}
+                    />
+                    <span
+                      title={p.name}
+                      style={{
+                        fontWeight: 700,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
+                      {p.name || "(sans nom)"} {medal}
+                    </span>
+                  </div>
+
+                  {showDelta && (
+                    <span
+                      style={{
+                        display: "inline-block",
+                        marginTop: 4,
+                        padding: "2px 6px",
+                        borderRadius: 9999,
+                        background: "#0b3a1e",
+                        border: "1px solid #14532d",
+                        color: "#86efac",
+                        fontSize: 12,
+                        fontWeight: 800,
+                      }}
+                    >
+                      +{p.lastDelta}
+                    </span>
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    fontWeight: 800,
+                    fontVariantNumeric: "tabular-nums",
+                    letterSpacing: 0.2,
+                  }}
+                  aria-label="score"
+                  title={`${p.score} points`}
+                >
+                  {Number(p.score || 0)}
+                </div>
+              </div>
+            );
+          })}
+
+          {leaderboard.length === 0 && (
+            <div style={{ opacity: 0.7, padding: 12, textAlign: "center" }}>
+              Aucun joueur.
+            </div>
+          )}
+        </div>
+      </aside>
 
       {/* QR — pendant le quiz : en bas à gauche et 2× plus gros */}
       {isRunning && <JoinPanelFixedBottom />}
     </div>
   );
 }
+
+
+
+
