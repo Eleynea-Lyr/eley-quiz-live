@@ -1,7 +1,7 @@
 // /pages/player.js
 
 /*Partie 1/4 (imports, constantes, helpers) */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, startTransition } from "react";
 import { db } from "../lib/firebase";
 import {
   collection,
@@ -19,6 +19,24 @@ import {
   deleteDoc,
   runTransaction,
 } from "firebase/firestore";
+
+// Fix viewport height on mobile browsers (100vh bug)
+const useMobileVH = () => {
+  useEffect(() => {
+    const setVh = () => {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty("--vh", `${vh}px`);
+    };
+    setVh();
+    window.addEventListener("resize", setVh);
+    window.addEventListener("orientationchange", setVh);
+    return () => {
+      window.removeEventListener("resize", setVh);
+      window.removeEventListener("orientationchange", setVh);
+    };
+  }, []);
+};
+
 
 /* ============================== CONSTANTES ============================== */
 
@@ -98,6 +116,10 @@ async function recordFirstCorrectAndPredict({ db, qid, playerId }) {
     return { predictedRank, predictedPoints };
   });
 }
+
+// Transitions : masque et “cooldown” frontière
+const UI_MASK_MS = 220;         // durée du voile anti-flicker
+const BOUNDARY_HYST_MS = 120;   // marge autour des frontières de manche
 
 // Anti-spam
 const RATE_LIMIT_ENABLED = true;
@@ -320,7 +342,7 @@ function Splash() {
   return (
     <div
       style={{
-        minHeight: "100vh",
+        minHeight: "calc(var(--vh, 1vh) * 100)",
         background: "#0a0a1a", // même fond que l'UI Player
       }}
       aria-hidden="true"
@@ -355,7 +377,11 @@ function medalForRank(rank) {
 /* =============================== COMPOSANT =============================== */
 
 export default function Player() {
+  useMobileVH();
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
+
+  const lastNavSeqRef = useRef(null);
+  const uiFreezeUntilRef = useRef(0);
 
   // Leaderboard (fin de quiz)
   const [playersLB, setPlayersLB] = useState([]);
@@ -435,6 +461,11 @@ export default function Player() {
   // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
 
+  // Offset horloge serveur ← d.serverNow (écrit par Admin)
+  const serverDeltaRef = useRef(0);        // ms
+  const [serverDeltaTick, setServerDeltaTick] = useState(0); // force un léger re-render si besoin
+
+
   /* =============================== EFFECTS =============================== */
 
   // 1) Charger identité locale + cache rejets + gestion param ?reset=1
@@ -486,36 +517,42 @@ export default function Player() {
 
         localStorage.removeItem("playerId");
         localStorage.removeItem("playerName");
-        setPlayerId(null);
-        setPlayerName("");
-        setInputName("");
-        setError("");
-        setIsKicked(false);
-
+        startTransition(() => {
+          setPlayerId(null);
+          setPlayerName("");
+          setInputName("");
+          setError("");
+          setIsKicked(false);
+        });
         if (!selfInitiated) {
           localStorage.removeItem("rejectedNamesCache");
-          setRejectedNames([]);
+          startTransition(() => setRejectedNames([]));
         }
         return;
       }
 
       const d = snap.data() || {};
 
-      setIsKicked(!!d.isKicked);
-      if (d.isKicked) {
-        setError("Vous avez été retiré de la partie.");
-      } else if (d.nameStatus === "rejected") {
-        setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
-        setInputName("");
-      } else {
-        setError("");
-      }
+      startTransition(() => {
+        setIsKicked(!!d.isKicked);
+        if (d.isKicked) {
+          setError("Vous avez été retiré de la partie.");
+        } else if (d.nameStatus === "rejected") {
+          setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
+          setInputName("");
+        } else {
+          setError("");
+        }
+      });
 
       if (typeof d.name === "string") {
-        setPlayerName(d.name);
+        startTransition(() => {
+          setPlayerName(d.name);
+        });
         localStorage.setItem("playerName", d.name);
       }
-      setNameLocked(!!d.nameLocked);
+      startTransition(() => setNameLocked(!!d.nameLocked));
+
 
       let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
       const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
@@ -531,9 +568,10 @@ export default function Player() {
       }
       const union = Array.from(new Set([...prev.filter((n) => !isAliasNameLocal(n)), ...serverRejected]));
       localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
-      setRejectedNames(union);
+      startTransition(() => setRejectedNames(union));
 
-      setPlayerDocLoaded(true);
+
+      startTransition(() => setPlayerDocLoaded(true));
     });
 
     return () => unsub();
@@ -541,7 +579,8 @@ export default function Player() {
 
   // 4) Si aucun playerId → considérer le doc joueur "chargé"
   useEffect(() => {
-    if (!playerId) setPlayerDocLoaded(true);
+    if (!playerId) startTransition(() => setPlayerDocLoaded(true));
+
   }, [playerId]);
 
   // 5) Abonnement principal /quiz/state
@@ -549,41 +588,93 @@ export default function Player() {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
 
+      // startMs reconstruit depuis l'ancrage (anchorAt + anchorOffsetSec) si présent.
+      // Fallback: startAt (Timestamp) puis startEpochMs (legacy).
       let startMs = null;
-      if (d.startAt && typeof d.startAt.seconds === "number") {
+
+      if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
+        const anchorMs =
+          d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+        const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
+        startMs = anchorMs - offsetSec * 1000;
+      } else if (d.startAt && typeof d.startAt.seconds === "number") {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
       } else if (typeof d.startEpochMs === "number") {
         startMs = d.startEpochMs;
       }
 
-      setIsRunning(!!d.isRunning);
-      setIsPaused(!!d.isPaused);
-
-      if (!startMs) {
-        setQuizStartMs(null);
-        setPauseAtMs(null);
-        setElapsedSec(0);
-        setAnswer("");
-        setResult(null);
-      } else {
-        setQuizStartMs(startMs);
-        if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
-          const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
-          setPauseAtMs(pms);
-          if (d.isPaused) {
-            const e = Math.floor((pms - startMs) / 1000);
-            setElapsedSec(e < 0 ? 0 : e);
-          }
-        } else {
-          setPauseAtMs(null);
-        }
+      // Gate visuelle sur changement de navigation
+      const nextNavSeq = Number.isFinite(d.navSeq) ? d.navSeq : null;
+      if (nextNavSeq != null && nextNavSeq !== lastNavSeqRef.current) {
+        lastNavSeqRef.current = nextNavSeq;
+        uiFreezeUntilRef.current = performance.now() + UI_MASK_MS;
       }
 
-      setLastAutoPausedRoundIndex(
-        Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
-      );
 
-      setStateLoaded(true);
+      // Mise à jour du delta d'horloge si Admin publie serverNow
+      if (d.serverNow && typeof d.serverNow.seconds === "number") {
+        const serverNowMs =
+          d.serverNow.seconds * 1000 + Math.floor((d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6);
+        const instantDelta = serverNowMs - Date.now(); // (+) = ma clock est en retard, (-) = en avance
+        // Buffer des derniers deltas pour une correction “best-of”
+        if (!serverDeltaRef.buffer) serverDeltaRef.buffer = [];
+        serverDeltaRef.buffer.push(instantDelta);
+        if (serverDeltaRef.buffer.length > 8) serverDeltaRef.buffer.shift();
+
+        // On prend le percentile 90 (valeur haute sans aller à l’extrême)
+        const sorted = [...serverDeltaRef.buffer].sort((a, b) => a - b);
+        const p90 = sorted[Math.floor(sorted.length * 0.9)] ?? instantDelta;
+
+        // Lissage EMA vers cette valeur
+        const prev = serverDeltaRef.current || 0;
+        const alpha = 0.25;
+        serverDeltaRef.current = prev * (1 - alpha) + p90 * alpha;
+
+        // Tick léger pour réactualiser si besoin d’afficher qqch basé sur Date.now()
+        setServerDeltaTick((t) => (t + 1) & 0xfff);
+      }
+
+
+
+
+      startTransition(() => {
+        setIsRunning(!!d.isRunning);
+        setIsPaused(!!d.isPaused);
+      });
+
+
+      if (!startMs) {
+        startTransition(() => {
+          setQuizStartMs(null);
+          setPauseAtMs(null);
+          setElapsedSec(0);
+          setAnswer("");
+          setResult(null);
+        });
+      } else {
+        startTransition(() => {
+          setQuizStartMs(startMs);
+          if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
+            const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
+            setPauseAtMs(pms);
+            if (d.isPaused) {
+              const e = Math.floor((pms - startMs) / 1000);
+              setElapsedSec(e < 0 ? 0 : e);
+            }
+          } else {
+            setPauseAtMs(null);
+          }
+        });
+
+      }
+
+      startTransition(() => {
+        setLastAutoPausedRoundIndex(
+          Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
+        );
+      });
+
+      startTransition(() => setStateLoaded(true));
     });
     return () => unsub();
   }, []);
@@ -599,7 +690,7 @@ export default function Player() {
         if (!Number.isFinite(prev) || ms > prev) {
           localStorage.setItem("playersResetAt", String(ms));
           localStorage.removeItem("rejectedNamesCache");
-          setRejectedNames([]);
+          startTransition(() => setRejectedNames([]));
         }
       }
     });
@@ -615,18 +706,21 @@ export default function Player() {
     })();
   }, []);
 
+
   // 8) Config (manches + fin + durée de révélation)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
       const d = snap.data();
-      setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
-      setRoundOffsetsSec(
-        Array.isArray(d?.roundOffsetsSec)
-          ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null))
-          : []
-      );
-      const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
-      setRevealDurationSec(rv);
+      startTransition(() => {
+        setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
+        setRoundOffsetsSec(
+          Array.isArray(d?.roundOffsetsSec)
+            ? d.roundOffsetsSec.map((v) => (Number.isFinite(v) ? v : null))
+            : []
+        );
+        const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
+        setRevealDurationSec(rv);
+      });
     });
     return () => unsub();
   }, []);
@@ -644,47 +738,63 @@ export default function Player() {
           isKicked: !!v.isKicked,
         };
       });
-      setPlayersLB(arr);
+      startTransition(() => setPlayersLB(arr));
     });
     return () => unsub();
   }, []);
 
-  // 9) Timer local (avec clamp fin de quiz)
+  // 9) Timer local (avec clamp fin de quiz) — rAF throttle ~10 FPS
   useEffect(() => {
     if (!quizStartMs) {
-      setElapsedSec(0);
+      startTransition(() => setElapsedSec(0));
       return;
     }
     if (isPaused && pauseAtMs) {
       const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
       const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
-      setElapsedSec(clamped < 0 ? 0 : clamped);
+      startTransition(() => setElapsedSec(clamped < 0 ? 0 : clamped));
       return;
     }
     if (!isRunning) {
-      setElapsedSec(0);
+      startTransition(() => setElapsedSec(0));
       return;
     }
 
-    const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
+    const computeNow = () =>
+      Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
+
+
+    // Première mise à jour immédiate
     const first = computeNow();
     if (Number.isFinite(quizEndSec) && first >= quizEndSec) {
-      setElapsedSec(Math.max(0, quizEndSec));
+      startTransition(() => setElapsedSec(Math.max(0, quizEndSec)));
       return;
     }
-    setElapsedSec(first < 0 ? 0 : first);
+    startTransition(() => setElapsedSec(first < 0 ? 0 : first));
 
-    const id = setInterval(() => {
-      const raw = computeNow();
-      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
-        setElapsedSec(Math.max(0, quizEndSec));
-        clearInterval(id);
-      } else {
-        setElapsedSec(raw < 0 ? 0 : raw);
+    let rafId;
+    let last = 0;
+    const TARGET_MS = 1000 / 10; // 10 FPS
+
+    const loop = (t) => {
+      if (!last || t - last >= TARGET_MS) {
+        last = t;
+        const raw = computeNow();
+
+        if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+          startTransition(() => setElapsedSec(Math.max(0, quizEndSec)));
+          return; // stoppe la boucle (pas de nouvelle frame)
+        }
+
+        startTransition(() => setElapsedSec(raw < 0 ? 0 : raw));
       }
-    }, 500);
-    return () => clearInterval(id);
+      rafId = requestAnimationFrame(loop);
+    };
+
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+
 
   /* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
   /* ===================== Dérivés & calculs d'écran ===================== */
@@ -728,6 +838,9 @@ export default function Player() {
     }
   }
 
+  const uiMasked = performance.now() < uiFreezeUntilRef.current;
+
+
   // Prochaine échéance (min question / frontière de manche / fin de quiz)
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
@@ -736,6 +849,7 @@ export default function Player() {
   const ROUND_DEADZONE_SEC = 1;
   const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
+    !uiMasked &&
     secondsToRoundBoundary != null &&
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
@@ -778,14 +892,25 @@ export default function Player() {
     ? qStart + ROUND_START_INTRO_SEC
     : null;
 
-  const isRoundIntroPhase = Boolean(
-    isFirstQuestionOfRound &&
-    !isPaused &&
-    !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
-    introStart != null &&
-    elapsedSec >= introStart &&
-    elapsedSec < introEnd
+  // Si on est très proche de la frontière de manche, on force l’intro (UX)
+  const forceIntroByBoundary =
+    secondsToRoundBoundary != null &&
+    secondsToRoundBoundary <= 0.20 &&     // +200 ms après frontière
+    secondsToRoundBoundary >= -0.12;      // −120 ms avant frontière
+
+
+  const isRoundIntroPhase = !uiMasked && Boolean(
+    (
+      isFirstQuestionOfRound &&
+      !isPaused &&
+      !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
+      introStart != null &&
+      elapsedSec >= introStart &&
+      elapsedSec < introEnd
+    )
+    || forceIntroByBoundary
   );
+
 
   // Le temps “utilisable” pour répondre commence après l’intro
   const qStartEffective = isFirstQuestionOfRound && Number.isFinite(qStart)
@@ -812,7 +937,7 @@ export default function Player() {
   const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
 
-  const isQuestionPhase = Boolean(
+  const isQuestionPhase = !uiMasked && Boolean(
     currentQuestion &&
     qStartEffective != null &&
     nextEvent != null &&
@@ -822,7 +947,7 @@ export default function Player() {
     !isRoundBreak
   );
 
-  const isRevealAnswerPhase = Boolean(
+  const isRevealAnswerPhase = !uiMasked && Boolean(
     currentQuestion &&
     revealStart != null &&
     countdownStart != null &&
@@ -832,7 +957,7 @@ export default function Player() {
     !isRoundBreak
   );
 
-  const isCountdownPhase = Boolean(
+  const isCountdownPhase = !uiMasked && Boolean(
     currentQuestion &&
     countdownStart != null &&
     nextEvent != null &&
@@ -841,6 +966,7 @@ export default function Player() {
     !isPaused &&
     !isRoundBreak
   );
+
 
   // Décompte (jamais 0s)
   const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
@@ -900,13 +1026,77 @@ export default function Player() {
   }, [currentQuestionId]);
 
 
-  // Préchargement image
+  // Préchargement image avec decode() pour éviter le flash au reveal
+  const [preloadedImage, setPreloadedImage] = useState(null);
+  // ✅ Pas d'optional chaining dans le tableau de dépendances
+  const currentImageUrl = currentQuestion ? currentQuestion.imageUrl : null;
+
   useEffect(() => {
-    if (currentQuestion?.imageUrl) {
-      const img = new Image();
-      img.src = currentQuestion.imageUrl;
+    setPreloadedImage(null);
+    const url = currentImageUrl;
+    if (!url) return;
+
+    let cancelled = false;
+    const img = new Image();
+    img.src = url;
+
+    const markReady = () => { if (!cancelled) setPreloadedImage(url); };
+
+    if (typeof img.decode === "function") {
+      img.decode().then(markReady).catch(markReady);
+    } else {
+      img.onload = markReady;
+      img.onerror = () => { if (!cancelled) setPreloadedImage(null); };
     }
-  }, [currentQuestion?.imageUrl]);
+    return () => { cancelled = true; };
+  }, [currentImageUrl]);
+
+
+
+  // Prefetch "idle" des 2 prochaines images pour accélérer les futurs reveals
+  useEffect(() => {
+    if (!currentQuestionId || !Array.isArray(sorted) || !sorted.length) return;
+
+    const idx = sorted.findIndex((q) => q?.id === currentQuestionId);
+    if (idx < 0) return;
+
+    const nextUrls = [];
+    for (let k = idx + 1; k < sorted.length && nextUrls.length < 2; k++) {
+      const u = sorted[k]?.imageUrl;
+      if (typeof u === "string" && u.trim()) nextUrls.push(u);
+    }
+    if (!nextUrls.length) return;
+
+    // Utilise requestIdleCallback si dispo, sinon fallback setTimeout
+    const run = () => {
+      nextUrls.forEach((url) => {
+        try {
+          const im = new Image();
+          im.loading = "eager";
+          im.decoding = "async";
+          im.src = url;
+          // Déclenche le décodage si possible, sans bloquer le thread
+          if (im.decode) {
+            im.decode().catch(() => { });
+          }
+        } catch { /* noop */ }
+      });
+    };
+
+    if (typeof window.requestIdleCallback === "function") {
+      const id = window.requestIdleCallback(run, { timeout: 1200 });
+      return () => {
+        if (typeof window.cancelIdleCallback === "function") {
+          window.cancelIdleCallback(id);
+        }
+      };
+    } else {
+      const t = setTimeout(run, 150);
+      return () => clearTimeout(t);
+    }
+  }, [currentQuestionId, sorted]);
+
+
 
   // Flags de rendu global
   const showPreStart = !(quizStartMs && isRunning);
@@ -939,6 +1129,17 @@ export default function Player() {
 
   const gainedPoints =
     instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
+
+  // Focus automatique quand le masque est levé et que l'input est visible
+  useEffect(() => {
+    if (!uiMasked && showInput) {
+      const el = answerInputRef.current;
+      if (el && document.activeElement !== el) {
+        requestAnimationFrame(() => el.focus());
+      }
+    }
+  }, [uiMasked, showInput, currentQuestionId]);
+
 
   /* ======= Effets dépendant des dérivés (APRES le bloc de dérivés) ======= */
 
@@ -1221,12 +1422,24 @@ export default function Player() {
     } finally {
       localStorage.removeItem("playerId");
       localStorage.removeItem("playerName");
-      setPlayerId(null);
-      setPlayerName("");
-      setInputName("");
-      setError("");
+      startTransition(() => {
+        setPlayerId(null);
+        setPlayerName("");
+        setInputName("");
+        setError("");
+      });
     }
   }
+
+  useEffect(() => {
+    if (!uiMasked) return;
+    const tag = document.createElement("style");
+    tag.setAttribute("data-ui-mask", "1");
+    tag.textContent = `*{transition:none!important;animation:none!important}`;
+    document.head.appendChild(tag);
+    return () => { tag.remove(); };
+  }, [uiMasked]);
+
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
@@ -1256,16 +1469,17 @@ export default function Player() {
     return (
       <div
         style={{
-          minHeight: "100vh",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
           background: "#000814",
           color: "white",
           display: "grid",
           placeItems: "center",
           padding: 24,
           textAlign: "center",
+          overflowX: "hidden",
         }}
       >
-        <div style={{ width: 380, maxWidth: "90vw" }}>
+        <div style={{ width: "min(360px, 100%)", margin: "0 auto" }}>
           <h1 style={{ margin: 0, fontSize: "2rem", fontWeight: 800 }}>
             Bienvenue dans le quiz d’ELEY
           </h1>
@@ -1275,6 +1489,12 @@ export default function Player() {
 
           <form onSubmit={handleNameSubmit} style={{ marginTop: 12 }}>
             <input
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              inputMode="text"
+              enterKeyHint="send"
               type="text"
               value={inputName}
               onChange={(e) => setInputName(e.target.value)}
@@ -1282,12 +1502,15 @@ export default function Player() {
               placeholder="ex : Les Quichettes"
               style={{
                 width: "100%",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                display: "block",
                 padding: "10px 12px",
                 borderRadius: 10,
                 border: "1px solid #334155",
                 background: "#0b1220",
                 color: "white",
-                fontSize: 16,
+                fontSize: "clamp(14px, 3.9vw, 16px)",
               }}
               autoFocus
             />
@@ -1307,13 +1530,19 @@ export default function Player() {
               style={{
                 marginTop: 12,
                 width: "100%",
-                padding: "10px 12px",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                display: "block",
+                padding: "clamp(10px, 2.8vw, 12px) 12px",
                 borderRadius: 10,
                 border: "1px solid #2a2a2a",
                 background: busy ? "#64748b" : "#3b82f6",
                 color: "white",
                 fontWeight: 700,
-                cursor: isSubmitDisabled ? "not-allowed" : "pointer",
+                cursor: isSubmitDisabled ? "not-allowed" : "pointer", // 👈 curseur interdit quand désactivé
+                touchAction: "manipulation", // NEW: supprime le délai tactile mobile
+                WebkitTapHighlightColor: "transparent", // NEW: enlève le flash gris iOS/Android
+                userSelect: "none", // NEW: évite la sélection de texte au tap prolongé
               }}
               title={
                 isRejectedInput || isSameAsRejectedCurrent
@@ -1345,14 +1574,15 @@ export default function Player() {
         style={{
           background: "#0a0a1a",
           color: "#fff",
-          minHeight: "100vh",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
           display: "grid",
           placeItems: "center",
           padding: "24px",
           textAlign: "center",
+          overflowX: "hidden",
         }}
       >
-        <div style={{ width: 380, maxWidth: "90vw" }}>
+        <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
             ELEY&nbsp;Quiz — Accès retiré
           </h1>
@@ -1374,20 +1604,20 @@ export default function Player() {
         style={{
           background: "#0a0a1a",
           color: "#fff",
-          minHeight: "100vh",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
           display: "grid",
           placeItems: "center",
           padding: "24px",
           textAlign: "center",
         }}
       >
-        <div style={{ width: 380, maxWidth: "90vw" }}>
+        <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
             ELEY&nbsp;Quiz — En attente du départ
           </h1>
         </div>
 
-        <div style={{ width: 380, maxWidth: "90vw", marginTop: 12, textAlign: "center" }}>
+        <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
           <p style={{ opacity: 0.85 }}>
             {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
             L’Admin n’a pas encore lancé le quiz.
@@ -1428,11 +1658,25 @@ export default function Player() {
         background: "#0a0a1a",
         color: "white",
         padding: "20px",
-        minHeight: "100vh",
+        minHeight: "calc(var(--vh, 1vh) * 100)",
         textAlign: "center",
         position: "relative",
+        overflowX: "hidden",
       }}
     >
+      {/* Voile anti-flicker */}
+      <div
+        aria-hidden="true"
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "#020617",          // bleu nuit
+          opacity: uiMasked ? 0.96 : 0,
+          transition: "opacity 120ms ease",
+          pointerEvents: "none",
+          zIndex: 50,
+        }}
+      />
       {/* Timer discret en haut-droite */}
       <div
         style={{
@@ -1490,11 +1734,11 @@ export default function Player() {
               textAlign: "center",
             }}
           >
-            <div style={{ fontSize: "1.5rem", fontWeight: 800 }}>
+            <div style={{ fontSize: "clamp(1.1rem, 4.8vw, 1.5rem)", fontWeight: 800 }}>
               {myMedal ? `${myMedal} ` : ""}{myEndMessage}
             </div>
             {myRank != null && (
-              <div style={{ marginTop: 6, opacity: 0.9 }}>
+              <div style={{ marginTop: 6, opacity: 0.9, fontSize: "clamp(0.95rem, 3.8vw, 1rem)" }}>
                 Ton score : <b>{myScore}</b> • Classement : <b>{Number(myScore) > 0 ? `#${myRank}` : "dernier"}</b>
               </div>
             )}
@@ -1523,7 +1767,7 @@ export default function Player() {
               }}
             >
               {myMedal ? <span aria-label="médaille" title="médaille">{myMedal}</span> : null}
-              <span>Tu es {myRank === 1 ? "1er" : `${myRank}ᵉ`} dans le classement</span>
+              <span>Tu es {Number(myScore) > 0 ? (myRank === 1 ? "1er" : `${myRank}ᵉ`) : "dernier"} dans le classement</span>
             </div>
           )}
 
@@ -1532,7 +1776,7 @@ export default function Player() {
       ) : inRoundBoundaryWindow ? (
         // Fenêtre morte juste avant la frontière
         <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-          <h2 style={{ fontSize: "1.8rem", margin: 0 }}>
+          <h2 style={{ fontSize: "clamp(1.2rem, 5.3vw, 1.8rem)", margin: 0 }}>
             Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
           </h2>
           <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>(transition…)</div>
@@ -1563,7 +1807,7 @@ export default function Player() {
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
                 {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
               </div>
-              <div style={{ fontSize: "4rem", fontWeight: 800, lineHeight: 1 }}>
+              <div style={{ fontSize: "clamp(2.4rem, 12vw, 4rem)", fontWeight: 800, lineHeight: 1 }}>
                 {introCountdownSec}
               </div>
             </div>
@@ -1574,33 +1818,57 @@ export default function Player() {
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
                 {revealPhrase}
               </div>
-              <h2 style={{ fontSize: "1.6rem", margin: 0 }}>{primaryAnswer}</h2>
+              <h2
+                style={{
+                  fontSize: "clamp(1.2rem, 5vw, 1.6rem)",
+                  margin: 0,
+                  overflowWrap: "anywhere",
+                  wordBreak: "break-word",
+                  hyphens: "auto",
+                }}
+              >
+                {primaryAnswer}
+              </h2>
+
             </div>
           ) : isCountdownPhase ? (
             <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
                 {countdownLabel}
               </div>
-              <div style={{ fontSize: "4rem", fontWeight: 800, lineHeight: 1 }}>
+              <div style={{ fontSize: "clamp(2.4rem, 12vw, 4rem)", fontWeight: 800, lineHeight: 1 }}>
                 {countdownSec}
               </div>
             </div>
           ) : (
             // Fallback conservateur
-            <h2 style={{ fontSize: "1.5rem" }}>{currentQuestion.text}</h2>
+            <h2
+              style={{
+                fontSize: "clamp(1.1rem, 4.5vw, 1.5rem)",
+                overflowWrap: "anywhere",
+                wordBreak: "break-word",
+                hyphens: "auto",
+                margin: 0,
+              }}
+            >
+              {currentQuestion.text}
+            </h2>
+
           )}
 
           {/* Barre de temps */}
           {canShowTimeBar && (
             <div
               style={{
-                width: "min(700px, 92%)",
+                width: "min(620px, 92%)",
                 height: BAR_H,
                 margin: "12px auto 10px",
                 background: BAR_BLUE,
                 borderRadius: 9999,
                 overflow: "hidden",
                 position: "relative",
+                // 👇 cache la barre tant que le masque est actif
+                visibility: uiMasked ? "hidden" : "visible",
               }}
             >
               <div
@@ -1624,8 +1892,8 @@ export default function Player() {
             </div>
           )}
 
-          {/* Image pendant la révélation */}
-          {isRevealAnswerPhase && !isRoundBreak && currentQuestion?.imageUrl ? (
+          {/* Image pendant la révélation (anti-flicker) */}
+          {isRevealAnswerPhase && !isRoundBreak && preloadedImage ? (
             <div
               style={{
                 width: PLAYER_IMG_MAX,
@@ -1641,14 +1909,22 @@ export default function Player() {
               }}
             >
               <img
-                src={currentQuestion.imageUrl}
+                src={preloadedImage}
                 alt="Réponse visuelle — œuvre"
-                style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "auto" }}
-                loading="lazy"
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                  imageRendering: "auto",
+                  // 👇 on n'affiche que quand l'image est prête
+                  visibility: preloadedImage ? "visible" : "hidden",
+                }}
+                loading="eager"
                 decoding="async"
               />
             </div>
           ) : null}
+
 
           {/* Score pendant le REVEAL uniquement (visible pour tous les joueurs) */}
           {isRevealAnswerPhase && (
@@ -1667,8 +1943,17 @@ export default function Player() {
                 value={answer}
                 onChange={(e) => setAnswer(e.target.value)}
                 placeholder="Votre réponse"
-                style={{ width: "80%", padding: "10px", marginTop: "20px" }}
-                autoFocus
+                style={{
+                  width: "min(520px, 100%)",
+                  maxWidth: "92vw",
+                  boxSizing: "border-box",
+                  padding: "clamp(10px, 2.8vw, 12px)",
+                  marginTop: "16px",
+                  fontSize: "clamp(14px, 3.9vw, 16px)",
+                  visibility: uiMasked ? "hidden" : "visible",
+                }}
+                // 👇 pas d'autofocus tant que le masque est actif
+                autoFocus={!uiMasked}
                 inputMode="text"
                 autoComplete="off"
                 autoCorrect="off"
@@ -1687,6 +1972,7 @@ export default function Player() {
               </p>
             ) : null}
           </form>
+
 
           {/* Réponse : bannière persistante pendant la phase question */}
           {isQuestionPhase && hasAnsweredThisQuestion && (

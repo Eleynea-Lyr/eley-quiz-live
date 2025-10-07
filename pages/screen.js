@@ -6,7 +6,27 @@ import {
   where, runTransaction, serverTimestamp, increment
 } from "firebase/firestore";
 
+// Fix viewport height on mobile browsers (100vh bug)
+const useMobileVH = () => {
+  useEffect(() => {
+    const setVh = () => {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty("--vh", `${vh}px`);
+    };
+    setVh();
+    window.addEventListener("resize", setVh);
+    window.addEventListener("orientationchange", setVh);
+    return () => {
+      window.removeEventListener("resize", setVh);
+      window.removeEventListener("orientationchange", setVh);
+    };
+  }, []);
+};
+
+
 /* ============================ CONSTANTES & HELPERS ============================ */
+
+const UI_MASK_MS = 220; // durée du voile anti-flicker (ms)
 
 // Phrases de révélation par défaut
 const DEFAULT_REVEAL_PHRASES = [
@@ -135,7 +155,7 @@ function Splash() {
   return (
     <div
       style={{
-        minHeight: "100vh",
+        minHeight: "calc(var(--vh, 1vh) * 100)",
         background: "#0a0a1a",
       }}
       aria-hidden="true"
@@ -253,7 +273,12 @@ async function ensureAwardsForQuestionTx(qid) {
 /* ================================== COMPOSANT ================================= */
 
 export default function Screen() {
+  useMobileVH();
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
+
+  const lastNavSeqRef = useRef(null);
+  const uiFreezeUntilRef = useRef(0);
+
 
   // Flags de chargement
   const [stateLoaded, setStateLoaded] = useState(false);
@@ -279,6 +304,13 @@ export default function Screen() {
 
   // Fin de manche (poussée par l’admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
+
+  // Offset d’horloge serveur (ms) — mis à jour via /quiz/state.serverNow
+  const serverDeltaRef = useRef(0);
+  const [serverDeltaTick, setServerDeltaTick] = useState(0); // re-render léger si besoin
+
+  // Préchargement image avec decode() pour éviter le flash au reveal
+  const [preloadedImage, setPreloadedImage] = useState(null);
 
   /* --------------------------- Charger les questions --------------------------- */
   useEffect(() => {
@@ -338,13 +370,54 @@ export default function Screen() {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = (snap && snap.data()) || {};
 
-      // startMs depuis startAt (Timestamp) OU startEpochMs (number)
+
+      // startMs depuis ancrage (anchorAt + anchorOffsetSec) si présent ; fallback legacy
       let startMs = null;
-      if (d.startAt && typeof d.startAt.seconds === "number") {
+      if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
+        const anchorMs = d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+        const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
+        startMs = anchorMs - offsetSec * 1000;
+      } else if (d.startAt && typeof d.startAt.seconds === "number") {
         startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
       } else if (typeof d.startEpochMs === "number") {
         startMs = d.startEpochMs;
       }
+
+      // Gate visuelle sur changement de navigation
+      const nextNavSeq = Number.isFinite(d.navSeq) ? d.navSeq : null;
+      if (nextNavSeq != null && nextNavSeq !== lastNavSeqRef.current) {
+        lastNavSeqRef.current = nextNavSeq;
+        uiFreezeUntilRef.current = performance.now() + UI_MASK_MS;
+      }
+
+
+      // Delta d’horloge locale ← serveur (via heartbeat Admin)
+      if (d.serverNow && typeof d.serverNow.seconds === "number") {
+        const serverNowMs = d.serverNow.seconds * 1000 + Math.floor((d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6);
+        const instantDelta = serverNowMs - Date.now(); // (>0) = mon device est en retard
+
+        // Lissage simple + "max prefer" pour compenser le biais réseau (latence)
+        // - on prend la valeur la plus GRANDE (souvent la plus proche de la réalité,
+        //   car la latence rend les mesures trop FAIBLES)
+        // Buffer des derniers deltas pour une correction “best-of”
+        if (!serverDeltaRef.buffer) serverDeltaRef.buffer = [];
+        serverDeltaRef.buffer.push(instantDelta);
+        if (serverDeltaRef.buffer.length > 8) serverDeltaRef.buffer.shift();
+
+        // On prend le percentile 90 (valeur haute sans aller à l’extrême)
+        const sorted = [...serverDeltaRef.buffer].sort((a, b) => a - b);
+        const p90 = sorted[Math.floor(sorted.length * 0.9)] ?? instantDelta;
+
+        // Lissage EMA vers cette valeur
+        const prev = serverDeltaRef.current || 0;
+        const alpha = 0.25;
+        serverDeltaRef.current = prev * (1 - alpha) + p90 * alpha;
+
+
+        // Tick optionnel (faible coût) si tu relies des choses à Date.now()
+        setServerDeltaTick((t) => (t + 1) & 0xfff);
+      }
+
 
       setIsRunning(!!d.isRunning);
       setIsPaused(!!d.isPaused);
@@ -394,7 +467,10 @@ export default function Screen() {
       return;
     }
 
-    const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
+    const computeNow = () =>
+      Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
+
+    // Premier tick immédiat
     const first = computeNow();
     if (Number.isFinite(quizEndSec) && first >= quizEndSec) {
       setElapsedSec(Math.max(0, quizEndSec));
@@ -402,17 +478,28 @@ export default function Screen() {
     }
     setElapsedSec(first < 0 ? 0 : first);
 
-    const id = setInterval(() => {
-      const raw = computeNow();
-      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
-        setElapsedSec(Math.max(0, quizEndSec));
-        clearInterval(id);
-      } else {
+    // --- rAF 10 FPS ---
+    let rafId;
+    let lastTick = 0;
+
+    const loop = (t) => {
+      if (t - lastTick >= 100) { // ≈ 10 FPS
+        lastTick = t;
+        const raw = computeNow();
+        if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+          setElapsedSec(Math.max(0, quizEndSec));
+          cancelAnimationFrame(rafId);
+          return;
+        }
         setElapsedSec(raw < 0 ? 0 : raw);
       }
-    }, 500);
-    return () => clearInterval(id);
+      rafId = requestAnimationFrame(loop);
+    };
+
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+
 
   /* ----------------------- Leaderboard (tri & top N) ----------------------- */
   const leaderboard = useMemo(() => {
@@ -526,6 +613,8 @@ export default function Screen() {
     }
   }
 
+  const uiMasked = performance.now() < uiFreezeUntilRef.current;
+
   // Prochaine manche
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
@@ -535,6 +624,7 @@ export default function Screen() {
   const ROUND_DEADZONE_SEC = 1;
   const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
+    !uiMasked &&
     secondsToRoundBoundary != null &&
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
@@ -575,7 +665,9 @@ export default function Screen() {
       ? qStart + ROUND_START_INTRO_SEC
       : null;
 
-  const isRoundIntroPhase = Boolean(
+
+
+  const isRoundIntroPhase = !uiMasked && Boolean(
     isFirstQuestionOfRound &&
     !isPaused &&
     !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
@@ -612,7 +704,7 @@ export default function Screen() {
   const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
 
-  const isQuestionPhase = Boolean(
+  const isQuestionPhase = !uiMasked && Boolean(
     currentQuestion &&
     qStartEffective != null &&
     nextEvent != null &&
@@ -622,7 +714,7 @@ export default function Screen() {
     !isRoundBreak
   );
 
-  const isRevealAnswerPhase = Boolean(
+  const isRevealAnswerPhase = !uiMasked && Boolean(
     currentQuestion &&
     revealStart != null &&
     countdownStart != null &&
@@ -632,7 +724,7 @@ export default function Screen() {
     !isRoundBreak
   );
 
-  const isCountdownPhase = Boolean(
+  const isCountdownPhase = !uiMasked && Boolean(
     currentQuestion &&
     countdownStart != null &&
     nextEvent != null &&
@@ -696,14 +788,6 @@ export default function Screen() {
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
 
-  // Préchargement image reveal
-  useEffect(() => {
-    if (currentQuestion?.imageUrl) {
-      const img = new Image();
-      img.src = currentQuestion.imageUrl;
-    }
-  }, [currentQuestion?.imageUrl]);
-
   // Infos attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
@@ -715,6 +799,40 @@ export default function Screen() {
   const currentQuestionIdForLB = currentQuestionId;
   const inRevealWindowForLB = Boolean(isRevealAnswerPhase || isCountdownPhase);
 
+  useEffect(() => {
+    setPreloadedImage(null);
+    const url = currentQuestion?.imageUrl;
+    if (!url) return;
+
+    let cancelled = false;
+    const img = new Image();
+    img.src = url;
+
+    const markReady = () => { if (!cancelled) setPreloadedImage(url); };
+
+    if (typeof img.decode === "function") {
+      img.decode().then(markReady).catch(markReady);
+    } else {
+      img.onload = markReady;
+      img.onerror = () => { if (!cancelled) setPreloadedImage(null); };
+    }
+    return () => { cancelled = true; };
+  }, [currentQuestionId]);
+
+
+  useEffect(() => {
+    if (!uiMasked) return;
+    // injecte un <style> global sans passer par styled-jsx
+    const tag = document.createElement("style");
+    tag.setAttribute("data-ui-mask", "1");
+    tag.textContent = `*{transition:none!important;animation:none!important}`;
+    document.head.appendChild(tag);
+    return () => { tag.remove(); };
+  }, [uiMasked]);
+
+
+
+
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
   if (!stateLoaded || !configLoaded || !questionsLoaded) {
@@ -724,7 +842,7 @@ export default function Screen() {
   if (showPreStart) {
     return (
       <div style={{
-        background: "#000814", color: "#fff", minHeight: "100vh",
+        background: "#000814", color: "#fff", minHeight: "calc(var(--vh, 1vh) * 100)",
         display: "grid", placeItems: "center", padding: "24px", textAlign: "center"
       }}>
         <div
@@ -756,10 +874,23 @@ export default function Screen() {
         flexDirection: "row",
         background: "#000814",
         color: "white",
-        minHeight: "100vh",
+        minHeight: "calc(var(--vh, 1vh) * 100)",
         position: "relative",
       }}
     >
+      {/* Voile anti-flicker */}
+      <div
+        aria-hidden="true"
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "#020617",
+          opacity: uiMasked ? 0.96 : 0,
+          transition: "opacity 120ms ease",
+          pointerEvents: "none",
+          zIndex: 50,
+        }}
+      />
       {/* Horloge en haut à droite */}
       <div
         style={{
@@ -952,14 +1083,17 @@ export default function Screen() {
             {canShowTimeBar && (
               <div
                 style={{
-                  width: "min(520px, 80%)",
+                  width: "min(700px, 92%)",
                   height: BAR_H,
-                  marginTop: 12,
+                  margin: "12px auto 10px",
                   background: BAR_BLUE,
                   borderRadius: 9999,
                   overflow: "hidden",
                   position: "relative",
+                  // 👇 cache la barre tant que le masque est actif
+                  visibility: uiMasked ? "hidden" : "visible",
                 }}
+
               >
                 <div
                   style={{
@@ -1001,7 +1135,13 @@ export default function Screen() {
                 <img
                   src={currentQuestion.imageUrl}
                   alt="Révélation — œuvre"
-                  style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "auto" }}
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    imageRendering: "auto",
+                    visibility: preloadedImage ? "visible" : "hidden",
+                  }}
                   loading="lazy"
                   decoding="async"
                 />

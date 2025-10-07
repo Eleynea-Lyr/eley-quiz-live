@@ -327,6 +327,11 @@ export default function Admin() {
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
 
+  // --- Refs pour connaître la phase courante sans dépendance d'ordre ---
+  const isCountdownRef = useRef(false);
+  const isRevealRef = useRef(false);
+
+
   // Création question
   const [newQ, setNewQ] = useState({
     text: "",
@@ -344,6 +349,8 @@ export default function Admin() {
   const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
 
   /* ------------------------------------- EFFECTS ------------------------------------- */
+
+
 
   // 1) Charger questions (ordre asc)
   useEffect(() => {
@@ -394,13 +401,22 @@ export default function Admin() {
       (snap) => {
         const d = snap.data() || {};
 
-        // startMs depuis startAt (Timestamp) OU startEpochMs (number)
+        // startMs reconstruit depuis l'ancrage (anchorAt + anchorOffsetSec) si présent.
+        // Fallback: startAt (Timestamp) puis startEpochMs (legacy).
         let startMs = null;
-        if (d.startAt && typeof d.startAt.seconds === "number") {
+
+        if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
+          const anchorMs = d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+          const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
+          // On veut: elapsed ≈ (now - anchorAt) + offsetSec
+          // ⇔ (now - startMs) ≈ (now - (anchorAt - offsetSec*1000))
+          startMs = anchorMs - offsetSec * 1000;
+        } else if (d.startAt && typeof d.startAt.seconds === "number") {
           startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
         } else if (typeof d.startEpochMs === "number") {
           startMs = d.startEpochMs;
         }
+
 
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
@@ -543,6 +559,63 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
+  // Heartbeat dynamique : 5 s par défaut, 0.5 s pendant les phases critiques (sans TDZ)
+  useEffect(() => {
+    const stateRef = doc(db, "quiz", "state");
+
+    let intervalMs = 5000;
+    let hbId = null;        // interval courant du heartbeat
+    let watchId = null;     // observeur local “phases”
+    let boostTimer = null;  // timer pour hbBoost
+
+    const tick = () =>
+      setDoc(stateRef, { serverNow: serverTimestamp() }, { merge: true }).catch(() => { });
+
+    const startHB = () => {
+      clearInterval(hbId);
+      hbId = setInterval(tick, intervalMs);
+    };
+
+    // Snapshot pour capter hbBoost: true
+    const unsub = onSnapshot(stateRef, (snap) => {
+      const d = snap.data() || {};
+      if (d.hbBoost === true) {
+        clearTimeout(boostTimer);
+        intervalMs = 200;      // boost
+        startHB();
+        boostTimer = setTimeout(() => {
+          intervalMs = (isCountdownRef.current || isRevealRef.current) ? 500 : 5000;
+          startHB();
+          setDoc(stateRef, { hbBoost: false }, { merge: true }).catch(() => { });
+        }, 1500);
+      }
+    });
+
+    // Observer local : ajuster 500ms pendant reveal/countdown sinon 5000ms
+    watchId = setInterval(() => {
+      if (boostTimer) return; // priorité au boost
+      const target = (isCountdownRef.current || isRevealRef.current) ? 500 : 5000;
+      if (target !== intervalMs) {
+        intervalMs = target;
+        startHB();
+      }
+    }, 300);
+
+    // Lancer
+    tick();
+    startHB();
+
+    // Cleanup
+    return () => {
+      clearInterval(hbId);
+      clearInterval(watchId);
+      clearTimeout(boostTimer);
+      unsub();
+    };
+  }, []); // NOTE: on lit les .current des refs, pas besoin de dépendances
+
+
+
   /* ====================== DÉRIVÉS & ACTIONS (PARTIE 3/4) ====================== */
 
   /* --------- Dérivés simples --------- */
@@ -678,6 +751,10 @@ export default function Admin() {
     elapsedSec < effectiveNextTimeSec &&
     !isPaused
   );
+
+  useEffect(() => { isCountdownRef.current = !!isCountdownPhase; }, [isCountdownPhase]);
+  useEffect(() => { isRevealRef.current = !!isRevealAnswerPhase; }, [isRevealAnswerPhase]);
+
 
   /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
   useEffect(() => {
@@ -955,15 +1032,20 @@ export default function Admin() {
 
   const startQuiz = async () => {
     try {
-      const nowMs = Date.now();
       await setDoc(
         doc(db, "quiz", "state"),
         {
           isRunning: true,
           isPaused: false,
-          startAt: Timestamp.fromMillis(nowMs),
-          startEpochMs: nowMs,
+          startAt: serverTimestamp(),   // ✅ horloge serveur
           pauseAt: null,
+          // Nouveau couple d’ancrage serveur
+          anchorAt: serverTimestamp(),  // ✅ même « maintenant » côté serveur
+          anchorOffsetSec: 0,           // on démarre à t = 0s
+          // On n’écrit plus startEpochMs (utile uniquement pour compat legacy)
+          startEpochMs: null,
+          navSeq: increment(1),           // 👈 NEW
+          hbBoost: true,
         },
         { merge: true }
       );
@@ -994,8 +1076,6 @@ export default function Admin() {
   const seekTo = async (targetSec) => {
     try {
       const target = Math.max(0, Math.floor(targetSec));
-      const ms = Date.now() - target * 1000;
-
       // Neutraliser l'auto-pause si on saute au début d'une manche
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
@@ -1011,14 +1091,18 @@ export default function Admin() {
       const payload = {
         isRunning: true,
         isPaused: false,
-        startAt: Timestamp.fromMillis(ms),
-        startEpochMs: ms,
+        startAt: serverTimestamp(),   // ✅ horloge serveur
         pauseAt: null,
+        // Nouveau couple d’ancrage
+        anchorAt: serverTimestamp(),  // ✅ « maintenant » serveur
+        anchorOffsetSec: target,      // t = target (s) sur la timeline
+        startEpochMs: null,           // n’écrit plus l’epoch local
+        navSeq: increment(1),           // 👈 NEW
+        hbBoost: true,
       };
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
         payload.lastAutoPausedRoundIndex = prevIdx;
       }
-
       await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
     } catch (err) {
       console.error("seekTo error:", err);
@@ -1026,11 +1110,11 @@ export default function Admin() {
     }
   };
 
+
   const resumeFromPause = async () => {
     try {
-      const newStartMs = Date.now() - Math.max(0, Math.floor(elapsedSec)) * 1000;
+      const elapsed = Math.max(0, Math.floor(elapsedSec));
 
-      // Si on est pile à la frontière (boundary = nextStart - 1), armer la sentinelle
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
@@ -1045,14 +1129,18 @@ export default function Admin() {
       const payload = {
         isRunning: true,
         isPaused: false,
-        startAt: Timestamp.fromMillis(newStartMs),
-        startEpochMs: newStartMs,
+        startAt: serverTimestamp(),   // ✅ serveur
         pauseAt: null,
+        // Ancrage serveur au moment de la reprise
+        anchorAt: serverTimestamp(),
+        anchorOffsetSec: elapsed,     // on reprend à « elapsed » de la timeline
+        startEpochMs: null,
+        navSeq: increment(1),           // 👈 NEW
+        hbBoost: true,
       };
       if (typeof boundary === "number" && elapsedSec >= boundary) {
         payload.lastAutoPausedRoundIndex = prevIdx;
       }
-
       await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
     } catch (err) {
       console.error("resumeFromPause error:", err);
@@ -1060,10 +1148,10 @@ export default function Admin() {
     }
   };
 
+
   const jumpToRoundStartAndPlay = async (roundStartSec) => {
     try {
       const target = Math.max(0, Math.floor(roundStartSec));
-      const ms = Date.now() - target * 1000;
 
       // Sentinelle = index de la manche précédente au point (roundStartSec - 1)
       let prevIdx = -1;
@@ -1077,9 +1165,14 @@ export default function Admin() {
         {
           isRunning: true,
           isPaused: false,
-          startAt: Timestamp.fromMillis(ms),
-          startEpochMs: ms,
+          startAt: serverTimestamp(),   // ✅ serveur
           pauseAt: null,
+          // Ancrage serveur
+          anchorAt: serverTimestamp(),
+          anchorOffsetSec: target,
+          startEpochMs: null,
+          navSeq: increment(1),           // 👈 NEW
+          hbBoost: true,
           lastAutoPausedRoundIndex: prevIdx,
         },
         { merge: true }
@@ -1090,10 +1183,10 @@ export default function Admin() {
     }
   };
 
+
   const seekPaused = async (targetSec) => {
     try {
       const target = Math.max(0, Math.floor(targetSec));
-      const startMs = Date.now() - target * 1000;
 
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
@@ -1109,14 +1202,18 @@ export default function Admin() {
       const payload = {
         isRunning: true,
         isPaused: true,
-        startAt: Timestamp.fromMillis(startMs),
-        startEpochMs: startMs,
-        pauseAt: serverTimestamp(),
+        startAt: serverTimestamp(),    // ✅ serveur
+        pauseAt: serverTimestamp(),    // ✅ serveur
+        // Ancrage serveur
+        anchorAt: serverTimestamp(),
+        anchorOffsetSec: target,
+        startEpochMs: null,
+        navSeq: increment(1),           // 👈 NEW
+        hbBoost: true,
       };
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
         payload.lastAutoPausedRoundIndex = prevIdx;
       }
-
       await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
     } catch (err) {
       console.error("seekPaused error:", err);
@@ -1267,17 +1364,20 @@ export default function Admin() {
     if (!Number.isFinite(nextStart)) return; // pas de manche suivante
 
     const targetSec = Math.max(0, Math.floor(nextStart));
-    const startMs = Date.now() - targetSec * 1000;
-
     try {
       await setDoc(
         doc(db, "quiz", "state"),
         {
           isRunning: true,
           isPaused: true,
-          startAt: Timestamp.fromMillis(startMs),
-          startEpochMs: startMs,
-          pauseAt: serverTimestamp(),
+          startAt: serverTimestamp(),     // ✅ serveur
+          pauseAt: serverTimestamp(),     // ✅ serveur
+          // Ancrage serveur
+          anchorAt: serverTimestamp(),
+          anchorOffsetSec: targetSec,
+          startEpochMs: null,
+          navSeq: increment(1),           // 👈 NEW
+          hbBoost: true,
           lastAutoPausedRoundIndex: prevIdx,
         },
         { merge: true }
@@ -1286,6 +1386,7 @@ export default function Admin() {
       console.error("goToRoundEndPaused error:", e);
     }
   }
+
 
   /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
 
