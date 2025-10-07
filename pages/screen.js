@@ -43,8 +43,12 @@ const COUNTDOWN_START_SEC = 5;
 const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
 // ====== JOIN (DEV) ======
-const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+//const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
+//const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+
+// ====== JOIN (PUBLIC OK) ======
+const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
+const JOIN_QR_SRC = "/qr-code-public-OK.png"; // fichier placé dans /public
 
 // Barre de temps
 const BAR_H = 6;
