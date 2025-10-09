@@ -1,4 +1,12 @@
-// /pages/admin.js
+// ============================================================================
+// /pages/admin.js — Partie 1/6
+// Scope : Imports + Couleurs & helpers joueurs + Defaults globales +
+//         ensureConfigDefaults + cache scoring + TX d’attribution (awards)
+// Règles : aucune modification fonctionnelle ; uniquement cosmétique (titres,
+//          séparateurs, indentation/espaces, commentaires d’ancrage).
+// ============================================================================
+
+// [1.1] Imports
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db, storage } from "../lib/firebase";
 import {
@@ -23,6 +31,8 @@ import {
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
+
+// [1.2] Couleurs & helpers joueurs
 /* ========================= COULEURS & HELPERS JOUEURS ========================= */
 
 const PLAYER_COLORS = [
@@ -46,6 +56,8 @@ function pickColorDifferent(prev) {
   return bag[Math.floor(Math.random() * bag.length)];
 }
 
+
+// [1.3] Defaults & constantes globales
 /* ========================= DEFAULTS & CONSTANTES GLOBALES ========================= */
 
 const DEFAULT_SCORING_TABLE = [30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
@@ -61,6 +73,8 @@ function clampTimeMusicSec(sec) {
   return Math.max(TIME_MUSIC_MIN_SEC, Math.floor(n));
 }
 
+
+// [1.4] Config par défaut (idempotent)
 /* =================== CONFIG PAR DÉFAUT (IDEMPOTENT) =================== */
 
 async function ensureConfigDefaults() {
@@ -78,6 +92,8 @@ async function ensureConfigDefaults() {
   }
 }
 
+
+// [1.5] Scoring (cache)
 /* ========== SCORING (CACHE) ========== */
 
 let _cachedScoringTable = null;
@@ -98,6 +114,8 @@ async function getScoringTableAdmin() {
   }
 }
 
+
+// [1.6] Attribution transactionnelle (anti-doublons)
 /* ========== ATTRIBUTION TRANSACTIONNELLE (ANTI-DOUBLONS) ========== */
 // PATCH(Admin): robust awards TX (aligné sur Screen)
 async function ensureAwardsForQuestionTx(qid) {
@@ -180,20 +198,25 @@ async function ensureAwardsForQuestionTx(qid) {
   });
 }
 
+// ============================================================================
+// /pages/admin.js — Partie 2/6
+// Scope : Début du composant Admin — états, helpers internes, effets 1→3
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
 /* =============================== COMPOSANT =============================== */
 
 /* ====================== ÉTATS & HELPERS INTERNES (PARTIE 2/4) ====================== */
 export default function Admin() {
-  /* Étape 0 : injecter la config par défaut si absente */
+  /* [2.1] Étape 0 : injecter la config par défaut si absente */
   useEffect(() => {
     ensureConfigDefaults().catch((e) => console.error("ensureConfigDefaults error:", e));
   }, []);
 
-  // Garde locale pour l’attribution auto (anti multi-déclenchements UI)
+  // [2.2] Garde locale pour l’attribution auto (anti multi-déclenchements UI)
   const awardGuardRef = useRef({});
 
-  /* ---------- Helpers internes (déclarés ici pour usage dans tout le composant) ---------- */
+  /* [2.3] Helpers internes (déclarés ici pour usage dans tout le composant) */
   function parseCSV(input = "") {
     return String(input).split(",").map((s) => s.trim()).filter(Boolean);
   }
@@ -282,7 +305,7 @@ export default function Admin() {
     return hex;
   }
 
-  /* --------------------------------- ÉTATS UI/DATA --------------------------------- */
+  /* [2.4] États UI/DATA */
   // Questions
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -331,7 +354,6 @@ export default function Admin() {
   const isCountdownRef = useRef(false);
   const isRevealRef = useRef(false);
 
-
   // Création question
   const [newQ, setNewQ] = useState({
     text: "",
@@ -348,11 +370,7 @@ export default function Admin() {
   ];
   const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
 
-  /* ------------------------------------- EFFECTS ------------------------------------- */
-
-
-
-  // 1) Charger questions (ordre asc)
+  /* [2.5] Effects — 1) Charger questions (ordre asc) */
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -370,7 +388,7 @@ export default function Admin() {
     })();
   }, []);
 
-  // 2) Écouter config (rounds + fin)
+  /* [2.6] Effects — 2) Écouter config (rounds + fin) */
   useEffect(() => {
     const unsub = onSnapshot(
       doc(db, "quiz", "config"),
@@ -394,7 +412,7 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
-  // 3) Écouter état live (Timestamp ou startEpochMs)
+  /* [2.7] Effects — 3) Écouter état live (Timestamp ou startEpochMs) */
   useEffect(() => {
     const unsub = onSnapshot(
       doc(db, "quiz", "state"),
@@ -416,7 +434,6 @@ export default function Admin() {
         } else if (typeof d.startEpochMs === "number") {
           startMs = d.startEpochMs;
         }
-
 
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
@@ -448,7 +465,14 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
-  // 4) Timer local (avec clamp fin de quiz)
+// ============================================================================
+// /pages/admin.js — Partie 3/6
+// Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
+//         Watcher d’attribution automatique
+// Règles : aucune modification fonctionnelle ; uniquement cosmétique.
+// ============================================================================
+
+  // [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
   useEffect(() => {
     if (!quizStartMs) {
       setElapsedSec(0);
@@ -480,7 +504,7 @@ export default function Admin() {
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
-  // 5) Auto-pause à la fin de manche (boundary = nextStart - 1s)
+  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = nextStart - 1s)
   useEffect(() => {
     if (!isRunning || isPaused) return;
     if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null)) return;
@@ -513,7 +537,7 @@ export default function Admin() {
     }
   }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
 
-  // 6) Écouter /quiz/state/players : normaliser nameNorm + couleur + ordre d’arrivée
+  // [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
   useEffect(() => {
     const playersCol = collection(db, "quiz", "state", "players");
     const unsub = onSnapshot(playersCol, (snap) => {
@@ -559,7 +583,7 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
-  // Heartbeat dynamique : 5 s par défaut, 0.5 s pendant les phases critiques (sans TDZ)
+  // [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
   useEffect(() => {
     const stateRef = doc(db, "quiz", "state");
 
@@ -615,8 +639,9 @@ export default function Admin() {
   }, []); // NOTE: on lit les .current des refs, pas besoin de dépendances
 
 
-
-  /* ====================== DÉRIVÉS & ACTIONS (PARTIE 3/4) ====================== */
+  // ========================================================================
+  // DÉRIVÉS & PHASES (rounds/reveal/countdown) + Watcher attribution auto
+  // ========================================================================
 
   /* --------- Dérivés simples --------- */
   const connectedCount = useMemo(
@@ -755,7 +780,6 @@ export default function Admin() {
   useEffect(() => { isCountdownRef.current = !!isCountdownPhase; }, [isCountdownPhase]);
   useEffect(() => { isRevealRef.current = !!isRevealAnswerPhase; }, [isRevealAnswerPhase]);
 
-
   /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
   useEffect(() => {
     const qid = currentQuestion?.id || null;
@@ -772,8 +796,13 @@ export default function Admin() {
       });
   }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase, elapsedSec, isPaused]);
 
-  /* ------------------------------- Actions: Questions ------------------------------- */
+  // ============================================================================
+// /pages/admin.js — Partie 4/6
+// Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
+  // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic
   async function recalcAllTimecodesFromOrder() {
     try {
       const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
@@ -808,7 +837,7 @@ export default function Admin() {
     }
   }
 
-  // Édits inline
+  // [4.2] Édits inline sur une question (state local uniquement)
   const handleFieldChange = (id, field, value) => {
     setItems((prev) =>
       prev.map((it) => {
@@ -821,7 +850,7 @@ export default function Admin() {
     );
   };
 
-  // Manches (UI) : saisir puis sauver
+  // [4.3] Saisie des offsets de manches (UI) + sauvegarde
   const handleRoundOffsetChange = (i, value) => {
     setRoundOffsetsStr((prev) => {
       const next = [...prev];
@@ -849,6 +878,7 @@ export default function Admin() {
     }
   };
 
+  // [4.4] Saisie/Enregistrement de la fin du quiz (global)
   const saveEndOffset = async (valStr) => {
     try {
       const t = (valStr || "").trim();
@@ -865,7 +895,7 @@ export default function Admin() {
     }
   };
 
-  // Upload image question
+  // [4.5] Upload d'image (Storage) + binding sur la question
   const uploadImage = async (file) => {
     if (!file) return null;
     try {
@@ -900,7 +930,7 @@ export default function Admin() {
     handleFieldChange(id, "_imageUploading", false);
   };
 
-  // Save / delete
+  // [4.6] Sauvegarder une question (update Firestore)
   const saveOne = async (it) => {
     try {
       setSavingId(it.id);
@@ -948,6 +978,7 @@ export default function Admin() {
     }
   };
 
+  // [4.7] Supprimer une question
   const removeOne = async (id) => {
     if (!confirm("Supprimer cette question ?")) return;
     await deleteDoc(doc(db, "LesQuestions", id));
@@ -957,7 +988,7 @@ export default function Admin() {
     await recalcAllTimecodesFromOrder();
   };
 
-  // Reorder
+  // [4.8] Reorder (swap deux lignes)
   const swapOrder = async (indexA, indexB) => {
     if (indexA < 0 || indexB < 0 || indexA >= items.length || indexB >= items.length) return;
     const a = items[indexA], b = items[indexB];
@@ -971,7 +1002,7 @@ export default function Admin() {
     await recalcAllTimecodesFromOrder();
   };
 
-  // Init order (one-time)
+  // [4.9] Initialiser l'ordre une fois (fallback legacy)
   const initOrder = async () => {
     const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
     const snap = await getDocs(q);
@@ -985,7 +1016,7 @@ export default function Admin() {
     await recalcAllTimecodesFromOrder();
   };
 
-  // Create
+  // [4.10] Créer une nouvelle question
   const createOne = async () => {
     try {
       setCreating(true);
@@ -1027,6 +1058,13 @@ export default function Admin() {
       await recalcAllTimecodesFromOrder();
     }
   };
+
+  // ============================================================================
+// /pages/admin.js — Partie 5/6
+// Scope : Actions — Live (start/pause/seek/back/next/round) +
+//         Joueurs (reject/kick/alias) + purge/reset complet
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
   /* ------------------------------- Actions: Live ------------------------------- */
 
@@ -1110,7 +1148,6 @@ export default function Admin() {
     }
   };
 
-
   const resumeFromPause = async () => {
     try {
       const elapsed = Math.max(0, Math.floor(elapsedSec));
@@ -1148,7 +1185,6 @@ export default function Admin() {
     }
   };
 
-
   const jumpToRoundStartAndPlay = async (roundStartSec) => {
     try {
       const target = Math.max(0, Math.floor(roundStartSec));
@@ -1182,7 +1218,6 @@ export default function Admin() {
       alert("Échec du saut de manche : " + (err?.message || err));
     }
   };
-
 
   const seekPaused = async (targetSec) => {
     try {
@@ -1284,7 +1319,6 @@ export default function Admin() {
       return { ok: false, reason: "error" };
     }
   }
-
 
   const handleBack = async () => {
     if (!isPaused) return;
@@ -1390,7 +1424,7 @@ export default function Admin() {
 
   /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
 
-  // Récupère un N unique et libre pour "Player N"
+  // [5.1] Récupère un N unique et libre pour "Player N"
   async function getNextAliasNumber() {
     const stateRef = doc(db, "quiz", "state");
     let reservedN = await runTransaction(db, async (tx) => {
@@ -1421,6 +1455,7 @@ export default function Admin() {
     }
   }
 
+  // [5.2] Refuser un nom de joueur (modération)
   async function rejectPlayer(playerId, currentName) {
     try {
       const playersCol = collection(db, "quiz", "state", "players");
@@ -1453,6 +1488,7 @@ export default function Admin() {
     }
   }
 
+  // [5.3] Kick joueur
   async function kickPlayer(id) {
     try {
       const playersCol = collection(db, "quiz", "state", "players");
@@ -1462,6 +1498,7 @@ export default function Admin() {
     }
   }
 
+  // [5.4] Renommer en alias "Player N" (verrouillé)
   async function renameToAlias(playerId) {
     try {
       const n = await getNextAliasNumber();
@@ -1485,7 +1522,7 @@ export default function Admin() {
     }
   }
 
-  // Supprime tous les joueurs (en batchs)
+  // [5.5] Supprimer tous les joueurs (batchs)
   async function deleteAllPlayers() {
     const playersCol = collection(db, "quiz", "state", "players");
     const snap = await getDocs(playersCol);
@@ -1499,7 +1536,7 @@ export default function Admin() {
     }
   }
 
-  // Purge complète de answers/* (submissions + awards + doc racine)
+  // [5.6] Purge complète de answers/* (submissions + awards + doc racine)
   async function purgeAnswersTree() {
     const answersCol = collection(db, "answers");
     const answersSnap = await getDocs(answersCol);
@@ -1538,6 +1575,7 @@ export default function Admin() {
     }
   }
 
+  // [5.7] Reset complet du quiz + joueurs + answers/*
   async function resetQuizAndPlayers() {
     const ok = window.confirm("Tout remettre à zéro ? (quiz/state, joueurs, answers/*)");
     if (!ok) return;
@@ -1585,6 +1623,13 @@ export default function Admin() {
       setTimeout(() => setNotice(null), 2000);
     }
   }
+
+  // ============================================================================
+// /pages/admin.js — Partie 6/6
+// Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
+//         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
   /* ================= UI DÉRIVÉES & RENDU (PARTIE 4/4) ================= */
 
@@ -2141,8 +2186,6 @@ export default function Admin() {
                     const rank = rankingForAdmin.get(p.id) ?? null;
                     const s = Number(p.score || 0);
                     const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
-
-
 
                     return (
                       <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>

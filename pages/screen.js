@@ -1,4 +1,9 @@
-// /pages/screen.js
+// ============================================================================
+// /pages/screen.js — Partie 1/5
+// Scope : Imports, hook mobile VH, constantes, helpers utilitaires,
+// panneaux "Rejoindre", scoring & attribution transactionnelle (hors composant).
+// ============================================================================
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
 import {
@@ -43,12 +48,12 @@ const COUNTDOWN_START_SEC = 5;
 const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
 // ====== JOIN (DEV) ======
-//const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-//const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
+const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
 
 // ====== JOIN (PUBLIC OK) ======
-const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
-const JOIN_QR_SRC = "/qr-code-public-OK.png"; // fichier placé dans /public
+//const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
+//const JOIN_QR_SRC = "/qr-code-public-OK.png"; // fichier placé dans /public
 
 // Barre de temps
 const BAR_H = 6;
@@ -274,15 +279,19 @@ async function ensureAwardsForQuestionTx(qid) {
   });
 }
 
-/* ================================== COMPOSANT ================================= */
+// ============================================================================
+// /pages/screen.js — Partie 2/5
+// Scope : Composant Screen — états/refs, abonnements Firestore (questions,
+// joueurs, config, état global) et timer local synchronisé.
+// ============================================================================
 
 export default function Screen() {
   useMobileVH();
+
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
   const lastNavSeqRef = useRef(null);
   const uiFreezeUntilRef = useRef(0);
-
 
   // Flags de chargement
   const [stateLoaded, setStateLoaded] = useState(false);
@@ -301,10 +310,10 @@ export default function Screen() {
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
   const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
 
-  // leaderboard
+  // Leaderboard
   const [playersLB, setPlayersLB] = useState([]);
   const [leaderboardTopN, setLeaderboardTopN] = useState(DEFAULT_LEADERBOARD_TOP_N);
-  const awardGuardRef = useRef({}); // utilisé en Partie 3/4 pour l’attribution des points
+  const awardGuardRef = useRef({}); // utilisé plus tard pour l’attribution des points
 
   // Fin de manche (poussée par l’admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
@@ -313,8 +322,9 @@ export default function Screen() {
   const serverDeltaRef = useRef(0);
   const [serverDeltaTick, setServerDeltaTick] = useState(0); // re-render léger si besoin
 
-  // Préchargement image avec decode() pour éviter le flash au reveal
+  // Préchargement image pour éviter le flash au reveal
   const [preloadedImage, setPreloadedImage] = useState(null);
+
 
   /* --------------------------- Charger les questions --------------------------- */
   useEffect(() => {
@@ -374,7 +384,6 @@ export default function Screen() {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = (snap && snap.data()) || {};
 
-
       // startMs depuis ancrage (anchorAt + anchorOffsetSec) si présent ; fallback legacy
       let startMs = null;
       if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
@@ -394,15 +403,11 @@ export default function Screen() {
         uiFreezeUntilRef.current = performance.now() + UI_MASK_MS;
       }
 
-
       // Delta d’horloge locale ← serveur (via heartbeat Admin)
       if (d.serverNow && typeof d.serverNow.seconds === "number") {
         const serverNowMs = d.serverNow.seconds * 1000 + Math.floor((d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6);
         const instantDelta = serverNowMs - Date.now(); // (>0) = mon device est en retard
 
-        // Lissage simple + "max prefer" pour compenser le biais réseau (latence)
-        // - on prend la valeur la plus GRANDE (souvent la plus proche de la réalité,
-        //   car la latence rend les mesures trop FAIBLES)
         // Buffer des derniers deltas pour une correction “best-of”
         if (!serverDeltaRef.buffer) serverDeltaRef.buffer = [];
         serverDeltaRef.buffer.push(instantDelta);
@@ -417,11 +422,9 @@ export default function Screen() {
         const alpha = 0.25;
         serverDeltaRef.current = prev * (1 - alpha) + p90 * alpha;
 
-
-        // Tick optionnel (faible coût) si tu relies des choses à Date.now()
+        // Tick optionnel (faible coût) si on relies des choses à Date.now()
         setServerDeltaTick((t) => (t + 1) & 0xfff);
       }
-
 
       setIsRunning(!!d.isRunning);
       setIsPaused(!!d.isPaused);
@@ -502,8 +505,13 @@ export default function Screen() {
 
     rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
+  // ============================================================================
+// /pages/screen.js — Partie 3.5/5
+// Scope : leaderboard/podium (tri + égalités), dérivés & phases d’écran,
+// déclenchement d’attribution des points pendant la révélation.
+// ============================================================================
 
   /* ----------------------- Leaderboard (tri & top N) ----------------------- */
   const leaderboard = useMemo(() => {
@@ -522,7 +530,7 @@ export default function Screen() {
       return 0;
     });
 
-    // === RANGS AVEC ÉGALITÉS (compétition) ===
+    // Rangs avec égalités
     let lastScore = null;
     let lastRank = 0;
     rows.forEach((p, i) => {
@@ -532,20 +540,19 @@ export default function Screen() {
         lastScore = sc;
         lastRank = 1;
       } else if (sc === lastScore) {
-        p._rank = lastRank;           // égalité → même rang
+        p._rank = lastRank;
       } else {
-        p._rank = i + 1;              // rang = position (1-based)
+        p._rank = i + 1;
         lastScore = sc;
         lastRank = p._rank;
       }
     });
 
-
     const top = Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
     return rows.slice(0, top);
   }, [playersLB, leaderboardTopN]);
 
-  // Podium (fin de quiz) : groupes de médailles avec égalités, uniquement si score > 0
+  // Podium (fin de quiz) : groupes par médailles avec égalités (> 0 pts)
   const podium = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
@@ -555,10 +562,7 @@ export default function Screen() {
         score: Number(p.score || 0),
         _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
       }))
-      .sort((a, b) => {
-        if (a.score !== b.score) return b.score - a.score; // score desc
-        return a._nameKey.localeCompare(b._nameKey);
-      });
+      .sort((a, b) => (a.score !== b.score ? b.score - a.score : a._nameKey.localeCompare(b._nameKey)));
 
     const distinct = Array.from(new Set(rows.map((r) => r.score))).filter((s) => s > 0);
     const goldScore = distinct[0];
@@ -572,10 +576,7 @@ export default function Screen() {
     };
   }, [playersLB]);
 
-
-  /* ===================== DÉRIVÉS & LOGIQUE (PARTIE 3/4) ===================== */
-
-  /* --------------- Choix question active (borné à la manche courante) --------- */
+  /* ---------------- Dérivés & logique bornée par la manche ---------------- */
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
 
   // Début/fin de la manche courante
@@ -595,7 +596,7 @@ export default function Screen() {
     return Infinity;
   })();
 
-  // Dernière question dans [currentRoundStart, elapsedSec[
+  // Question courante = dernière question dans [roundStart, elapsedSec[
   let activeIndex = -1;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
@@ -606,8 +607,8 @@ export default function Screen() {
   const currentQuestion = activeIndex >= 0 ? sorted[activeIndex] : null;
   const currentQuestionId = currentQuestion?.id ?? null;
 
-  /* --------------- Prochaine échéance (question / manche / fin quiz) ---------- */
-  // Prochaine question
+  /* ---------------- Prochaine échéance (question / manche / fin) ----------- */
+  // Prochaine question (t > elapsedSec)
   let nextTimeSec = null;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
@@ -619,12 +620,12 @@ export default function Screen() {
 
   const uiMasked = performance.now() < uiFreezeUntilRef.current;
 
-  // Prochaine manche
+  // Prochaine frontière de manche (−GAP pour éviter chevauchement reveal)
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
   const nextRoundBoundary = Number.isFinite(nextRoundStart) ? Math.max(0, nextRoundStart - GAP) : null;
 
-  // Fenêtre morte (1s avant la frontière)
+  // Fenêtre morte à ± ~1s autour de la frontière
   const ROUND_DEADZONE_SEC = 1;
   const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
@@ -633,22 +634,25 @@ export default function Screen() {
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
 
-  // Min des candidates
+  // Candidat minimal
   let effectiveNextTimeSec = null;
   let nextKind = null; // "question" | "round" | "end"
-  const cands = [];
-  if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: "question" });
-  if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: "round" });
-  if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: "end" });
-  if (cands.length) {
-    const best = cands.reduce((a, b) => (a.t < b.t ? a : b));
-    effectiveNextTimeSec = best.t;
-    nextKind = best.k;
+  {
+    const cands = [];
+    if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: "question" });
+    if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: "round" });
+    if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: "end" });
+    if (cands.length) {
+      const best = cands.reduce((a, b) => (a.t < b.t ? a : b));
+      effectiveNextTimeSec = best.t;
+      nextKind = best.k;
+    }
   }
 
-  // Bornes locales de la question (intro mangée sur la 1ʳᵉ question de la manche)
+  /* ------------------------- Phases & bornes locales ------------------------ */
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
 
+  // 1ʳᵉ question de la manche courante ?
   const firstQuestionTimeInCurrentRound = (() => {
     for (let i = 0; i < sorted.length; i++) {
       const t = getTimeSec(sorted[i]);
@@ -657,28 +661,15 @@ export default function Screen() {
     }
     return null;
   })();
-
   const isFirstQuestionOfRound =
     Number.isFinite(qStart) &&
     Number.isFinite(firstQuestionTimeInCurrentRound) &&
     qStart === firstQuestionTimeInCurrentRound;
 
   const introStart = isFirstQuestionOfRound ? qStart : null;
-  const introEnd =
-    isFirstQuestionOfRound && Number.isFinite(qStart)
-      ? qStart + ROUND_START_INTRO_SEC
-      : null;
-
-
-
-  const isRoundIntroPhase = !uiMasked && Boolean(
-    isFirstQuestionOfRound &&
-    !isPaused &&
-    !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
-    introStart != null &&
-    elapsedSec >= introStart &&
-    elapsedSec < introEnd
-  );
+  const introEnd = isFirstQuestionOfRound && Number.isFinite(qStart)
+    ? qStart + ROUND_START_INTRO_SEC
+    : null;
 
   // Le temps “jouable” commence après l’intro
   const qStartEffective =
@@ -687,41 +678,55 @@ export default function Screen() {
       : qStart;
 
   // Compte à rebours affiché 5..1
-  const introCountdownSec = isRoundIntroPhase
-    ? Math.max(1, Math.ceil((introEnd ?? 0) - elapsedSec))
-    : null;
+  const introCountdownSec = isFirstQuestionOfRound &&
+    !uiMasked &&
+    !isPaused &&
+    introStart != null &&
+    elapsedSec >= introStart &&
+    introEnd != null &&
+    elapsedSec < introEnd
+      ? Math.max(1, Math.ceil(introEnd - elapsedSec))
+      : null;
 
-  // Numéro de manche pour l’UI
+  // Numéro de manche (UI)
   const roundIdxForCurrentQuestion = Number.isFinite(qStart)
     ? roundIndexOfTime(Math.max(0, qStart), roundOffsetsSec)
     : null;
-  const roundNumberForIntro =
-    roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
+  const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
 
-  // Fin de manche (pause posée au boundary par l’admin)
+  // Pause de manche / fin de quiz
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
   const isRoundBreak = Boolean(isPaused && endedRoundIndex != null && !isQuizEnded);
 
-  // Phases bornées (pas de flash)
+  // Phases bornées (anti-flash)
   const nextEvent = effectiveNextTimeSec;
   const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
+
+  const isRoundIntroPhase = !uiMasked && Boolean(
+    isFirstQuestionOfRound &&
+    !isPaused &&
+    !(isPaused && Number.isInteger(lastAutoPausedRoundIndex)) &&
+    introStart != null &&
+    elapsedSec >= introStart &&
+    elapsedSec < (introEnd ?? -Infinity)
+  );
 
   const isQuestionPhase = !uiMasked && Boolean(
     currentQuestion &&
     qStartEffective != null &&
     nextEvent != null &&
     elapsedSec >= qStartEffective &&
-    elapsedSec < revealStart &&
+    elapsedSec < (revealStart ?? -Infinity) &&
     !isPaused &&
     !isRoundBreak
   );
 
   const isRevealAnswerPhase = !uiMasked && Boolean(
     currentQuestion &&
-    revealStart != null &&
-    countdownStart != null &&
+    (revealStart != null) &&
+    (countdownStart != null) &&
     elapsedSec >= revealStart &&
     elapsedSec < countdownStart &&
     !isPaused &&
@@ -730,15 +735,15 @@ export default function Screen() {
 
   const isCountdownPhase = !uiMasked && Boolean(
     currentQuestion &&
-    countdownStart != null &&
-    nextEvent != null &&
+    (countdownStart != null) &&
+    (nextEvent != null) &&
     elapsedSec >= countdownStart &&
     elapsedSec < nextEvent &&
     !isPaused &&
     !isRoundBreak
   );
 
-  /* ===== Attribution des points : déclenche pendant la fenêtre de révélation ===== */
+  /* ===== Attribution des points : déclenchée pendant la fenêtre de révélation ===== */
   useEffect(() => {
     const qid = currentQuestion?.id || null;
     if (!qid) return;
@@ -756,8 +761,7 @@ export default function Screen() {
     });
   }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase]);
 
-  /* ====================== Variables d’UI dérivées (4/4) ====================== */
-
+  /* ---------------------- Variables d’UI dérivées ---------------------- */
   // Décompte (jamais 0s)
   const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
   const countdownSec = isCountdownPhase
@@ -803,6 +807,7 @@ export default function Screen() {
   const currentQuestionIdForLB = currentQuestionId;
   const inRevealWindowForLB = Boolean(isRevealAnswerPhase || isCountdownPhase);
 
+  // Préchargement image (anti-flicker au reveal)
   useEffect(() => {
     setPreloadedImage(null);
     const url = currentQuestion?.imageUrl;
@@ -823,10 +828,9 @@ export default function Screen() {
     return () => { cancelled = true; };
   }, [currentQuestionId]);
 
-
+  // UI mask : neutralise les transitions CSS le temps du voile
   useEffect(() => {
     if (!uiMasked) return;
-    // injecte un <style> global sans passer par styled-jsx
     const tag = document.createElement("style");
     tag.setAttribute("data-ui-mask", "1");
     tag.textContent = `*{transition:none!important;animation:none!important}`;
@@ -834,8 +838,12 @@ export default function Screen() {
     return () => { tag.remove(); };
   }, [uiMasked]);
 
-
-
+  // ============================================================================
+// /pages/screen.js — Partie 4/5
+// Scope : RENDER — écrans pré-start / quiz (question, reveal, countdown),
+// pauses & fins de manche/quiz, colonne classement et panneaux “Rejoindre”.
+// (⚠️ Ne PAS fermer la fonction ici — l’accolade finale arrive en partie 5.)
+// ============================================================================
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
@@ -1310,7 +1318,3 @@ export default function Screen() {
     </div>
   );
 }
-
-
-
-

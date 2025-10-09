@@ -1,4 +1,9 @@
-// /pages/player.js
+// ============================================================================
+// /pages/player.js — Partie 1/6
+// Scope : Imports, hook mobile VH, constantes, helpers (scoring, normalisation,
+//         modération & validation de nom), composant Splash, reset runtime.
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
 /*Partie 1/4 (imports, constantes, helpers) */
 import { useEffect, useMemo, useRef, useState, startTransition } from "react";
@@ -20,7 +25,9 @@ import {
   runTransaction,
 } from "firebase/firestore";
 
-// Fix viewport height on mobile browsers (100vh bug)
+// ---------------------------------------------------------------------------
+// Hook: Fix viewport height on mobile browsers (100vh bug)
+// ---------------------------------------------------------------------------
 const useMobileVH = () => {
   useEffect(() => {
     const setVh = () => {
@@ -117,11 +124,15 @@ async function recordFirstCorrectAndPredict({ db, qid, playerId }) {
   });
 }
 
+// ---------------------------------------------------------------------------
 // Transitions : masque et “cooldown” frontière
+// ---------------------------------------------------------------------------
 const UI_MASK_MS = 220;         // durée du voile anti-flicker
 const BOUNDARY_HYST_MS = 120;   // marge autour des frontières de manche
 
+// ---------------------------------------------------------------------------
 // Anti-spam
+// ---------------------------------------------------------------------------
 const RATE_LIMIT_ENABLED = true;
 const MAX_WRONG_ATTEMPTS = 5;        // nb de tentatives avant blocage
 const RATE_LIMIT_WINDOW_MS = 15_000; // fenêtre glissante: 15 s
@@ -338,6 +349,9 @@ function validateName(raw) {
   return { ok: true, value: cleaned };
 }
 
+// ---------------------------------------------------------------------------
+// Splash (écran neutre, plein écran, fond homogène)
+// ---------------------------------------------------------------------------
 function Splash() {
   return (
     <div
@@ -350,6 +364,9 @@ function Splash() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Helpers alpha/tri pour le classement & messages finaux
+// ---------------------------------------------------------------------------
 function normalizeNameAlpha(s) {
   return String(s || "")
     .normalize("NFD")
@@ -372,16 +389,53 @@ function medalForRank(rank) {
   return rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "";
 }
 
+// ---------------------------------------------------------------------------
+// Reset complet de l'état "par joueur / par question"
+// ---------------------------------------------------------------------------
+function resetRuntimeForPlayer({
+  answeredAtRef,
+  lastAnswerQidRef,
+  lastInstantWinQidRef,
+  setInstantWin,
+  setResult,
+  setAnswer,
+  setWrongTimes,
+  setCooldownUntilMs,
+  setLockPhraseIndex,
+}) {
+  if (answeredAtRef?.current) answeredAtRef.current = {};
+  if (lastAnswerQidRef) lastAnswerQidRef.current = null;
+  if (lastInstantWinQidRef) lastInstantWinQidRef.current = null;
+
+  // États UI
+  setInstantWin?.(null);
+  setResult?.(null);
+  setAnswer?.("");
+  setWrongTimes?.([]);
+  setCooldownUntilMs?.(null);
+  setLockPhraseIndex?.(null);
+}
+
+// ============================================================================
+// /pages/player.js — Partie 2/6
+// Scope : État React + abonnements Firestore + timers (boot, joueur, quiz, config,
+//         leaderboard, correction d’horloge serveur, rAF timer).
+// ============================================================================
+
 /* Partie 2/4 — état React + abonnements Firestore + timers*/
 
 /* =============================== COMPOSANT =============================== */
 
 export default function Player() {
   useMobileVH();
+
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
   const lastNavSeqRef = useRef(null);
   const uiFreezeUntilRef = useRef(0);
+
+  // Mémo: ce joueur a répondu pour la 1ʳᵉ fois *après* le dernier Back sur ce qid
+  const answeredAfterBackRef = useRef({}); // { [qid]: boolean }
 
   // Leaderboard (fin de quiz)
   const [playersLB, setPlayersLB] = useState([]);
@@ -395,7 +449,7 @@ export default function Player() {
         localStorage.getItem("playerID") ||
         localStorage.getItem("player_id") ||
         null;
-    } catch { }
+    } catch {}
   }, []);
 
   // Instant win (affichage immédiat + anti double-appel)
@@ -442,7 +496,6 @@ export default function Player() {
   // Horodatage (elapsedSec) de la 1ʳᵉ bonne réponse par question
   const answeredAtRef = useRef({}); // { [qid]: number }
 
-
   // ---- Détection Back (rewind) ----
   const prevElapsedSecRef = useRef(null);
   const prevQuestionIdRef = useRef(null);
@@ -450,7 +503,6 @@ export default function Player() {
   // Mémo Back : question concernée + si le joueur avait DÉJÀ trouvé avant le Back
   const backInfoRef = useRef({ lastBackQid: null, hadCorrectBeforeBack: false });
   const [backTick, setBackTick] = useState(0); // force un re-render lors d'un Back
-
 
   // Anti-spam
   const [wrongTimes, setWrongTimes] = useState([]); // timestamps ms des erreurs
@@ -464,7 +516,6 @@ export default function Player() {
   // Offset horloge serveur ← d.serverNow (écrit par Admin)
   const serverDeltaRef = useRef(0);        // ms
   const [serverDeltaTick, setServerDeltaTick] = useState(0); // force un léger re-render si besoin
-
 
   /* =============================== EFFECTS =============================== */
 
@@ -488,7 +539,7 @@ export default function Player() {
         const arr = JSON.parse(raw);
         if (Array.isArray(arr)) setRejectedNames(arr);
       }
-    } catch { }
+    } catch {}
     setHydrated(true);
   }, []);
 
@@ -528,6 +579,18 @@ export default function Player() {
           localStorage.removeItem("rejectedNamesCache");
           startTransition(() => setRejectedNames([]));
         }
+        // Remise à zéro locale pour éviter "déjà répondu" après reset
+        resetRuntimeForPlayer({
+          answeredAtRef,
+          lastAnswerQidRef,
+          lastInstantWinQidRef,
+          setInstantWin,
+          setResult,
+          setAnswer,
+          setWrongTimes,
+          setCooldownUntilMs,
+          setLockPhraseIndex,
+        });
         return;
       }
 
@@ -553,7 +616,6 @@ export default function Player() {
       }
       startTransition(() => setNameLocked(!!d.nameLocked));
 
-
       let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
       const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
       serverRejected = serverRejected.filter((n) => !isAliasNameLocal(n));
@@ -570,7 +632,6 @@ export default function Player() {
       localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
       startTransition(() => setRejectedNames(union));
 
-
       startTransition(() => setPlayerDocLoaded(true));
     });
 
@@ -580,7 +641,6 @@ export default function Player() {
   // 4) Si aucun playerId → considérer le doc joueur "chargé"
   useEffect(() => {
     if (!playerId) startTransition(() => setPlayerDocLoaded(true));
-
   }, [playerId]);
 
   // 5) Abonnement principal /quiz/state
@@ -610,7 +670,6 @@ export default function Player() {
         uiFreezeUntilRef.current = performance.now() + UI_MASK_MS;
       }
 
-
       // Mise à jour du delta d'horloge si Admin publie serverNow
       if (d.serverNow && typeof d.serverNow.seconds === "number") {
         const serverNowMs =
@@ -634,14 +693,10 @@ export default function Player() {
         setServerDeltaTick((t) => (t + 1) & 0xfff);
       }
 
-
-
-
       startTransition(() => {
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
       });
-
 
       if (!startMs) {
         startTransition(() => {
@@ -665,7 +720,6 @@ export default function Player() {
             setPauseAtMs(null);
           }
         });
-
       }
 
       startTransition(() => {
@@ -705,7 +759,6 @@ export default function Player() {
       setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
     })();
   }, []);
-
 
   // 8) Config (manches + fin + durée de révélation)
   useEffect(() => {
@@ -763,7 +816,6 @@ export default function Player() {
     const computeNow = () =>
       Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
 
-
     // Première mise à jour immédiate
     const first = computeNow();
     if (Number.isFinite(quizEndSec) && first >= quizEndSec) {
@@ -795,13 +847,19 @@ export default function Player() {
     return () => cancelAnimationFrame(rafId);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
+  // ============================================================================
+// /pages/player.js — Partie 3/6
+// Scope : Dérivés & calculs d’écran (phases, bornes de manche/question),
+//         préchargement images, anti-spam dérivés, focus, watcher Back,
+//         handlers de réponse, “instant win”, ranking & helpers nom.
+// ============================================================================
 
-  /* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
-  /* ===================== Dérivés & calculs d'écran ===================== */
+/* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
+/* ===================== Dérivés & calculs d'écran ===================== */
 
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
 
-  // Début/fin de la manche courante
+  // --- Début/fin de la manche courante
   const currentRoundStart = (() => {
     let s = 0;
     for (let i = 0; i < roundOffsetsSec.length; i++) {
@@ -810,6 +868,7 @@ export default function Player() {
     }
     return s;
   })();
+
   const currentRoundEnd = (() => {
     for (let i = 0; i < roundOffsetsSec.length; i++) {
       const t = roundOffsetsSec[i];
@@ -818,7 +877,7 @@ export default function Player() {
     return Infinity;
   })();
 
-  // Question courante
+  // --- Question courante bornée à la manche
   let activeIndex = -1;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
@@ -828,20 +887,16 @@ export default function Player() {
   }
   const currentQuestion = activeIndex >= 0 ? sorted[activeIndex] : null;
 
-  // Prochaine question
+  // Prochaine question (t > elapsed)
   let nextTimeSec = null;
   for (let i = 0; i < sorted.length; i++) {
     const t = getTimeSec(sorted[i]);
-    if (Number.isFinite(t) && t > elapsedSec) {
-      nextTimeSec = t;
-      break;
-    }
+    if (Number.isFinite(t) && t > elapsedSec) { nextTimeSec = t; break; }
   }
 
   const uiMasked = performance.now() < uiFreezeUntilRef.current;
 
-
-  // Prochaine échéance (min question / frontière de manche / fin de quiz)
+  // --- Prochaine échéance (min question / frontière de manche / fin de quiz)
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
   const nextRoundBoundary = Number.isFinite(nextRoundStart) ? Math.max(0, nextRoundStart - GAP) : null;
@@ -866,12 +921,12 @@ export default function Player() {
     nextKind = best.k;
   }
 
-  // Bornes de la question courante
+  // --- Bornes de la question courante
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
   const boundary = effectiveNextTimeSec;
   const qEnd = boundary != null ? boundary - revealDurationSec : null;
 
-  // 1ʳᵉ question de la manche courante ?
+  // 1re question de la manche courante ?
   const firstQuestionTimeInCurrentRound = (() => {
     for (let i = 0; i < sorted.length; i++) {
       const t = getTimeSec(sorted[i]);
@@ -886,18 +941,17 @@ export default function Player() {
     Number.isFinite(firstQuestionTimeInCurrentRound) &&
     qStart === firstQuestionTimeInCurrentRound;
 
-  // Fenêtre d’intro
+  // Fenêtre d’intro (début de manche)
   const introStart = isFirstQuestionOfRound ? qStart : null;
   const introEnd = isFirstQuestionOfRound && Number.isFinite(qStart)
     ? qStart + ROUND_START_INTRO_SEC
     : null;
 
-  // Si on est très proche de la frontière de manche, on force l’intro (UX)
+  // Force une courte intro si on “rase” la frontière (UX)
   const forceIntroByBoundary =
     secondsToRoundBoundary != null &&
-    secondsToRoundBoundary <= 0.20 &&     // +200 ms après frontière
-    secondsToRoundBoundary >= -0.12;      // −120 ms avant frontière
-
+    secondsToRoundBoundary <= 0.20 &&
+    secondsToRoundBoundary >= -0.12;
 
   const isRoundIntroPhase = !uiMasked && Boolean(
     (
@@ -911,13 +965,12 @@ export default function Player() {
     || forceIntroByBoundary
   );
 
-
-  // Le temps “utilisable” pour répondre commence après l’intro
+  // Le temps utile de réponse commence après l’intro
   const qStartEffective = isFirstQuestionOfRound && Number.isFinite(qStart)
     ? qStart + ROUND_START_INTRO_SEC
     : qStart;
 
-  // Compte à rebours affiché 5..1
+  // Compte à rebours d’intro (1..N)
   const introCountdownSec = isRoundIntroPhase
     ? Math.max(1, Math.ceil((introEnd ?? 0) - elapsedSec))
     : null;
@@ -928,11 +981,11 @@ export default function Player() {
     : null;
   const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
 
-  // Fin de manche (pause posée à la frontière par l’admin)
+  // Fin de manche (pause posée par Admin à la frontière)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
   const isRoundBreak = Boolean(isPaused && endedRoundIndex != null);
 
-  // Phases
+  // --- Phases
   const nextEvent = effectiveNextTimeSec;
   const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
   const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
@@ -967,13 +1020,13 @@ export default function Player() {
     !isRoundBreak
   );
 
-
-  // Décompte (jamais 0s)
+  // Décompte (jamais 0)
   const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
   const countdownSec = isCountdownPhase
     ? Math.max(1, Math.min(COUNTDOWN_START_SEC, Math.ceil(secondsToNext)))
     : null;
 
+  // Libellé du décompte
   let countdownLabel = "Prochaine question dans :";
   if (nextKind === "end") countdownLabel = "Fin du quiz dans :";
   if (nextKind === "round") {
@@ -995,9 +1048,8 @@ export default function Player() {
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
 
-  // Reset UI quand la question change
-  const currentQuestionId = currentQuestion?.id ?? null;
   // Reset UI complet à chaque changement de question
+  const currentQuestionId = currentQuestion?.id ?? null;
   useEffect(() => {
     lastAnswerQidRef.current = null;
     lastInstantWinQidRef.current = null;
@@ -1008,13 +1060,25 @@ export default function Player() {
     setCooldownUntilMs(null);
     setLockPhraseIndex(null);
 
-    // reset détection Back pour la nouvelle question
+    // Reset détection Back pour la nouvelle question
     prevElapsedSecRef.current = null;
     prevQuestionIdRef.current = null;
     backInfoRef.current = { lastBackQid: null, hadCorrectBeforeBack: false };
   }, [currentQuestionId]);
 
-  // Phrase de révélation et réponse primaire (pour l’écran Reveal)
+  // Init “answeredAfterBackRef” pour la q courante
+  useEffect(() => {
+    const qid = currentQuestionId;
+    if (qid) {
+      if (typeof answeredAfterBackRef.current[qid] !== "boolean") {
+        answeredAfterBackRef.current[qid] = false;
+      }
+    } else {
+      answeredAfterBackRef.current = {};
+    }
+  }, [currentQuestionId]);
+
+  // Phrase de révélation + réponse primaire
   const revealPhrase = useMemo(
     () => (currentQuestion ? pickRevealPhrase(currentQuestion) : ""),
     [currentQuestionId]
@@ -1025,10 +1089,8 @@ export default function Player() {
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
 
-
-  // Préchargement image avec decode() pour éviter le flash au reveal
+  // --- Préchargement image du reveal (anti-flicker)
   const [preloadedImage, setPreloadedImage] = useState(null);
-  // ✅ Pas d'optional chaining dans le tableau de dépendances
   const currentImageUrl = currentQuestion ? currentQuestion.imageUrl : null;
 
   useEffect(() => {
@@ -1051,9 +1113,7 @@ export default function Player() {
     return () => { cancelled = true; };
   }, [currentImageUrl]);
 
-
-
-  // Prefetch "idle" des 2 prochaines images pour accélérer les futurs reveals
+  // Prefetch “idle” des 2 prochaines images
   useEffect(() => {
     if (!currentQuestionId || !Array.isArray(sorted) || !sorted.length) return;
 
@@ -1067,7 +1127,6 @@ export default function Player() {
     }
     if (!nextUrls.length) return;
 
-    // Utilise requestIdleCallback si dispo, sinon fallback setTimeout
     const run = () => {
       nextUrls.forEach((url) => {
         try {
@@ -1075,11 +1134,8 @@ export default function Player() {
           im.loading = "eager";
           im.decoding = "async";
           im.src = url;
-          // Déclenche le décodage si possible, sans bloquer le thread
-          if (im.decode) {
-            im.decode().catch(() => { });
-          }
-        } catch { /* noop */ }
+          if (im.decode) im.decode().catch(() => {});
+        } catch {}
       });
     };
 
@@ -1096,11 +1152,21 @@ export default function Player() {
     }
   }, [currentQuestionId, sorted]);
 
-
-
-  // Flags de rendu global
+  // Flags globaux + statut joueur courant
   const showPreStart = !(quizStartMs && isRunning);
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
+
+  const qid = currentQuestionId;
+  const hadCorrectEver = qid ? (answeredAtRef.current[qid] != null) : false;
+  const justAnsweredAfterBack = qid ? (answeredAfterBackRef.current[qid] === true) : false;
+
+  // ✅ Bonne réponse “affichable maintenant”
+  const showGoodNow = useMemo(() => {
+    if (!qid) return false;
+    const gotNow = (result === "correct" && lastAnswerQidRef.current === qid);
+    const noBackSince = backInfoRef.current.lastBackQid !== qid;
+    return (gotNow && noBackSince) || justAnsweredAfterBack;
+  }, [qid, result, justAnsweredAfterBack, backTick]);
 
   // Splash : relâcher après boot initial
   const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
@@ -1109,7 +1175,7 @@ export default function Player() {
   }, [initialBootReady]);
 
   // Anti-spam (dérivés)
-  const nowMs = Date.now() + cooldownTick; // force re-render pendant cooldown
+  const nowMs = Date.now() + cooldownTick;
   const isLocked = RATE_LIMIT_ENABLED && cooldownUntilMs != null && nowMs < cooldownUntilMs;
   const lockRemainingSec = isLocked ? Math.max(0, Math.ceil((cooldownUntilMs - nowMs) / 1000)) : 0;
   const lockText =
@@ -1117,20 +1183,24 @@ export default function Player() {
       ? LOCK_PHRASES[lockPhraseIndex]
       : LOCK_PHRASES[0];
 
-  // Conditions input
-  const answersOpen = Boolean(isQuestionPhase && !isLocked);
-  const showInput = Boolean(answersOpen && result !== "correct");
-
-  // Bannière réponse persistante pendant la phase question
-  const hasAnsweredThisQuestion =
-    (instantWin && instantWin.qid === currentQuestionId) ||
-    lastAnswerQidRef.current === currentQuestionId ||
-    result === "correct";
-
   const gainedPoints =
     instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
 
-  // Focus automatique quand le masque est levé et que l'input est visible
+  // “Déjà correct” (persiste même après un Back)
+  const alreadyCorrect = useMemo(() => {
+    const qid = currentQuestionId;
+    if (!qid) return false;
+    if (answeredAtRef.current[qid] != null) return true;
+    if (lastAnswerQidRef.current === qid) return true;
+    if (instantWin && instantWin.qid === qid) return true;
+    return result === "correct";
+  }, [currentQuestionId, instantWin, result]);
+
+  // Ouverture/affichage input
+  const answersOpen = Boolean(isQuestionPhase && !isLocked);
+  const showInput = Boolean(answersOpen && !hadCorrectEver && !justAnsweredAfterBack);
+
+  // Focus auto si input visible et masque levé
   useEffect(() => {
     if (!uiMasked && showInput) {
       const el = answerInputRef.current;
@@ -1140,11 +1210,7 @@ export default function Player() {
     }
   }, [uiMasked, showInput, currentQuestionId]);
 
-
-  /* ======= Effets dépendant des dérivés (APRES le bloc de dérivés) ======= */
-
-  // 9.5) Watcher Back : si elapsedSec recule sur la même question → Back détecté.
-  //     On mémorise si le joueur AVAIT déjà la bonne réponse avant ce Back.
+  // --- Watcher Back : elapsedSec recule sur même qid → Back détecté
   useEffect(() => {
     const qid = currentQuestionId;
 
@@ -1153,36 +1219,35 @@ export default function Player() {
       backInfoRef.current = { lastBackQid: null, hadCorrectBeforeBack: false };
     }
 
-    // détection Back : elapsedSec qui diminue d’au moins 1s
+    // détection Back : recul d’au moins ~1s
     if (
       qid &&
       prevQidRef.current === qid &&
       typeof prevElapsedSecRef.current === "number" &&
       elapsedSec < prevElapsedSecRef.current - 0.9
     ) {
-      // Avais-je déjà répondu juste AVANT ce Back ?
       const tAnswer = answeredAtRef.current[qid];
       const hadAlready =
         Number.isFinite(tAnswer) && Number.isFinite(prevElapsedSecRef.current)
-          ? tAnswer <= prevElapsedSecRef.current   // la réponse existait et était antérieure au Back
-          : tAnswer != null; // fallback si pas d’horodatage
+          ? tAnswer <= prevElapsedSecRef.current
+          : tAnswer != null;
       backInfoRef.current = { lastBackQid: qid, hadCorrectBeforeBack: !!hadAlready };
-      setBackTick((t) => t + 1); // re-render pour rafraîchir le texte de la bannière
-
+      answeredAfterBackRef.current[qid] = false;
+      setBackTick((t) => t + 1);
     }
 
     prevQidRef.current = qid;
     prevElapsedSecRef.current = elapsedSec;
   }, [elapsedSec, currentQuestionId, result]);
 
-  // 10) Ticker de cooldown (anti-spam)
+  // Ticker cooldown (anti-spam)
   useEffect(() => {
     if (!cooldownUntilMs) return;
     const id = setInterval(() => setCooldownTick((t) => t + 1), 250);
     return () => clearInterval(id);
   }, [cooldownUntilMs]);
 
-  /* ============================ Vérification & Handlers ============================ */
+/* ============================ Vérification & Handlers ============================ */
 
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
@@ -1196,7 +1261,8 @@ export default function Player() {
       lastAnswerQidRef.current = currentQuestion?.id || null;
       setResult("correct");
       setAnswer("");
-      // Mémorise quand la bonne réponse a été donnée (robuste aux Back)
+
+      // Horodatage de la 1re bonne réponse (robuste aux Back)
       if (currentQuestion?.id && Number.isFinite(elapsedSec)) {
         const qid = currentQuestion.id;
         if (answeredAtRef.current[qid] == null) {
@@ -1204,6 +1270,16 @@ export default function Player() {
         }
       }
 
+      const qid = currentQuestion?.id;
+      if (qid) {
+        // Marque “réponse après Back” si applicable
+        if (
+          backInfoRef.current.lastBackQid === qid &&
+          backInfoRef.current.hadCorrectBeforeBack === false
+        ) {
+          answeredAfterBackRef.current[qid] = true;
+        }
+      }
     } else {
       setResult("wrong");
       setAnswer("");
@@ -1244,7 +1320,7 @@ export default function Player() {
     checkAnswer();
   };
 
-  // === Instant win (prédiction rang/points dès qu'une réponse devient correcte) ===
+  // === Instant win (prédiction rang/points dès qu'une réponse correcte survient) ===
   useEffect(() => {
     const qid = currentQuestionId;
     if (!qid) return;
@@ -1264,7 +1340,8 @@ export default function Player() {
         if (cancelled) return;
         setInstantWin({ qid, rank: predictedRank, points: predictedPoints, at: Date.now() });
         lastInstantWinQidRef.current = qid;
-        // Mémorise aussi l’instant de la 1ʳᵉ bonne réponse (utile pour savoir si c’était AVANT un Back)
+
+        // Mémorise aussi l’instant de la 1re bonne réponse (utile pour les Back)
         if (Number.isFinite(elapsedSec) && answeredAtRef.current[qid] == null) {
           answeredAtRef.current[qid] = elapsedSec;
         }
@@ -1276,7 +1353,7 @@ export default function Player() {
     return () => { cancelled = true; };
   }, [currentQuestionId, result, isQuestionPhase, playerId, elapsedSec]);
 
-  // ==== Classement (TOP-LEVEL; jamais dans un if / fonction) ====
+  // ==== Classement (TOP-LEVEL; pas dans une condition) ====
   const ranking = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
@@ -1289,7 +1366,7 @@ export default function Player() {
       if (a.score !== b.score) return b.score - a.score; // score desc
       return a._nameKey.localeCompare(b._nameKey);
     });
-    // RANGS AVEC ÉGALITÉS
+    // Rangs avec égalités
     let lastScore = null;
     let lastRank = 0;
     rows.forEach((p, i) => {
@@ -1431,6 +1508,7 @@ export default function Player() {
     }
   }
 
+  // Style “no transition” pendant le masque UI
   useEffect(() => {
     if (!uiMasked) return;
     const tag = document.createElement("style");
@@ -1440,6 +1518,11 @@ export default function Player() {
     return () => { tag.remove(); };
   }, [uiMasked]);
 
+  // ============================================================================
+// /pages/player.js — Partie 4/6
+// Scope : Début du rendu — flags d’UI, Splash, inscription, écran “kické”,
+//         attente pré-start. Le “main screen” arrive dans la partie 5/6.
+// ============================================================================
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
@@ -1539,10 +1622,10 @@ export default function Player() {
                 background: busy ? "#64748b" : "#3b82f6",
                 color: "white",
                 fontWeight: 700,
-                cursor: isSubmitDisabled ? "not-allowed" : "pointer", // 👈 curseur interdit quand désactivé
-                touchAction: "manipulation", // NEW: supprime le délai tactile mobile
-                WebkitTapHighlightColor: "transparent", // NEW: enlève le flash gris iOS/Android
-                userSelect: "none", // NEW: évite la sélection de texte au tap prolongé
+                cursor: isSubmitDisabled ? "not-allowed" : "pointer",
+                touchAction: "manipulation",
+                WebkitTapHighlightColor: "transparent",
+                userSelect: "none",
               }}
               title={
                 isRejectedInput || isSameAsRejectedCurrent
@@ -1651,6 +1734,14 @@ export default function Player() {
     );
   }
 
+// ============================================================================
+// /pages/player.js — Partie 5/6
+// Scope : Écran principal pendant le quiz — overlay anti-flicker, timer,
+//         badge nom, fin de quiz / fin de manche / pause, phases (question /
+//         reveal / décompte), barre de temps, image, score, saisie + anti-spam,
+//         bannière de bonne réponse, styles d’animations.
+// ============================================================================
+
   // 4) Écran principal pendant le quiz
   return (
     <div
@@ -1677,6 +1768,7 @@ export default function Player() {
           zIndex: 50,
         }}
       />
+
       {/* Timer discret en haut-droite */}
       <div
         style={{
@@ -1719,6 +1811,8 @@ export default function Player() {
           {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
         </div>
       )}
+
+      {/* ====================== Branches principales d’affichage ====================== */}
 
       {/* Fin du quiz : message perso + classement */}
       {isQuizEnded ? (
@@ -1770,8 +1864,6 @@ export default function Player() {
               <span>Tu es {Number(myScore) > 0 ? (myRank === 1 ? "1er" : `${myRank}ᵉ`) : "dernier"} dans le classement</span>
             </div>
           )}
-
-
         </div>
       ) : inRoundBoundaryWindow ? (
         // Fenêtre morte juste avant la frontière
@@ -1788,20 +1880,20 @@ export default function Player() {
           <div style={{ opacity: 0.75, marginTop: 8, fontSize: 14 }}>
             Le quiz est momentanément en pause.
           </div>
-          {/* INFO (pause) : déjà répondu à la question active */}
-          {currentQuestion && (instantWin?.qid === currentQuestion.id || result === "correct") && (
+
+          {/* Info (pause) : même logique que la bannière question */}
+          {currentQuestion && (hadCorrectEver || showGoodNow) && (
             <div style={{ marginTop: 10, fontSize: 14, opacity: 0.9 }}>
-              Tu as déjà bien répondu
-              {instantWin?.qid === currentQuestion.id && Number.isFinite(instantWin.points)
-                ? <> (+{instantWin.points} pts)</>
-                : null}
-              .
+              {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
+              {Number.isFinite(gainedPoints) ? <> (+{gainedPoints} pts)</> : null}
             </div>
           )}
         </div>
       ) : currentQuestion ? (
         <>
-          {/* question / révélation / décompte */}
+          {/* ======================== Phases de la question ======================== */}
+
+          {/* Intro de manche */}
           {isRoundIntroPhase ? (
             <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
@@ -1812,8 +1904,10 @@ export default function Player() {
               </div>
             </div>
           ) : isQuestionPhase ? (
+            // Phase question
             <h2 style={{ fontSize: "1.5rem" }}>{currentQuestion.text}</h2>
           ) : isRevealAnswerPhase ? (
+            // Révélation de la réponse
             <div style={{ marginTop: 8, marginBottom: 4 }}>
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
                 {revealPhrase}
@@ -1829,9 +1923,9 @@ export default function Player() {
               >
                 {primaryAnswer}
               </h2>
-
             </div>
           ) : isCountdownPhase ? (
+            // Décompte avant prochaine échéance
             <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
                 {countdownLabel}
@@ -1853,10 +1947,9 @@ export default function Player() {
             >
               {currentQuestion.text}
             </h2>
-
           )}
 
-          {/* Barre de temps */}
+          {/* -------------------------- Barre de temps -------------------------- */}
           {canShowTimeBar && (
             <div
               style={{
@@ -1867,8 +1960,7 @@ export default function Player() {
                 borderRadius: 9999,
                 overflow: "hidden",
                 position: "relative",
-                // 👇 cache la barre tant que le masque est actif
-                visibility: uiMasked ? "hidden" : "visible",
+                visibility: uiMasked ? "hidden" : "visible", // cache tant que masque actif
               }}
             >
               <div
@@ -1892,7 +1984,7 @@ export default function Player() {
             </div>
           )}
 
-          {/* Image pendant la révélation (anti-flicker) */}
+          {/* ----------------------- Image pendant le reveal ----------------------- */}
           {isRevealAnswerPhase && !isRoundBreak && preloadedImage ? (
             <div
               style={{
@@ -1916,7 +2008,6 @@ export default function Player() {
                   height: "100%",
                   objectFit: "contain",
                   imageRendering: "auto",
-                  // 👇 on n'affiche que quand l'image est prête
                   visibility: preloadedImage ? "visible" : "hidden",
                 }}
                 loading="eager"
@@ -1925,15 +2016,14 @@ export default function Player() {
             </div>
           ) : null}
 
-
-          {/* Score pendant le REVEAL uniquement (visible pour tous les joueurs) */}
+          {/* Score (révélé pour tous pendant le reveal) */}
           {isRevealAnswerPhase && (
             <div style={{ marginTop: 8, fontWeight: 700 }}>
               Ton score actuel est de : <b>{myScore}</b>
             </div>
           )}
 
-          {/* Saisie / anti-spam */}
+          {/* -------------------- Saisie + anti-spam / cooldown -------------------- */}
           <form onSubmit={handleAnswerSubmit}>
             {showInput ? (
               <input
@@ -1950,9 +2040,8 @@ export default function Player() {
                   padding: "clamp(10px, 2.8vw, 12px)",
                   marginTop: "16px",
                   fontSize: "clamp(14px, 3.9vw, 16px)",
-                  visibility: uiMasked ? "hidden" : "visible",
+                  visibility: uiMasked ? "hidden" : "visible", // pas d’autofocus tant que masque actif
                 }}
-                // 👇 pas d'autofocus tant que le masque est actif
                 autoFocus={!uiMasked}
                 inputMode="text"
                 autoComplete="off"
@@ -1973,9 +2062,8 @@ export default function Player() {
             ) : null}
           </form>
 
-
-          {/* Réponse : bannière persistante pendant la phase question */}
-          {isQuestionPhase && hasAnsweredThisQuestion && (
+          {/* Bannière “bonne réponse” persistante pendant la phase question */}
+          {isQuestionPhase && (hadCorrectEver || showGoodNow) && (
             <div
               style={{
                 marginTop: 8,
@@ -1986,32 +2074,32 @@ export default function Player() {
                 fontWeight: 700,
               }}
             >
-              {(backInfoRef.current.lastBackQid === currentQuestionId &&
-                backInfoRef.current.hadCorrectBeforeBack === true)
-                ? "Tu as déjà bien répondu à cette question"
-                : "Bonne réponse !"}
-
+              {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
               {Number.isFinite(gainedPoints) ? ` +${gainedPoints} pts` : ""}{" "}
               {instantWin?.rank ? medalForRank(instantWin.rank) : ""}
             </div>
           )}
         </>
       ) : (
+        // ============================== Fallbacks ==============================
         <>
           {!isRunning && <p>En attente du démarrage…</p>}
+
           {isRunning && earliestTimeSec != null && elapsedSec < earliestTimeSec && (
             <p>En attente de la première question (à {formatHMS(earliestTimeSec)})…</p>
           )}
+
           {isRunning && earliestTimeSec == null && (
             <p>Aucune question planifiée (ajoute des timecodes dans l’admin).</p>
           )}
+
           {isRunning && earliestTimeSec != null && elapsedSec >= earliestTimeSec && !currentQuestion && (
             <p>Patiente… (synchronisation)</p>
           )}
         </>
       )}
 
-      {/* Animations wrong-answer */}
+      {/* ============================== Styles locaux ============================== */}
       <style jsx>{`
         .answerInput.shake { animation: shake 250ms ease-in-out; }
         @keyframes shake {
