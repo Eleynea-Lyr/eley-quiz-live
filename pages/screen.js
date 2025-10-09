@@ -52,7 +52,7 @@ const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
 // ====== JOIN (PUBLIC OK) ======
 const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
-const JOIN_QR_SRC = "/qr-code-public-OK.png"; // fichier placé dans /public
+const JOIN_QR_SRC = "/qr-code-public-OK.png";
 
 // Barre de temps
 const BAR_H = 6;
