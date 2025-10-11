@@ -198,6 +198,73 @@ async function ensureAwardsForQuestionTx(qid) {
   });
 }
 
+// [1.7] Toggle Pause / Reprendre — même logique que Back/Next/Start, reprise exacte
+async function togglePauseResume(db) {
+  const stateRef = doc(db, "quiz", "state");
+  const snap = await getDoc(stateRef);
+  const d = snap.data() || {};
+
+  // Reconstruit startMs depuis l’ancrage si présent ; fallback legacy
+  let startMs = null;
+  if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
+    const anchorMs = d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+    const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
+    startMs = anchorMs - offsetSec * 1000;
+  } else if (d.startAt && typeof d.startAt.seconds === "number") {
+    startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
+  } else if (typeof d.startEpochMs === "number") {
+    startMs = d.startEpochMs;
+  }
+
+  // Gardes : ne pas permettre Pause/Reprendre avant le départ ou après la fin
+  const running = !!d.isRunning;
+  const hasStart = Number.isFinite(startMs) && startMs > 0;
+  const endOffset = Number.isFinite(d.endOffsetSec) ? d.endOffsetSec : null;
+  const nowMs = Date.now();
+  const elapsedIfRunning = hasStart ? Math.floor((nowMs - startMs) / 1000) : 0;
+  const isEnded = Number.isFinite(endOffset) ? elapsedIfRunning >= endOffset : false;
+
+  if (!running || !hasStart || isEnded) {
+    // no-op : on ignore le click en dehors des phases valides
+    return;
+  }
+
+  // Toggle
+  if (d.isPaused) {
+    // Reprendre — repartir exactement là où on s'était arrêté
+    if (!d.pauseAt || typeof d.pauseAt.seconds !== "number" || !hasStart) {
+      await updateDoc(stateRef, {
+        isPaused: false,
+        // reset de la sentinelle de fin de manche, sinon l'écran reste en "Fin de la manche"
+        lastAutoPausedRoundIndex: null,
+        navSeq: (Number(d.navSeq) || 0) + 1,
+      });
+      return;
+    }
+
+    const pauseAtMs = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || d.pauseAt.nanos || 0) / 1e6);
+    const lastElapsedSec = Math.max(0, Math.floor((pauseAtMs - startMs) / 1000));
+
+    await updateDoc(stateRef, {
+      isPaused: false,
+      // re-ancre proprement pour repartir EXACTEMENT au même elapsed
+      anchorAt: serverTimestamp(),
+      anchorOffsetSec: lastElapsedSec,
+      // très important : on nettoie la sentinelle de fin de manche
+      lastAutoPausedRoundIndex: null,
+      navSeq: (Number(d.navSeq) || 0) + 1,
+    });
+  } else {
+    // Mettre en pause — snapshot de l'instant courant (pause MANUELLE)
+    await updateDoc(stateRef, {
+      isPaused: true,
+      pauseAt: serverTimestamp(),
+      lastAutoPausedRoundIndex: null, // 👈 ne pas afficher "Fin de la manche"
+      navSeq: (Number(d.navSeq) || 0) + 1,
+    });
+  }
+}
+
 // ============================================================================
 // /pages/admin.js — Partie 2/6
 // Scope : Début du composant Admin — états, helpers internes, effets 1→3
@@ -465,12 +532,12 @@ export default function Admin() {
     return () => unsub();
   }, []);
 
-// ============================================================================
-// /pages/admin.js — Partie 3/6
-// Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
-//         Watcher d’attribution automatique
-// Règles : aucune modification fonctionnelle ; uniquement cosmétique.
-// ============================================================================
+  // ============================================================================
+  // /pages/admin.js — Partie 3/6
+  // Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
+  //         Watcher d’attribution automatique
+  // Règles : aucune modification fonctionnelle ; uniquement cosmétique.
+  // ============================================================================
 
   // [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
   useEffect(() => {
@@ -675,12 +742,14 @@ export default function Admin() {
       const idx = lastAutoPausedRoundIndex + 1;
       return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
     }
+    // ⚠️ strict ">" : on veut la VRAIE manche suivante, pas la manche courante
     for (let i = 0; i < roundOffsetsSec.length; i++) {
       const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && t >= elapsedSec) return i;
+      if (Number.isFinite(t) && t > elapsedSec) return i;
     }
     return null;
   }, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
+
 
   const roundBoundarySec = useMemo(() => {
     if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
@@ -797,10 +866,10 @@ export default function Admin() {
   }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase, elapsedSec, isPaused]);
 
   // ============================================================================
-// /pages/admin.js — Partie 4/6
-// Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // /pages/admin.js — Partie 4/6
+  // Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
   // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic
   async function recalcAllTimecodesFromOrder() {
@@ -1060,11 +1129,11 @@ export default function Admin() {
   };
 
   // ============================================================================
-// /pages/admin.js — Partie 5/6
-// Scope : Actions — Live (start/pause/seek/back/next/round) +
-//         Joueurs (reject/kick/alias) + purge/reset complet
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // /pages/admin.js — Partie 5/6
+  // Scope : Actions — Live (start/pause/seek/back/next/round) +
+  //         Joueurs (reject/kick/alias) + purge/reset complet
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
   /* ------------------------------- Actions: Live ------------------------------- */
 
@@ -1152,38 +1221,30 @@ export default function Admin() {
     try {
       const elapsed = Math.max(0, Math.floor(elapsedSec));
 
-      let prevIdx = -1;
-      for (let i = 0; i < roundOffsetsSec.length; i++) {
-        const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
-      }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
-      const boundary =
-        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-
-      const payload = {
-        isRunning: true,
-        isPaused: false,
-        startAt: serverTimestamp(),   // ✅ serveur
-        pauseAt: null,
-        // Ancrage serveur au moment de la reprise
-        anchorAt: serverTimestamp(),
-        anchorOffsetSec: elapsed,     // on reprend à « elapsed » de la timeline
-        startEpochMs: null,
-        navSeq: increment(1),           // 👈 NEW
-        hbBoost: true,
-      };
-      if (typeof boundary === "number" && elapsedSec >= boundary) {
-        payload.lastAutoPausedRoundIndex = prevIdx;
-      }
-      await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
+      // Reprise simple : on repart EXACTEMENT à elapsed,
+      // et on nettoie la sentinelle (sinon "Fin de la manche X" persiste)
+      await setDoc(
+        doc(db, "quiz", "state"),
+        {
+          isRunning: true,
+          isPaused: false,
+          startAt: serverTimestamp(),
+          pauseAt: null,
+          anchorAt: serverTimestamp(),
+          anchorOffsetSec: elapsed,
+          startEpochMs: null,
+          navSeq: increment(1),
+          hbBoost: true,
+          lastAutoPausedRoundIndex: null, // 👈 important : purge
+        },
+        { merge: true }
+      );
     } catch (err) {
       console.error("resumeFromPause error:", err);
       alert("Échec de la reprise : " + (err?.message || err));
     }
   };
+
 
   const jumpToRoundStartAndPlay = async (roundStartSec) => {
     try {
@@ -1625,11 +1686,11 @@ export default function Admin() {
   }
 
   // ============================================================================
-// /pages/admin.js — Partie 6/6
-// Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
-//         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // /pages/admin.js — Partie 6/6
+  // Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
+  //         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
   /* ================= UI DÉRIVÉES & RENDU (PARTIE 4/4) ================= */
 
@@ -1670,8 +1731,19 @@ export default function Admin() {
       ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
 
-  const canClickPause = isRunning && !isPaused && !isQuizEnded;
-  const pauseCursor = canClickPause ? "pointer" : "not-allowed";
+  // --- Pause/Reprendre (même visuel qu'avant, juste le label qui bascule) ---
+  const canPauseResume = isRunning && !!quizStartMs && !isQuizEnded; // pas avant départ, ni après fin
+  const pauseBtnLabel = isPaused ? "Reprendre" : "Pause";
+  const pauseCursor = canPauseResume ? "pointer" : "not-allowed";
+  const pauseBtnTitle = canPauseResume
+    ? (isPaused ? "Reprendre le quiz" : "Mettre en pause le quiz")
+    : "Indisponible avant le départ ou après la fin";
+  // Largeur fixe + couleur pastel différente quand on est en "Reprendre"
+  const PAUSE_BTN_WIDTH = 120; // px, dimensionnée pour "Reprendre"
+  const pauseBtnBg = isPaused ? "#dfd6ff" : "#FECACA"; // Reprendre = pêche pastel, Pause = saumon pastel d'origine
+
+
+
 
   // ===== Rangs (égalité) pour l'affichage des médailles et du rang (sans toucher l'ordre du tableau)
   const rankingForAdmin = useMemo(() => {
@@ -1912,21 +1984,29 @@ export default function Admin() {
         </button>
 
         <button
-          onClick={canClickPause ? pauseQuiz : (e) => e.preventDefault()}
-          aria-disabled={canClickPause ? "false" : "true"}
+          onClick={() => (canPauseResume ? togglePauseResume(db) : null)}
+          disabled={!canPauseResume}
+          aria-disabled={!canPauseResume ? "true" : "false"}
           style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: PAUSE_BTN_WIDTH,          // largeur fixe pour "Reprendre"
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#fecaca",
+            background: pauseBtnBg,          // couleur pastel différente en "Reprendre"
             color: "#000",
             fontWeight: 600,
             cursor: pauseCursor,
+            opacity: !canPauseResume ? 0.6 : 1,
+            whiteSpace: "nowrap",
+            textAlign: "center",
             transition: "background 160ms ease",
           }}
-          title={canClickPause ? "Mettre en pause le quiz" : "Pause indisponible"}
+          title={pauseBtnTitle}
         >
-          Pause
+          {pauseBtnLabel}
         </button>
 
         <button
@@ -2431,4 +2511,4 @@ export default function Admin() {
       </div>
     </div>
   );
-}
+} 

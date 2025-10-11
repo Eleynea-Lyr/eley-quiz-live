@@ -171,6 +171,11 @@ const HANDLE_COLOR = "#f8fafc";
 // Image
 const PLAYER_IMG_MAX = 220; // px
 
+// Espace haut (safe-area iOS + marge supérieure uniforme)
+const SAFE_TOP = "env(safe-area-inset-top, 0px)";
+const TOP_GUTTER_RUNNING = "clamp(40px, 8vh, 72px)"; // quand le quiz tourne
+const TOP_GUTTER_IDLE    = "clamp(28px, 6vh, 56px)"; // états hors “running”
+
 /* ================================ HELPERS =============================== */
 function normalize(str) {
   return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
@@ -449,7 +454,7 @@ export default function Player() {
         localStorage.getItem("playerID") ||
         localStorage.getItem("player_id") ||
         null;
-    } catch {}
+    } catch { }
   }, []);
 
   // Instant win (affichage immédiat + anti double-appel)
@@ -539,7 +544,7 @@ export default function Player() {
         const arr = JSON.parse(raw);
         if (Array.isArray(arr)) setRejectedNames(arr);
       }
-    } catch {}
+    } catch { }
     setHydrated(true);
   }, []);
 
@@ -848,14 +853,14 @@ export default function Player() {
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
 
   // ============================================================================
-// /pages/player.js — Partie 3/6
-// Scope : Dérivés & calculs d’écran (phases, bornes de manche/question),
-//         préchargement images, anti-spam dérivés, focus, watcher Back,
-//         handlers de réponse, “instant win”, ranking & helpers nom.
-// ============================================================================
+  // /pages/player.js — Partie 3/6
+  // Scope : Dérivés & calculs d’écran (phases, bornes de manche/question),
+  //         préchargement images, anti-spam dérivés, focus, watcher Back,
+  //         handlers de réponse, “instant win”, ranking & helpers nom.
+  // ============================================================================
 
-/* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
-/* ===================== Dérivés & calculs d'écran ===================== */
+  /* ===================== DÉRIVÉS & HANDLERS (PARTIE 3/4) ===================== */
+  /* ===================== Dérivés & calculs d'écran ===================== */
 
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
 
@@ -983,7 +988,23 @@ export default function Player() {
 
   // Fin de manche (pause posée par Admin à la frontière)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
-  const isRoundBreak = Boolean(isPaused && endedRoundIndex != null);
+
+  // On considère "pause de manche" seulement si on est réellement très proche
+  // de la frontière correspondante (±2s). Sinon, c’est une pause manuelle.
+  let isRoundBreak = false;
+  if (isPaused && endedRoundIndex != null) {
+    const boundarySec =
+      (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex + 1]))
+        ? roundOffsetsSec[endedRoundIndex + 1]
+        : (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex]))
+          ? roundOffsetsSec[endedRoundIndex]
+          : null;
+
+    const atBoundary =
+      Number.isFinite(boundarySec) && Math.abs(elapsedSec - boundarySec) <= 2;
+
+    isRoundBreak = atBoundary;
+  }
 
   // --- Phases
   const nextEvent = effectiveNextTimeSec;
@@ -1134,8 +1155,8 @@ export default function Player() {
           im.loading = "eager";
           im.decoding = "async";
           im.src = url;
-          if (im.decode) im.decode().catch(() => {});
-        } catch {}
+          if (im.decode) im.decode().catch(() => { });
+        } catch { }
       });
     };
 
@@ -1247,7 +1268,7 @@ export default function Player() {
     return () => clearInterval(id);
   }, [cooldownUntilMs]);
 
-/* ============================ Vérification & Handlers ============================ */
+  /* ============================ Vérification & Handlers ============================ */
 
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
@@ -1519,12 +1540,23 @@ export default function Player() {
   }, [uiMasked]);
 
   // ============================================================================
-// /pages/player.js — Partie 4/6
-// Scope : Début du rendu — flags d’UI, Splash, inscription, écran “kické”,
-//         attente pré-start. Le “main screen” arrive dans la partie 5/6.
-// ============================================================================
+  // /pages/player.js — Partie 4/6
+  // Scope : Début du rendu — flags d’UI, Splash, inscription, écran “kické”,
+  //         attente pré-start. Le “main screen” arrive dans la partie 5/6.
+  // ============================================================================
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
+
+  // Style compact pour la question (évite le chevauchement en haut)
+  const questionH2Style = {
+    fontSize: "clamp(1.1rem, 4.2vw, 1.45rem)",
+    lineHeight: 1.25,
+    margin: 0,
+    marginTop: 6,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+    hyphens: "auto",
+  };
 
   // Flags d’état pour le bouton d’inscription
   const normInput = normalizeName(inputName);
@@ -1734,13 +1766,13 @@ export default function Player() {
     );
   }
 
-// ============================================================================
-// /pages/player.js — Partie 5/6
-// Scope : Écran principal pendant le quiz — overlay anti-flicker, timer,
-//         badge nom, fin de quiz / fin de manche / pause, phases (question /
-//         reveal / décompte), barre de temps, image, score, saisie + anti-spam,
-//         bannière de bonne réponse, styles d’animations.
-// ============================================================================
+  // ============================================================================
+  // /pages/player.js — Partie 5/6
+  // Scope : Écran principal pendant le quiz — overlay anti-flicker, timer,
+  //         badge nom, fin de quiz / fin de manche / pause, phases (question /
+  //         reveal / décompte), barre de temps, image, score, saisie + anti-spam,
+  //         bannière de bonne réponse, styles d’animations.
+  // ============================================================================
 
   // 4) Écran principal pendant le quiz
   return (
@@ -1749,6 +1781,9 @@ export default function Player() {
         background: "#0a0a1a",
         color: "white",
         padding: "20px",
+        paddingTop: isRunning
+          ? `calc(${TOP_GUTTER_RUNNING} + ${SAFE_TOP})`
+          : `calc(${TOP_GUTTER_IDLE} + ${SAFE_TOP})`,
         minHeight: "calc(var(--vh, 1vh) * 100)",
         textAlign: "center",
         position: "relative",
@@ -1773,7 +1808,7 @@ export default function Player() {
       <div
         style={{
           position: "absolute",
-          top: 12,
+          top: `calc(12px + ${SAFE_TOP})`,
           right: 12,
           background: "#111",
           padding: "6px 10px",
@@ -1791,7 +1826,7 @@ export default function Player() {
         <div
           style={{
             position: "fixed",
-            top: 10,
+            top: `calc(10px + ${SAFE_TOP})`,
             left: 10,
             zIndex: 20,
             background: "#0b1e3d",
@@ -1905,7 +1940,7 @@ export default function Player() {
             </div>
           ) : isQuestionPhase ? (
             // Phase question
-            <h2 style={{ fontSize: "1.5rem" }}>{currentQuestion.text}</h2>
+            <h2 style={questionH2Style}>{currentQuestion.text}</h2>
           ) : isRevealAnswerPhase ? (
             // Révélation de la réponse
             <div style={{ marginTop: 8, marginBottom: 4 }}>
@@ -1936,15 +1971,7 @@ export default function Player() {
             </div>
           ) : (
             // Fallback conservateur
-            <h2
-              style={{
-                fontSize: "clamp(1.1rem, 4.5vw, 1.5rem)",
-                overflowWrap: "anywhere",
-                wordBreak: "break-word",
-                hyphens: "auto",
-                margin: 0,
-              }}
-            >
+            <h2 style={questionH2Style}>
               {currentQuestion.text}
             </h2>
           )}

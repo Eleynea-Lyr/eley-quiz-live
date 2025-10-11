@@ -47,12 +47,12 @@ const COUNTDOWN_START_SEC = 5;
 const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
 
 // ====== JOIN (DEV) ======
-//const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-//const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
+const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
 
 // ====== JOIN (PUBLIC OK) ======
-const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
-const JOIN_QR_SRC = "/qr-code-public-OK.png";
+//const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
+//const JOIN_QR_SRC = "/qr-code-public-OK.png";
 
 // Barre de temps
 const BAR_H = 6;
@@ -507,10 +507,10 @@ export default function Screen() {
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
   // ============================================================================
-// /pages/screen.js — Partie 3.5/5
-// Scope : leaderboard/podium (tri + égalités), dérivés & phases d’écran,
-// déclenchement d’attribution des points pendant la révélation.
-// ============================================================================
+  // /pages/screen.js — Partie 3.5/5
+  // Scope : leaderboard/podium (tri + égalités), dérivés & phases d’écran,
+  // déclenchement d’attribution des points pendant la révélation.
+  // ============================================================================
 
   /* ----------------------- Leaderboard (tri & top N) ----------------------- */
   const leaderboard = useMemo(() => {
@@ -684,8 +684,8 @@ export default function Screen() {
     elapsedSec >= introStart &&
     introEnd != null &&
     elapsedSec < introEnd
-      ? Math.max(1, Math.ceil(introEnd - elapsedSec))
-      : null;
+    ? Math.max(1, Math.ceil(introEnd - elapsedSec))
+    : null;
 
   // Numéro de manche (UI)
   const roundIdxForCurrentQuestion = Number.isFinite(qStart)
@@ -696,7 +696,23 @@ export default function Screen() {
   // Pause de manche / fin de quiz
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
-  const isRoundBreak = Boolean(isPaused && endedRoundIndex != null && !isQuizEnded);
+
+  // "Pause de manche" uniquement si on est réellement collé à la frontière (±2s).
+  let isRoundBreak = false;
+  if (isPaused && endedRoundIndex != null && !isQuizEnded) {
+    const boundarySec =
+      (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex + 1]))
+        ? roundOffsetsSec[endedRoundIndex + 1]
+        : (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex]))
+          ? roundOffsetsSec[endedRoundIndex]
+          : null;
+
+    const atBoundary =
+      Number.isFinite(boundarySec) && Math.abs(elapsedSec - boundarySec) <= 2;
+
+    isRoundBreak = atBoundary;
+  }
+
 
   // Phases bornées (anti-flash)
   const nextEvent = effectiveNextTimeSec;
@@ -837,12 +853,23 @@ export default function Screen() {
     return () => { tag.remove(); };
   }, [uiMasked]);
 
+  // Largeur bornée + retours à la ligne + descente légère
+  const screenQuestionStyle = {
+    maxWidth: "min(760px, calc(100vw - 380px))", // 320px aside + ~60px marges (20+20 + air)
+    margin: "0 auto",
+    marginTop: 6,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
+    hyphens: "auto",
+    lineHeight: 1.22,
+  };
+
   // ============================================================================
-// /pages/screen.js — Partie 4/5
-// Scope : RENDER — écrans pré-start / quiz (question, reveal, countdown),
-// pauses & fins de manche/quiz, colonne classement et panneaux “Rejoindre”.
-// (⚠️ Ne PAS fermer la fonction ici — l’accolade finale arrive en partie 5.)
-// ============================================================================
+  // /pages/screen.js — Partie 4/5
+  // Scope : RENDER — écrans pré-start / quiz (question, reveal, countdown),
+  // pauses & fins de manche/quiz, colonne classement et panneaux “Rejoindre”.
+  // (⚠️ Ne PAS fermer la fonction ici — l’accolade finale arrive en partie 5.)
+  // ============================================================================
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
@@ -920,7 +947,18 @@ export default function Screen() {
       </div>
 
       {/* Zone question (gauche) */}
-      <div style={{ flex: 2, padding: "40px", display: "flex", flexDirection: "column", alignItems: "center", gap: 12, textAlign: "center" }}>
+      <div
+        style={{
+          flex: 2,
+          padding: "40px",
+          paddingRight: 360, // évite de passer sous l’aside (320 + marge)
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 12,
+          textAlign: "center",
+        }}
+      >
         {isQuizEnded ? (
           <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
             <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Voici le podium :</h1>
@@ -1069,7 +1107,9 @@ export default function Screen() {
                 </div>
               </div>
             ) : isQuestionPhase ? (
-              <h1 style={{ fontSize: "2rem", margin: 0 }}>{currentQuestion.text}</h1>
+              <h1 style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}>
+                {currentQuestion.text}
+              </h1>
             ) : isRevealAnswerPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
                 <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 8 }}>
@@ -1087,7 +1127,9 @@ export default function Screen() {
                 </div>
               </div>
             ) : (
-              <h1 style={{ fontSize: "2rem", margin: 0 }}>{currentQuestion.text}</h1>
+              <h1 style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}>
+                {currentQuestion.text}
+              </h1>
             )}
 
             {/* Barre de temps sous la question */}
