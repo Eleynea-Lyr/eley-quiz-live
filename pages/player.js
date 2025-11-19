@@ -208,6 +208,17 @@ function normalizeBasic(s) {
 function isNumericString(s) {
   return /^[0-9]+$/.test(String(s || ""));
 }
+// Détection iOS (inclut iPadOS "desktop-class" avec écran tactile)
+const IS_IOS = (() => {
+  try {
+    const ua = navigator.userAgent || "";
+    const isIOSDevice = /iPad|iPhone|iPod/.test(ua);
+    const isTouchMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+    return isIOSDevice || isTouchMac;
+  } catch {
+    return false;
+  }
+})();
 
 // Récupère le mode choisi côté Admin (fallback: "relaxed")
 function getAnswerMode(q) {
@@ -1401,24 +1412,26 @@ export default function Player() {
   };
 
   const handleAnswerSubmit = (e) => {
-  if (e && typeof e.preventDefault === "function") e.preventDefault();
-  if (isLocked) return;
-  const trimmed = (answer ?? "").trim();
-  if (!trimmed) return;
+    if (e && typeof e.preventDefault === "function") e.preventDefault();
+    if (isLocked) return;
+    const trimmed = (answer ?? "").trim();
+    if (!trimmed) return;
 
-  checkAnswer();
+    checkAnswer();
 
-  // iOS: garder le clavier ouvert & vider le champ de manière fiable
-  requestAnimationFrame(() => {
-    const el = answerInputRef.current;
-    if (el) {
-      // double clear (state + DOM) pour WKWebView
-      try { el.value = ""; } catch {}
-      el.focus();
-      try { el.setSelectionRange(0, 0); } catch {}
-    }
-  });
-};
+    // iOS: garder le clavier ouvert & vider le champ de manière fiable
+    requestAnimationFrame(() => {
+      const el = answerInputRef.current;
+      if (el) {
+        try { el.value = ""; } catch { }
+        // Ré-assigne le state si jamais un IME garde une valeur fantôme
+        if (answer !== "") setAnswer("");
+        el.focus();
+        try { el.setSelectionRange(0, 0); } catch { }
+      }
+    });
+  };
+
 
 
   // === Instant win (prédiction rang/points dès qu'une réponse correcte survient) ===
@@ -2157,13 +2170,29 @@ export default function Player() {
                 spellCheck={false}
                 enterKeyHint="send"
                 onKeyDown={(e) => {
-                  // iOS: Enter ne déclenche pas toujours onSubmit; on force ici.
+                  // iOS: Enter/Done peut ne pas déclencher onSubmit; on force ici.
                   if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                     e.preventDefault();
                     handleAnswerSubmit(e);
                   }
                 }}
+                onBlur={() => {
+                  // iOS: le bouton "OK/Done" ferme le clavier (blur).
+                  // -> On submit si une réponse est présente, sinon on refocus pour laisser le clavier ouvert.
+                  if (IS_IOS && isQuestionPhase && !isLocked) {
+                    const hasValue = (answer ?? "").trim().length > 0;
+                    requestAnimationFrame(() => {
+                      if (hasValue) {
+                        handleAnswerSubmit();
+                      } else {
+                        const el = answerInputRef.current;
+                        if (el) el.focus();
+                      }
+                    });
+                  }
+                }}
               />
+
 
             ) : isLocked && isQuestionPhase ? (
               <p
@@ -2178,6 +2207,39 @@ export default function Player() {
               </p>
             ) : null}
           </form>
+
+          {/* Bouton "Valider" universel — seulement quand l'input est visible */}
+          {showInput && (
+            <div style={{ marginTop: 10 }}>
+              <button
+                type="button"
+                onClick={handleAnswerSubmit}
+                disabled={isLocked || !((answer ?? "").trim().length > 0)}
+                style={{
+                  width: "min(520px, 100%)",
+                  maxWidth: "92vw",
+                  boxSizing: "border-box",
+                  display: "inline-block",
+                  padding: "clamp(10px, 2.8vw, 12px) 12px",
+                  borderRadius: 10,
+                  border: "1px solid #2a2a2a",
+                  background: isLocked ? "#64748b" : "#3b82f6",
+                  color: "white",
+                  fontWeight: 700,
+                  cursor: isLocked ? "not-allowed" : "pointer",
+                  touchAction: "manipulation",
+                  WebkitTapHighlightColor: "transparent",
+                  userSelect: "none",
+                }}
+                aria-disabled={isLocked ? "true" : "false"}
+                title={isLocked ? "En cooldown anti-spam" : "Valider la réponse"}
+              >
+                Valider
+              </button>
+            </div>
+          )}
+
+
 
           {/* Bannière “bonne réponse” persistante pendant la phase question */}
           {isQuestionPhase && (hadCorrectEver || showGoodNow) && (
