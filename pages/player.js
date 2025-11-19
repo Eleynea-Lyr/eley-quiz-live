@@ -1349,6 +1349,26 @@ export default function Player() {
 
   /* ============================ Vérification & Handlers ============================ */
 
+  // --- iOS detection + anti-blur helpers (empêcher la fermeture du clavier)
+  const IS_IOS = typeof navigator !== "undefined" && (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+
+  // Empêche le transfert de focus de l'input vers le bouton (iOS ferme le clavier sinon)
+  const keepInputFocus = (e) => {
+    e.preventDefault();
+    const el = answerInputRef?.current;
+    if (el) {
+      // Re-focalise immédiatement (avant le submit) pour éviter le rangement du clavier
+      el.focus();
+      // Place le curseur en fin (cosmétique)
+      const v = el.value || "";
+      try { el.setSelectionRange(v.length, v.length); } catch { }
+    }
+  };
+
+
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
     const mode = getAnswerMode(currentQuestion);
@@ -2152,6 +2172,26 @@ export default function Player() {
                 type="text"
                 value={answer}
                 onChange={(e) => setAnswer(e.target.value)}
+                onBlur={(e) => {
+                  // iOS "OK" = blur ; on le transforme en submit doux et on garde le clavier ouvert
+                  if (!IS_IOS) return;
+                  const el = answerInputRef?.current;
+                  const txt = (answer ?? "").trim();
+                  // Si l'input est censé être visible (pas "déjà répondu") :
+                  if (showInput) {
+                    // Si du texte, on soumet comme Enter
+                    if (!isLocked && txt.length > 0) {
+                      handleAnswerSubmit();
+                    }
+                    // Dans tous les cas, on re-focalise immédiatement pour retenir le clavier
+                    requestAnimationFrame(() => {
+                      if (el) {
+                        el.focus();
+                        try { el.setSelectionRange(el.value.length, el.value.length); } catch { }
+                      }
+                    });
+                  }
+                }}
                 placeholder="Votre réponse"
                 style={{
                   width: "min(520px, 100%)",
@@ -2167,31 +2207,8 @@ export default function Player() {
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="none"
-                spellCheck={false}
-                enterKeyHint="send"
-                onKeyDown={(e) => {
-                  // iOS: Enter/Done peut ne pas déclencher onSubmit; on force ici.
-                  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-                    e.preventDefault();
-                    handleAnswerSubmit(e);
-                  }
-                }}
-                onBlur={() => {
-                  // iOS: le bouton "OK/Done" ferme le clavier (blur).
-                  // -> On submit si une réponse est présente, sinon on refocus pour laisser le clavier ouvert.
-                  if (IS_IOS && isQuestionPhase && !isLocked) {
-                    const hasValue = (answer ?? "").trim().length > 0;
-                    requestAnimationFrame(() => {
-                      if (hasValue) {
-                        handleAnswerSubmit();
-                      } else {
-                        const el = answerInputRef.current;
-                        if (el) el.focus();
-                      }
-                    });
-                  }
-                }}
               />
+
 
 
             ) : isLocked && isQuestionPhase ? (
@@ -2208,11 +2225,13 @@ export default function Player() {
             ) : null}
           </form>
 
-          {/* Bouton "Valider" universel — seulement quand l'input est visible */}
-          {showInput && (
+          {/* Bouton "Valider" — iOS uniquement et seulement quand l'input est visible */}
+          {IS_IOS && showInput && (
             <div style={{ marginTop: 10 }}>
               <button
                 type="button"
+                onMouseDown={keepInputFocus}
+                onTouchStart={keepInputFocus}
                 onClick={handleAnswerSubmit}
                 disabled={isLocked || !((answer ?? "").trim().length > 0)}
                 style={{
@@ -2238,6 +2257,7 @@ export default function Player() {
               </button>
             </div>
           )}
+
 
 
 
