@@ -7,9 +7,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
 import {
-  collection, doc, getDocs, getDoc, onSnapshot, orderBy, query,
+  collection, doc, getDocs, getDoc, onSnapshot, orderBy, query, limit,
   where, runTransaction, serverTimestamp, increment
 } from "firebase/firestore";
+
 
 // Fix viewport height on mobile browsers (100vh bug)
 const useMobileVH = () => {
@@ -60,12 +61,17 @@ const BAR_BLUE = "#3b82f6";
 const BAR_RED = "#ef4444";
 const HANDLE_COLOR = "#f8fafc";
 
+// Colonne gauche (largeur fixe et image générique)
+const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
+
+
 // Panneau "Rejoindre" (inline)
 function JoinPanelInline({ size = "md" }) {
   const imgSize = size === "lg" ? 320 : 160;
   const panelStyle = {
-    marginTop: 12,
-    width: size === "lg" ? 360 : 320,
+    marginTop: 0, // évite le décalage dans le cadre
+    width: size === "lg" ? "100%" : 320,
+    boxSizing: "border-box",
     padding: 12,
     borderRadius: 12,
     background: "rgba(15, 35, 74, 0.92)",
@@ -85,9 +91,13 @@ function JoinPanelInline({ size = "md" }) {
       <img
         src={JOIN_QR_SRC}
         alt=""
-        width={imgSize}
-        height={imgSize}
-        style={{ display: "block", marginTop: 10 }}
+        style={{
+          display: "block",
+          marginTop: 10,
+          width: "100%",
+          maxWidth: 320,
+          height: "auto",
+        }}
       />
     </div>
   );
@@ -110,6 +120,7 @@ function JoinPanelFixedBottom() {
     </div>
   );
 }
+
 
 const SCREEN_IMG_MAX = 300; // px (image de révélation, côté public)
 
@@ -309,6 +320,9 @@ export default function Screen() {
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
   const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
 
+  // Image optionnelle au-dessus du QR (config: screenLeftImageUrl)
+  const [leftImageUrl, setLeftImageUrl] = useState(null);
+
   // Leaderboard
   const [playersLB, setPlayersLB] = useState([]);
   const [leaderboardTopN, setLeaderboardTopN] = useState(DEFAULT_LEADERBOARD_TOP_N);
@@ -323,6 +337,35 @@ export default function Screen() {
 
   // Préchargement image pour éviter le flash au reveal
   const [preloadedImage, setPreloadedImage] = useState(null);
+
+  // Table de points (pour afficher +30/+25/+20)
+  const [scoringTable, setScoringTable] = useState(DEFAULT_SCORING_TABLE);
+
+  // Top 3 live pour la question courante (pendant la phase "question")
+  // Format: [{ playerId }]
+  const [liveFirsts, setLiveFirsts] = useState([]);
+
+  // Accès rapide aux noms des joueurs par id
+  const playersById = useMemo(() => {
+    const map = Object.create(null);
+    for (const p of playersLB) map[p.id] = p;
+    return map;
+  }, [playersLB]);
+
+  // Charger la table de scoring une fois
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const t = await getScoringTableScreen();
+        if (mounted && Array.isArray(t)) setScoringTable(t);
+      } catch {
+        // fallback déjà en place via DEFAULT_SCORING_TABLE
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
+
 
 
   /* --------------------------- Charger les questions --------------------------- */
@@ -373,7 +416,17 @@ export default function Screen() {
       );
       const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
       setRevealDurationSec(rv);
+
+      // Image optionnelle au-dessus du QR (fallback sur LEFT_GENERIC_IMG_SRC si absent)
+      setLeftImageUrl(
+        typeof d?.screenLeftImageUrl === "string" && d.screenLeftImageUrl.trim() !== ""
+          ? d.screenLeftImageUrl
+          : (LEFT_GENERIC_IMG_SRC || null)
+      );
+
+
       setConfigLoaded(true);
+
     });
     return () => unsub();
   }, []);
@@ -811,6 +864,54 @@ export default function Screen() {
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
 
+  // Abonnement live aux 3 premiers joueurs ayant trouvé (pendant la phase question)
+  useEffect(() => {
+    // Reset à chaque nouvelle question ou si on sort de la phase "question"
+    setLiveFirsts([]);
+    const qid = currentQuestionId;
+    if (!qid || !isQuestionPhase) return;
+
+    // Helper local pour normaliser un temps en ms (comme dans ensureAwardsForQuestionTx)
+    const toMs = (obj) => {
+      if (!obj) return Infinity;
+      if (typeof obj.toMillis === "function") return obj.toMillis();
+      if (typeof obj.seconds === "number") {
+        return obj.seconds * 1000 + Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6);
+      }
+      if (typeof obj === "number" && Number.isFinite(obj)) return Math.floor(obj);
+      return Infinity;
+    };
+
+    try {
+      const subsCol = collection(db, "answers", qid, "submissions");
+      // ⚠️ Pas de orderBy ici (certains docs n'ont pas firstCorrectAt) → on trie côté client
+      const q = query(subsCol, where("isCorrect", "==", true));
+      const unsub = onSnapshot(q, (snap) => {
+        const ranked = snap.docs
+          .map((d) => {
+            const data = d.data() || {};
+            const t = Math.min(
+              toMs(data.firstCorrectAt),
+              typeof data.firstCorrectAtMs === "number" ? data.firstCorrectAtMs : Infinity,
+              toMs(data.createdAt),
+              toMs(data.updatedAt)
+            );
+            return { playerId: d.id, t };
+          })
+          .filter((x) => Number.isFinite(x.t))
+          .sort((a, b) => a.t - b.t)
+          .slice(0, 3);
+
+        setLiveFirsts(ranked.map((x) => ({ playerId: x.playerId })));
+      });
+      return () => unsub();
+    } catch (e) {
+      console.error("[Screen] live podium subscription error:", e);
+    }
+  }, [currentQuestionId, isQuestionPhase]);
+
+
+
   // Infos attente
   const allTimes = sorted.map(getTimeSec).filter((t) => Number.isFinite(t));
   const earliestTimeSec = allTimes.length ? Math.min(...allTimes) : null;
@@ -843,6 +944,7 @@ export default function Screen() {
     return () => { cancelled = true; };
   }, [currentQuestionId]);
 
+
   // UI mask : neutralise les transitions CSS le temps du voile
   useEffect(() => {
     if (!uiMasked) return;
@@ -855,7 +957,7 @@ export default function Screen() {
 
   // Largeur bornée + retours à la ligne + descente légère
   const screenQuestionStyle = {
-    maxWidth: "min(760px, calc(100vw - 380px))", // 320px aside + ~60px marges (20+20 + air)
+    maxWidth: "min(760px, 92%)",
     margin: "0 auto",
     marginTop: 6,
     overflowWrap: "anywhere",
@@ -863,6 +965,7 @@ export default function Screen() {
     hyphens: "auto",
     lineHeight: 1.22,
   };
+
 
   // ============================================================================
   // /pages/screen.js — Partie 4/5
@@ -929,29 +1032,78 @@ export default function Screen() {
           zIndex: 50,
         }}
       />
-      {/* Horloge en haut à droite */}
-      <div
-        style={{
-          position: "absolute",
-          top: 12,
-          right: 12,
-          background: "#111",
-          padding: "6px 10px",
-          borderRadius: 8,
-          fontFamily: "monospace",
-          letterSpacing: 1,
-          border: "1px solid #2a2a2a",
-        }}
-      >
-        ⏱ {formatHMS(elapsedSec)}
-      </div>
 
-      {/* Zone question (gauche) */}
+      {/* Colonne gauche : image optionnelle + QR */}
+      <aside
+        aria-label="Infos & QR"
+        style={{
+          position: "relative",
+          width: 360,
+          maxWidth: "35vw",
+          background: "#081224",
+          border: "1px solid #1f2a44",
+          borderRadius: 12,
+          padding: 12,
+          margin: 12,
+          display: "flex",
+          flexDirection: "column",
+          gap: 10,
+          alignSelf: "flex-start",
+        }}
+
+      >
+        {/* Timecode overlay (haut-gauche) */}
+        <div
+          style={{
+            position: "absolute",
+            top: 10,
+            left: 10,
+            background: "rgba(17,17,17,0.9)",
+            padding: "6px 10px",
+            borderRadius: 8,
+            fontFamily: "monospace",
+            letterSpacing: 1,
+            border: "1px solid #2a2a2a",
+            zIndex: 2,
+          }}
+        >
+          ⏱ {formatHMS(elapsedSec)}
+        </div>
+
+        {leftImageUrl && (
+          <div
+            style={{
+              borderRadius: 10,
+              overflow: "hidden",
+              border: "1px solid #1f2a44",
+              background: "#0b0f1a",
+            }}
+          >
+            <img
+              src={leftImageUrl}
+              alt=""
+              style={{
+                display: "block",
+                width: "100%",
+                // min 320px, s’adapte à la hauteur de l’écran, max 500px
+                height: "clamp(320px, 38vh, 500px)",
+                objectFit: "cover",
+              }}
+              loading="lazy"
+              decoding="async"
+            />
+
+          </div>
+        )}
+        <div style={{ marginTop: "auto", paddingBottom: 0 }}>
+          <JoinPanelInline size="lg" />
+        </div>
+      </aside>
+
       <div
         style={{
-          flex: 2,
-          padding: "40px",
-          paddingRight: 360, // évite de passer sous l’aside (320 + marge)
+          flex: 1,
+          padding: "40px 24px",
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
@@ -1169,6 +1321,56 @@ export default function Screen() {
               </div>
             )}
 
+            {/* Podium live : s’affiche au fil de l’eau pendant la phase "question" */}
+            {isQuestionPhase && liveFirsts.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <div style={{ opacity: 0.85, fontSize: 14, marginBottom: 6 }}>
+                  Bravo à :
+                </div>
+                <div style={{ display: "grid", gap: 6, justifyContent: "center" }}>
+                  {liveFirsts.map((e, idx) => {
+                    const rank = idx + 1;
+                    const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : "🥉";
+                    const pts = scoringTable[idx] ?? 0;
+                    const name = (playersById[e.playerId]?.name || "(…)");
+                    const big = rank === 1;
+
+                    return (
+                      <div
+                        key={e.playerId}
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          alignItems: "baseline",
+                          justifyContent: "center",
+                          background: "#0b0f1a",
+                          border: "1px solid #1f2a44",
+                          borderRadius: 10,
+                          padding: "6px 10px",
+                        }}
+                      >
+                        <span style={{ fontSize: big ? 22 : 18 }}>{medal}</span>
+                        <b style={{ fontSize: big ? 20 : 16 }}>
+                          {name}
+                        </b>
+                        <span style={{ opacity: 0.85 }}>•</span>
+                        <span
+                          style={{
+                            fontVariantNumeric: "tabular-nums",
+                            fontWeight: 800,
+                          }}
+                        >
+                          +{pts} pts
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+
+
             {/* Image pendant la révélation */}
             {isRevealAnswerPhase && currentQuestion?.imageUrl ? (
               <div
@@ -1224,23 +1426,21 @@ export default function Screen() {
       <aside
         aria-label="Classement"
         style={{
-          position: "fixed",
-          top: 12,
-          right: 12,
-          bottom: 12,
           width: 320,
           maxWidth: "35vw",
           background: "#0b0f1a",
           border: "1px solid #1f2a44",
           borderRadius: 12,
-          padding: 12,
+          padding: "12px 12px 8px 12px", // bas plus fin → QR visuellement plus bas
+          margin: 12,
           overflow: "hidden",
           display: "flex",
           flexDirection: "column",
           gap: 8,
-          zIndex: 30,
+          alignSelf: "flex-start",
         }}
       >
+
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
             Classement
@@ -1353,9 +1553,6 @@ export default function Screen() {
           )}
         </div>
       </aside>
-
-      {/* QR — pendant le quiz : en bas à gauche et 2× plus gros */}
-      {isRunning && <JoinPanelFixedBottom />}
     </div>
   );
 }
