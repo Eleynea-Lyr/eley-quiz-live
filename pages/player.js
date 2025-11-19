@@ -1401,12 +1401,25 @@ export default function Player() {
   };
 
   const handleAnswerSubmit = (e) => {
-    if (e && typeof e.preventDefault === "function") e.preventDefault();
-    if (isLocked) return;
-    const trimmed = (answer ?? "").trim();
-    if (!trimmed) return;
-    checkAnswer();
-  };
+  if (e && typeof e.preventDefault === "function") e.preventDefault();
+  if (isLocked) return;
+  const trimmed = (answer ?? "").trim();
+  if (!trimmed) return;
+
+  checkAnswer();
+
+  // iOS: garder le clavier ouvert & vider le champ de manière fiable
+  requestAnimationFrame(() => {
+    const el = answerInputRef.current;
+    if (el) {
+      // double clear (state + DOM) pour WKWebView
+      try { el.value = ""; } catch {}
+      el.focus();
+      try { el.setSelectionRange(0, 0); } catch {}
+    }
+  });
+};
+
 
   // === Instant win (prédiction rang/points dès qu'une réponse correcte survient) ===
   useEffect(() => {
@@ -2141,7 +2154,17 @@ export default function Player() {
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="none"
+                spellCheck={false}
+                enterKeyHint="send"
+                onKeyDown={(e) => {
+                  // iOS: Enter ne déclenche pas toujours onSubmit; on force ici.
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    handleAnswerSubmit(e);
+                  }
+                }}
               />
+
             ) : isLocked && isQuestionPhase ? (
               <p
                 style={{
