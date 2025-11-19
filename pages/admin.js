@@ -428,6 +428,10 @@ export default function Admin() {
     timeMusicStr: "",
     imageFile: null,
   });
+  // 🔎 Patch Matching — champs création
+  // matchingMode: "strict" | "relaxed" | "numeric"
+  const [newMatchingMode, setNewMatchingMode] = useState("strict");
+
   const DEFAULT_REVEAL_PHRASES = [
     "La réponse était :",
     "Il fallait trouver :",
@@ -912,12 +916,19 @@ export default function Admin() {
       prev.map((it) => {
         if (it.id !== id) return it;
         const next = { ...it, [field]: value };
-        if (field === "answersCsv") next.answers = parseCSV(value);
-        if (field === "timeMusicStr") next.timeMusicSec = clampTimeMusicSec(parseHMS(value));
+
+        // 🔎 Patch Matching — mapping CSV -> arrays
+        if (field === "answersCsv") {
+          next.answers = parseCSV(value);
+        }
+        if (field === "timeMusicStr") {
+          next.timeMusicSec = clampTimeMusicSec(parseHMS(value));
+        }
         return next;
       })
     );
   };
+
 
   // [4.3] Saisie des offsets de manches (UI) + sauvegarde
   const handleRoundOffsetChange = (i, value) => {
@@ -1021,6 +1032,12 @@ export default function Admin() {
           : Array.isArray(it.answers)
             ? it.answers
             : [],
+
+        // 🔎 Patch Matching — persist par question
+        matchingMode: typeof it.matchingMode === "string" && it.matchingMode
+          ? it.matchingMode
+          : "strict",
+
         timeMusicSec: nextTimeMusicSec,
         timecodeSec: typeof it.timecodeSec === "number" ? it.timecodeSec : null,
         imageUrl: it.imageUrl || "",
@@ -1029,6 +1046,7 @@ export default function Admin() {
             ? it.order
             : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
       };
+
 
       await updateDoc(doc(db, "LesQuestions", it.id), payload);
       setSavedRowId(it.id);
@@ -1106,6 +1124,9 @@ export default function Admin() {
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
+        // 🔎 Patch Matching — champs persistant côté question
+        matchingMode: newMatchingMode || "strict",
+
         timeMusicSec,
         timecodeSec: null, // recalculé par recalcAllTimecodesFromOrder
         imageUrl,
@@ -1115,7 +1136,10 @@ export default function Admin() {
       });
 
       setNewQ({ text: "", answersCsv: "", timeMusicStr: "", imageFile: null });
+      setNewMatchingMode("strict");
       setNewRevealPhrases(["", "", "", "", ""]);
+
+
     } catch (err) {
       console.error("createOne error:", err);
       alert("Échec de la création : " + (err?.message || err));
@@ -1861,6 +1885,21 @@ export default function Admin() {
                       style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
                     />
                     <div style={{ fontSize: 12, opacity: 0.7 }}>Sépare par des virgules</div>
+                    {/* 🔎 Patch Matching — édition par ligne */}
+                    <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+                      <label style={{ fontSize: 12, opacity: 0.9 }}>
+                        Mode d’appariement
+                        <select
+                          value={it.matchingMode || "strict"}
+                          onChange={(e) => handleFieldChange(it.id, "matchingMode", e.target.value)}
+                          style={{ width: "100%", boxSizing: "border-box", marginTop: 4 }}
+                        >
+                          <option value="strict">strict (exact après normalisation)</option>
+                          <option value="relaxed">relaxed (tolérance relative)</option>
+                          <option value="numeric">numeric (strict numérique)</option>
+                        </select>
+                      </label>
+                    </div>
                   </td>
 
                   <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
@@ -2444,6 +2483,19 @@ export default function Admin() {
                     placeholder="ex: Mario, Super Mario"
                     style={{ width: "100%", boxSizing: "border-box" }}
                   />
+                </label>
+                {/* 🔎 Patch Matching — options de tolérance par question */}
+                <label>
+                  Mode d’appariement (tolérance)
+                  <select
+                    value={newMatchingMode}
+                    onChange={(e) => setNewMatchingMode(e.target.value)}
+                    style={{ width: "100%", boxSizing: "border-box" }}
+                  >
+                    <option value="strict">strict (exact après normalisation)</option>
+                    <option value="relaxed">relaxed (tolérance relative)</option>
+                    <option value="numeric">numeric (strict numérique)</option>
+                  </select>
                 </label>
 
                 <label>

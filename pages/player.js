@@ -134,9 +134,9 @@ const BOUNDARY_HYST_MS = 120;   // marge autour des frontières de manche
 // Anti-spam
 // ---------------------------------------------------------------------------
 const RATE_LIMIT_ENABLED = true;
-const MAX_WRONG_ATTEMPTS = 5;        // nb de tentatives avant blocage
+const MAX_WRONG_ATTEMPTS = 6;        // nb de tentatives avant blocage
 const RATE_LIMIT_WINDOW_MS = 15_000; // fenêtre glissante: 15 s
-const COOLDOWN_MS = 10_000;          // durée du blocage (10 s)
+const COOLDOWN_MS = 5_000;          // durée du blocage (5 s)
 
 // Phrases anti-spam
 const LOCK_PHRASES = [
@@ -174,7 +174,7 @@ const PLAYER_IMG_MAX = 220; // px
 // Espace haut (safe-area iOS + marge supérieure uniforme)
 const SAFE_TOP = "env(safe-area-inset-top, 0px)";
 const TOP_GUTTER_RUNNING = "clamp(40px, 8vh, 72px)"; // quand le quiz tourne
-const TOP_GUTTER_IDLE    = "clamp(28px, 6vh, 56px)"; // états hors “running”
+const TOP_GUTTER_IDLE = "clamp(28px, 6vh, 56px)"; // états hors “running”
 
 /* ================================ HELPERS =============================== */
 function normalize(str) {
@@ -197,6 +197,74 @@ function levenshteinDistance(a, b) {
 function isCloseEnough(input, expected, tolerance = 2) {
   return levenshteinDistance(input, expected) <= tolerance;
 }
+// ===== Tolérance de réponse — modes =====
+function normalizeBasic(s) {
+  return String(s || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function isNumericString(s) {
+  return /^[0-9]+$/.test(String(s || ""));
+}
+
+// Récupère le mode choisi côté Admin (fallback: "relaxed")
+function getAnswerMode(q) {
+  return q?.answerMode || q?.matchMode || "relaxed";
+}
+
+/**
+ * Modes supportés:
+ * - "strict": égalité exacte après normalisation de base
+ * - "relaxed": égalité OU Levenshtein <= ⌊len/3⌋ (min 1), mais
+ *              désactivé pour réponses très courtes (≤4) et pour le 100% numérique
+ * - "numeric": comparaison par valeur numérique :
+ *      • si l’attendu est numérique → Number(input) === Number(attendu) (zéros en tête autorisés)
+ *      • si l’attendu n’est pas numérique → égalité stricte normalisée (permet "quatre" si présent dans answers)
+ */
+function matchesWithMode(inputRaw, expectedRaw, mode = "relaxed") {
+  const inNorm = normalizeBasic(inputRaw);
+  const exNorm = normalizeBasic(expectedRaw);
+
+  if (mode === "numeric") {
+    const inDigits = String(inputRaw ?? "").replace(/\s+/g, "");
+    const exDigits = String(expectedRaw ?? "").replace(/\s+/g, "");
+
+    const exIsNum = isNumericString(exDigits);
+    const inIsNum = isNumericString(inDigits);
+
+    if (exIsNum && inIsNum) {
+      // Comparaison par valeur : "04" == "4", "040" != "4"
+      return Number(inDigits) === Number(exDigits);
+    }
+    if (!exIsNum) {
+      // L’attendu est une forme non-numérique explicitement listée ("quatre", "IV", etc.)
+      return inNorm === exNorm;
+    }
+    // Attendu numérique mais saisie non-numérique -> faux
+    return false;
+  }
+
+  if (mode === "strict") {
+    return inNorm === exNorm;
+  }
+
+  // "relaxed" (par défaut)
+  if (inNorm === exNorm) return true;
+
+  // Pas de flou si les deux sont purement numériques
+  const bothNumeric = isNumericString(inNorm) && isNumericString(exNorm);
+  if (bothNumeric) return false;
+
+  // Pas de flou pour les réponses très courtes (≤ 4)
+  if (exNorm.length <= 4) return false;
+
+  const tol = Math.max(1, Math.floor(exNorm.length / 3));
+  return isCloseEnough(inNorm, exNorm, tol);
+}
+
+
 function getTimeSec(q) {
   if (!q || typeof q !== "object") return Infinity;
   if (typeof q.timecodeSec === "number") return q.timecodeSec;           // secondes (nouveau)
@@ -1272,11 +1340,10 @@ export default function Player() {
 
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
-    const userInput = normalize(answer);
-    const accepted = currentQuestion.answers.map(normalize);
-    const isCorrect = accepted.some(
-      (acc) => acc === userInput || isCloseEnough(userInput, acc)
-    );
+    const mode = getAnswerMode(currentQuestion);
+    const list = Array.isArray(currentQuestion.answers) ? currentQuestion.answers : [];
+    const isCorrect = list.some((acc) => matchesWithMode(answer, acc, mode));
+
 
     if (isCorrect) {
       lastAnswerQidRef.current = currentQuestion?.id || null;
@@ -2128,6 +2195,39 @@ export default function Player() {
 
       {/* ============================== Styles locaux ============================== */}
       <style jsx>{`
+        /* Lisibilité input : texte & caret blancs, fond sombre, même après animations */
+.answerInput {
+  color: #fff !important;
+  caret-color: #fff !important;
+  -webkit-text-fill-color: #fff !important; /* WKWebView/iOS */
+
+  /* Contraste garanti (sinon blanc sur blanc) */
+  background: #0b1220 !important;
+  border: 1px solid #334155 !important;
+  border-radius: 10px;
+}
+
+/* Placeholder plus lisible sur fond sombre */
+.answerInput::placeholder {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* Sécurité : ne jamais altérer la couleur du texte pendant l’animation d’erreur */
+.answerInput.flashWrong {
+  color: #fff !important;
+  -webkit-text-fill-color: #fff !important;
+}
+
+/* (Android/iOS) Cas auto-fill : évite un fond blanc injecté par le navigateur */
+.answerInput:-webkit-autofill {
+  -webkit-text-fill-color: #fff !important;
+  caret-color: #fff !important;
+  background: #0b1220 !important;
+  /* évite l’override visuel temporaire de Chrome */
+  transition: background-color 99999s ease-out 0s;
+}
+
+
         .answerInput.shake { animation: shake 250ms ease-in-out; }
         @keyframes shake {
           0% { transform: translateX(0); }
