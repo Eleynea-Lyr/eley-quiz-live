@@ -1299,6 +1299,15 @@ export default function Player() {
   // Ouverture/affichage input
   const answersOpen = Boolean(isQuestionPhase && !isLocked);
   const showInput = Boolean(answersOpen && !hadCorrectEver && !justAnsweredAfterBack);
+  // Miroirs pour le listener global (anti-OK iOS)
+  const showInputRef = useRef(showInput);
+  const isLockedRef = useRef(isLocked);
+  const answerRef = useRef(answer);
+
+  useEffect(() => { showInputRef.current = showInput; }, [showInput]);
+  useEffect(() => { isLockedRef.current = isLocked; }, [isLocked]);
+  useEffect(() => { answerRef.current = answer; }, [answer]);
+
 
   // Focus auto si input visible et masque levé
   useEffect(() => {
@@ -1346,6 +1355,49 @@ export default function Player() {
     const id = setInterval(() => setCooldownTick((t) => t + 1), 250);
     return () => clearInterval(id);
   }, [cooldownUntilMs]);
+
+  // === Filet global anti-OK (iOS) : toute perte de focus redevient un submit doux + refocus ===
+useEffect(() => {
+  if (!IS_IOS) return;
+
+  const handler = (ev) => {
+    // Si l'input n'est plus censé être visible (bonne réponse, reveal, etc.), on ne fait rien
+    if (!showInputRef.current) return;
+
+    // 1) Submit doux si texte et pas en cooldown
+    const txt = String(answerRef.current || "").trim();
+    if (txt.length > 0 && !isLockedRef.current) {
+      // Pas d'event React ici : on appelle la même logique que Enter/clic
+      handleAnswerSubmit();
+    }
+
+    // 2) Forcer la persistance du clavier : multi-refocus agressif pour WKWebView
+    const refocus = () => {
+      const el = answerInputRef?.current;
+      if (!el) return;
+      try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+      try {
+        const v = el.value || "";
+        el.setSelectionRange(v.length, v.length);
+      } catch {}
+    };
+
+    // Chaîne : rAF → rAF → timeouts (iOS range parfois malgré un seul focus)
+    requestAnimationFrame(() => {
+      refocus();
+      requestAnimationFrame(() => {
+        refocus();
+        setTimeout(refocus, 40);
+        setTimeout(refocus, 120);
+      });
+    });
+  };
+
+  // Capture sur tout le document : iOS “OK/Done” provoque un blur qu’on ne peut pas prevent
+  document.addEventListener("focusout", handler, true);
+  return () => document.removeEventListener("focusout", handler, true);
+}, [/* pas de deps React nécessaires : on lit via *_Ref.current */]);
+
 
   /* ============================ Vérification & Handlers ============================ */
 
