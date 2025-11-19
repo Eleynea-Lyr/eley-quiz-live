@@ -1357,16 +1357,29 @@ export default function Player() {
 
   // Empêche le transfert de focus de l'input vers le bouton (iOS ferme le clavier sinon)
   const keepInputFocus = (e) => {
-    e.preventDefault();
+    // Empêche toute prise de focus par le bouton (sinon iOS range le clavier)
+    if (e && typeof e.preventDefault === "function") e.preventDefault();
+    if (e && typeof e.stopPropagation === "function") e.stopPropagation();
+
     const el = answerInputRef?.current;
     if (el) {
-      // Re-focalise immédiatement (avant le submit) pour éviter le rangement du clavier
-      el.focus();
-      // Place le curseur en fin (cosmétique)
-      const v = el.value || "";
-      try { el.setSelectionRange(v.length, v.length); } catch { }
+      // 1) Focus immédiat (dans le même gesture)
+      try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+
+      // 2) Re-focus “double tick” pour WKWebView (certains iOS l’ignorent sinon)
+      requestAnimationFrame(() => {
+        try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+        const v = el.value || "";
+        try { el.setSelectionRange(v.length, v.length); } catch { }
+      });
+
+      // 3) Fallback ultra-fiable (petit délai) pour Chrome iOS
+      setTimeout(() => {
+        try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+      }, 30);
     }
   };
+
 
 
   const checkAnswer = () => {
@@ -1400,6 +1413,14 @@ export default function Player() {
         }
       }
     } else {
+      // Ferme volontairement le clavier — c’est le SEUL cas où on le fait
+      requestAnimationFrame(() => {
+        const el = answerInputRef?.current;
+        if (el) {
+          try { el.blur(); } catch { }
+        }
+      });
+
       setResult("wrong");
       setAnswer("");
 
@@ -2172,26 +2193,57 @@ export default function Player() {
                 type="text"
                 value={answer}
                 onChange={(e) => setAnswer(e.target.value)}
+                onKeyDown={(e) => {
+                  // Capte Enter pour éviter un submit natif qui fermerait le clavier
+                  if (e.key === "Enter" && !isLocked) {
+                    e.preventDefault();
+                    const trimmed = (answer ?? "").trim();
+                    if (trimmed.length > 0) {
+                      handleAnswerSubmit();
+                      // Re-focus immédiat pour conserver le clavier ouvert
+                      const el = answerInputRef?.current;
+                      if (el) {
+                        try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+                        try { el.setSelectionRange(0, 0); } catch { }
+                      }
+                    }
+                  }
+                }}
+
                 onBlur={(e) => {
-                  // iOS "OK" = blur ; on le transforme en submit doux et on garde le clavier ouvert
+                  // iOS “OK”/“Done” déclenche un blur → on simule Enter ET on garde le clavier ouvert
                   if (!IS_IOS) return;
                   const el = answerInputRef?.current;
                   const txt = (answer ?? "").trim();
-                  // Si l'input est censé être visible (pas "déjà répondu") :
-                  if (showInput) {
-                    // Si du texte, on soumet comme Enter
-                    if (!isLocked && txt.length > 0) {
-                      handleAnswerSubmit();
-                    }
-                    // Dans tous les cas, on re-focalise immédiatement pour retenir le clavier
-                    requestAnimationFrame(() => {
-                      if (el) {
-                        el.focus();
-                        try { el.setSelectionRange(el.value.length, el.value.length); } catch { }
-                      }
-                    });
+
+                  // Ne rien faire si l’input n’est plus censé être visible (bonne réponse déjà gérée ailleurs)
+                  if (!showInput) return;
+
+                  // 1) Si du texte, on soumet comme Enter (sans fermer le clavier)
+                  if (!isLocked && txt.length > 0) {
+                    handleAnswerSubmit();
                   }
+
+                  // 2) Forcer la persistance du clavier (iOS peut ignorer un seul focus)
+                  //    → triple essai : rAF, puis rAF+setSelectionRange, puis léger timeout
+                  const refocus = () => {
+                    if (!el) return;
+                    try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+                    try {
+                      const v = el.value || "";
+                      el.setSelectionRange(v.length, v.length);
+                    } catch { }
+                  };
+
+                  requestAnimationFrame(() => {
+                    refocus();
+                    requestAnimationFrame(() => {
+                      refocus();
+                      setTimeout(refocus, 30);
+                    });
+                  });
                 }}
+
                 placeholder="Votre réponse"
                 style={{
                   width: "min(520px, 100%)",
@@ -2204,6 +2256,7 @@ export default function Player() {
                 }}
                 autoFocus={!uiMasked}
                 inputMode="text"
+                enterKeyHint="send"
                 autoComplete="off"
                 autoCorrect="off"
                 autoCapitalize="none"
@@ -2232,7 +2285,18 @@ export default function Player() {
                 type="button"
                 onMouseDown={keepInputFocus}
                 onTouchStart={keepInputFocus}
-                onClick={handleAnswerSubmit}
+                onClick={(e) => {
+                  handleAnswerSubmit(e);
+                  // Re-focus post-submit pour les iPhones un peu têtus
+                  const el = answerInputRef?.current;
+                  if (el && showInput) {
+                    requestAnimationFrame(() => {
+                      try { el.focus({ preventScroll: true }); } catch { el.focus(); }
+                      try { el.setSelectionRange(0, 0); } catch { }
+                    });
+                  }
+                }}
+
                 disabled={isLocked || !((answer ?? "").trim().length > 0)}
                 style={{
                   width: "min(520px, 100%)",
