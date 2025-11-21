@@ -28,6 +28,7 @@ import {
   runTransaction,
   where,
   increment,
+  deleteField,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
@@ -83,12 +84,73 @@ async function ensureConfigDefaults() {
   const data = snap.exists() ? snap.data() : {};
 
   const patch = {};
+
+  // Defaults existants
   if (!("scoringTable" in data)) patch.scoringTable = DEFAULT_SCORING_TABLE;
   if (!("revealDurationSec" in data)) patch.revealDurationSec = DEFAULT_REVEAL_DURATION_SEC;
   if (!("leaderboardTopN" in data)) patch.leaderboardTopN = DEFAULT_LEADERBOARD_TOP_N;
 
+  // === Nouveau : gestion des quiz ===
+  // Clé par défaut pour le premier quiz (ancien onglet "Questions")
+  const defaultQuizKey =
+    typeof data.activeQuizKey === "string" && data.activeQuizKey
+      ? data.activeQuizKey
+      : "quiz-test";
+
+  let quizzes = Array.isArray(data.quizzes) ? data.quizzes.filter((q) => q && q.key && q.name) : [];
+
+  if (!quizzes.length) {
+    // Premier quiz : "Quiz test"
+    quizzes = [
+      {
+        key: defaultQuizKey,
+        name: "Quiz test",
+      },
+    ];
+    patch.quizzes = quizzes;
+  } else if (!quizzes.some((q) => q.key === defaultQuizKey)) {
+    // S'assurer que le quiz actif est bien présent dans la liste
+    quizzes = [...quizzes, { key: defaultQuizKey, name: "Quiz test" }];
+    patch.quizzes = quizzes;
+  }
+
+  if (!("activeQuizKey" in data) || !data.activeQuizKey) {
+    patch.activeQuizKey = defaultQuizKey;
+  }
+
   if (Object.keys(patch).length > 0) {
     await setDoc(cfgRef, patch, { merge: true });
+  }
+
+  // Backfill des questions existantes : leur attribuer quizKey = defaultQuizKey si manquant
+  await backfillQuestionsQuizKey(defaultQuizKey);
+}
+
+async function backfillQuestionsQuizKey(defaultQuizKey) {
+  try {
+    if (!defaultQuizKey) return;
+    const colRef = collection(db, "LesQuestions");
+    const snap = await getDocs(colRef);
+
+    const docsToFix = snap.docs.filter((d) => {
+      const data = d.data() || {};
+      return !data.quizKey;
+    });
+
+    if (!docsToFix.length) return;
+
+    console.log("[Admin] backfill quizKey on", docsToFix.length, "questions");
+
+    while (docsToFix.length) {
+      const chunk = docsToFix.splice(0, 400);
+      const batch = writeBatch(db);
+      chunk.forEach((docSnap) => {
+        batch.update(doc(colRef, docSnap.id), { quizKey: defaultQuizKey });
+      });
+      await batch.commit();
+    }
+  } catch (e) {
+    console.error("backfillQuestionsQuizKey error:", e);
   }
 }
 
@@ -273,8 +335,8 @@ async function togglePauseResume(db) {
 
 /* =============================== COMPOSANT =============================== */
 
-/* ====================== ÉTATS & HELPERS INTERNES (PARTIE 2/4) ====================== */
-export default function Admin() {
+/* ====================== ÉTATS & HELPERS INTERNES (PARTIE 2/6) ====================== */
+function AdminInner() {
   /* [2.1] Étape 0 : injecter la config par défaut si absente */
   useEffect(() => {
     ensureConfigDefaults().catch((e) => console.error("ensureConfigDefaults error:", e));
@@ -373,7 +435,13 @@ export default function Admin() {
   }
 
   /* [2.4] États UI/DATA */
-  // Questions
+
+  // === Quiz (métadonnées + sélection) ===
+  const [quizzes, setQuizzes] = useState([]);          // [{ key, name }]
+  const [activeQuizKey, setActiveQuizKey] = useState(null); // quiz utilisé en live (Player/Screen)
+  const [selectedQuizKey, setSelectedQuizKey] = useState(null); // quiz actuellement affiché dans l’onglet
+
+  // Questions (du quiz sélectionné)
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
@@ -384,7 +452,7 @@ export default function Admin() {
   const [notice, setNotice] = useState(null);
   const [creating, setCreating] = useState(false);
   const [mainBtnBusy, setMainBtnBusy] = useState(false);
-  const [adminTab, setAdminTab] = useState("players"); // "players" | "questions"
+  const [adminTab, setAdminTab] = useState("players"); // "players" | `quiz:${quizKey}`
 
   // Joueurs (panneau)
   const [players, setPlayers] = useState([]);
@@ -396,6 +464,7 @@ export default function Admin() {
   const playerOrderRef = useRef(new Map()); // id -> index d’arrivée
   const nextPlayerOrderRef = useRef(1);
 
+  const [configDoc, setConfigDoc] = useState(null);
   // Rounds & fin
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
     "00:00:00", "00:16:00", "00:31:00", "00:46:00", "", "", "", "",
@@ -410,8 +479,13 @@ export default function Admin() {
   const [introRoundIndex, setIntroRoundIndex] = useState(null);
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
 
+  // Offset d’horloge serveur (ms) — mis à jour via /quiz/state.serverNow
+  const serverDeltaRef = useRef(0);
+  const [serverDeltaTick, setServerDeltaTick] = useState(0); // léger re-render si besoin
+
   // Live state
   const [isRunning, setIsRunning] = useState(false);
+
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
@@ -426,8 +500,10 @@ export default function Admin() {
     text: "",
     answersCsv: "",
     timeMusicStr: "",
-    imageFile: null,
+    imageQuestionFile: null, // 👈 nouveau (image affichée pendant la phase "question")
+    imageReponseFile: null,  // 👈 nouveau (image affichée pendant la "révélation")
   });
+
   // 🔎 Patch Matching — champs création
   // matchingMode: "strict" | "relaxed" | "numeric"
   const [newMatchingMode, setNewMatchingMode] = useState("strict");
@@ -441,13 +517,24 @@ export default function Admin() {
   ];
   const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
 
-  /* [2.5] Effects — 1) Charger questions (ordre asc) */
+  /* [2.5] Effects — 1) Charger questions du quiz sélectionné (ordre asc) */
   useEffect(() => {
+    if (!selectedQuizKey) {
+      setItems([]);
+      setNeedsOrderInit(false);
+      return;
+    }
+
     (async () => {
       setLoading(true);
       try {
-        const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-        const snap = await getDocs(q);
+        const colRef = collection(db, "LesQuestions");
+        const qRef = query(
+          colRef,
+          where("quizKey", "==", selectedQuizKey),
+          orderBy("order", "asc")
+        );
+        const snap = await getDocs(qRef);
         const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
         setItems(arr);
         setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
@@ -457,31 +544,100 @@ export default function Admin() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [selectedQuizKey]);
 
-  /* [2.6] Effects — 2) Écouter config (rounds + fin) */
+
+  /* [2.6] Effects — 2) Écouter config (rounds + fin + quiz actifs) */
   useEffect(() => {
     const unsub = onSnapshot(
       doc(db, "quiz", "config"),
       (snap) => {
         const d = snap.data() || {};
-        if (Array.isArray(d.roundOffsetsSec)) {
-          const offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
-          setRoundOffsetsSec(offs);
-          setRoundOffsetsStr(offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : "")));
+        setConfigDoc(d);
+
+        // === Quiz : métadonnées + actif ===
+        let cfgQuizzes = Array.isArray(d.quizzes)
+          ? d.quizzes.filter((q) => q && q.key && q.name)
+          : [];
+        let cfgActiveQuizKey =
+          typeof d.activeQuizKey === "string" && d.activeQuizKey
+            ? d.activeQuizKey
+            : "quiz-test";
+
+        if (!cfgQuizzes.length) {
+          cfgQuizzes = [{ key: cfgActiveQuizKey, name: "Quiz test" }];
+        } else if (!cfgQuizzes.some((q) => q.key === cfgActiveQuizKey)) {
+          cfgQuizzes = [...cfgQuizzes, { key: cfgActiveQuizKey, name: "Quiz test" }];
         }
-        if (typeof d.endOffsetSec === "number") {
-          setQuizEndSec(d.endOffsetSec);
-          setEndOffsetStr(formatHMS(d.endOffsetSec));
-        } else {
-          setQuizEndSec(null);
-          setEndOffsetStr("");
-        }
+
+        setQuizzes(cfgQuizzes);
+        setActiveQuizKey(cfgActiveQuizKey);
+
+        // Quiz sélectionné dans l’UI : si absent, basculer sur le quiz actif
+        setSelectedQuizKey((prev) => {
+          if (!prev) return cfgActiveQuizKey;
+          const exists = cfgQuizzes.some((q) => q.key === prev);
+          return exists ? prev : cfgActiveQuizKey;
+        });
       },
       (e) => console.error("onSnapshot config error:", e)
     );
     return () => unsub();
   }, []);
+
+  /* [2.6bis] Dériver offsets/fin par quiz (selectedQuizKey ↔ configDoc) */
+  useEffect(() => {
+    if (!configDoc) {
+      return;
+    }
+
+    const d = configDoc || {};
+    const key = selectedQuizKey || activeQuizKey || "quiz-test";
+
+    // roundOffsetsSec par quiz
+    const byQuiz =
+      d.roundOffsetsSecByQuiz && typeof d.roundOffsetsSecByQuiz === "object"
+        ? d.roundOffsetsSecByQuiz
+        : null;
+
+    let offs = null;
+    if (byQuiz && Array.isArray(byQuiz[key])) {
+      offs = coerceOffsetsToNumbers(byQuiz[key]);
+    } else if (Array.isArray(d.roundOffsetsSec)) {
+      // compat : fallback sur roundOffsetsSec global
+      offs = coerceOffsetsToNumbers(d.roundOffsetsSec);
+    } else {
+      offs = [null, null, null, null, null, null, null, null];
+    }
+
+    setRoundOffsetsSec(offs);
+    setRoundOffsetsStr(offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : "")));
+
+    // endOffsetSec par quiz
+    const endByQuiz =
+      d.endOffsetSecByQuiz && typeof d.endOffsetSecByQuiz === "object"
+        ? d.endOffsetSecByQuiz
+        : null;
+
+    let end = null;
+    if (endByQuiz && typeof endByQuiz[key] === "number") {
+      end = endByQuiz[key];
+    } else if (typeof d.endOffsetSec === "number") {
+      // compat : fallback global
+      end = d.endOffsetSec;
+    } else {
+      end = null;
+    }
+
+    if (typeof end === "number") {
+      setQuizEndSec(end);
+      setEndOffsetStr(formatHMS(end));
+    } else {
+      setQuizEndSec(null);
+      setEndOffsetStr("");
+    }
+  }, [configDoc, selectedQuizKey, activeQuizKey]);
+
 
   /* [2.7] Effects — 3) Écouter état live (Timestamp ou startEpochMs) */
   useEffect(() => {
@@ -495,15 +651,45 @@ export default function Admin() {
         let startMs = null;
 
         if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
-          const anchorMs = d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+          const anchorMs =
+            d.anchorAt.seconds * 1000 +
+            Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
           const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
-          // On veut: elapsed ≈ (now - anchorAt) + offsetSec
+          // On veut : elapsed ≈ (now - anchorAt) + offsetSec
           // ⇔ (now - startMs) ≈ (now - (anchorAt - offsetSec*1000))
           startMs = anchorMs - offsetSec * 1000;
         } else if (d.startAt && typeof d.startAt.seconds === "number") {
-          startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
+          startMs =
+            d.startAt.seconds * 1000 +
+            Math.floor((d.startAt.nanoseconds || 0) / 1e6);
         } else if (typeof d.startEpochMs === "number") {
           startMs = d.startEpochMs;
+        }
+
+        // Mise à jour du delta d’horloge si Admin publie serverNow
+        if (d.serverNow && typeof d.serverNow.seconds === "number") {
+          const serverNowMs =
+            d.serverNow.seconds * 1000 +
+            Math.floor((d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6);
+
+          const instantDelta = serverNowMs - Date.now(); // (>0) = ma clock est en retard
+
+          // Buffer des derniers deltas pour une correction “best-of”
+          if (!serverDeltaRef.buffer) serverDeltaRef.buffer = [];
+          serverDeltaRef.buffer.push(instantDelta);
+          if (serverDeltaRef.buffer.length > 8) serverDeltaRef.buffer.shift();
+
+          // On prend le percentile 90 (valeur haute sans aller à l’extrême)
+          const sorted = [...serverDeltaRef.buffer].sort((a, b) => a - b);
+          const p90 = sorted[Math.floor(sorted.length * 0.9)] ?? instantDelta;
+
+          // Lissage EMA vers cette valeur
+          const prev = serverDeltaRef.current || 0;
+          const alpha = 0.25;
+          serverDeltaRef.current = prev * (1 - alpha) + p90 * alpha;
+
+          // Tick léger pour réactualiser si besoin d’afficher qqch basé sur Date.now()
+          setServerDeltaTick((t) => (t + 1) & 0xfff);
         }
 
         setIsRunning(!!d.isRunning);
@@ -516,7 +702,9 @@ export default function Admin() {
         } else {
           setQuizStartMs(startMs);
           if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
-            const pms = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
+            const pms =
+              d.pauseAt.seconds * 1000 +
+              Math.floor((d.pauseAt.nanoseconds || 0) / 1e6);
             setPauseAtMs(pms);
           } else {
             setPauseAtMs(null);
@@ -525,16 +713,23 @@ export default function Admin() {
 
         // flags UI/state
         setIsIntro(!!d.isIntro);
-        setIntroEndsAtMs(typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null);
-        setIntroRoundIndex(Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null);
+        setIntroEndsAtMs(
+          typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null
+        );
+        setIntroRoundIndex(
+          Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null
+        );
         setLastAutoPausedRoundIndex(
-          Number.isInteger(d.lastAutoPausedRoundIndex) ? d.lastAutoPausedRoundIndex : null
+          Number.isInteger(d.lastAutoPausedRoundIndex)
+            ? d.lastAutoPausedRoundIndex
+            : null
         );
       },
       (e) => console.error("onSnapshot state error:", e)
     );
     return () => unsub();
   }, []);
+
 
   // ============================================================================
   // /pages/admin.js — Partie 3/6
@@ -551,7 +746,8 @@ export default function Admin() {
     }
     if (isPaused && pauseAtMs) {
       const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
-      setElapsedSec(e < 0 ? 0 : e);
+      const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
+      setElapsedSec(clamped < 0 ? 0 : clamped);
       return;
     }
     if (!isRunning) {
@@ -559,54 +755,71 @@ export default function Admin() {
       return;
     }
 
-    const computeNow = () => Math.floor((Date.now() - quizStartMs) / 1000);
+    const computeNow = () =>
+      Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
+
     const first = computeNow();
-    setElapsedSec(Number.isFinite(quizEndSec) && first >= quizEndSec ? quizEndSec : first < 0 ? 0 : first);
+    const firstClamped = Number.isFinite(quizEndSec)
+      ? Math.min(first, quizEndSec)
+      : first;
+    setElapsedSec(firstClamped < 0 ? 0 : firstClamped);
 
     const id = setInterval(() => {
       const raw = computeNow();
       if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
-        setElapsedSec(quizEndSec);
+        setElapsedSec(Math.max(0, quizEndSec));
         clearInterval(id);
       } else {
         setElapsedSec(raw < 0 ? 0 : raw);
       }
     }, 500);
     return () => clearInterval(id);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
-  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = nextStart - 1s)
+
+  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
   useEffect(() => {
     if (!isRunning || isPaused) return;
     if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null)) return;
 
-    const prevIdx = (() => {
-      let idx = -1;
-      for (let i = 0; i < roundOffsetsSec.length; i++) {
-        const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && elapsedSec >= t) idx = i;
+    // Manche courante = dernière dont l’offset ≤ elapsedSec
+    let prevIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) {
+        prevIdx = i;
       }
-      return idx;
-    })();
+    }
+    if (prevIdx < 0) return; // garde de sûreté
 
     const nextStart =
-      typeof roundOffsetsSec[prevIdx + 1] === "number" ? roundOffsetsSec[prevIdx + 1] : null;
-
+      typeof roundOffsetsSec[prevIdx + 1] === "number"
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
     if (typeof nextStart !== "number") return; // pas de manche suivante
 
-    const boundary = Math.max(0, nextStart - 1); // marge 1s
-    if (elapsedSec >= boundary && lastAutoPausedRoundIndex !== prevIdx) {
-      setDoc(
-        doc(db, "quiz", "state"),
-        {
-          isPaused: true,
-          pauseAt: serverTimestamp(),
-          lastAutoPausedRoundIndex: prevIdx,
-        },
-        { merge: true }
-      ).catch(console.error);
-    }
+    // Frontière = 1 seconde AVANT le début de la manche suivante
+    const boundary = Math.max(0, nextStart - 1);
+
+    // On attend d'avoir réellement atteint la frontière
+    if (elapsedSec < boundary) return;
+
+    // Déjà auto-pausé pour cette manche → ne rien refaire
+    if (lastAutoPausedRoundIndex === prevIdx) return;
+
+    setDoc(
+      doc(db, "quiz", "state"),
+      {
+        isPaused: true,
+        pauseAt: serverTimestamp(),
+        lastAutoPausedRoundIndex: prevIdx,
+      },
+      { merge: true }
+    ).catch(console.error);
   }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
+
+
+
 
   // [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
   useEffect(() => {
@@ -766,8 +979,11 @@ export default function Admin() {
     const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
       ? roundOffsetsSec[prevIdx + 1]
       : null;
+    // Frontière de manche = 1s avant la manche suivante
     return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
   }, [elapsedSec, roundOffsetsSec]);
+
+
 
   const atRoundBoundary = Boolean(
     isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec
@@ -818,7 +1034,8 @@ export default function Admin() {
     }
     return null;
   })();
-  const nextRoundBoundary = Number.isFinite(_nextRoundStart) ? Math.max(0, _nextRoundStart - 1) : null;
+  const nextRoundBoundary = Number.isFinite(_nextRoundStart) ? Math.max(0, _nextRoundStart) : null;
+
 
   const candidates = [];
   if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
@@ -875,11 +1092,17 @@ export default function Admin() {
   // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
   // ============================================================================
 
-  // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic
+  // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic (par quiz)
   async function recalcAllTimecodesFromOrder() {
+    if (!selectedQuizKey) return;
     try {
-      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-      const snap = await getDocs(q);
+      const colRef = collection(db, "LesQuestions");
+      const qRef = query(
+        colRef,
+        where("quizKey", "==", selectedQuizKey),
+        orderBy("order", "asc")
+      );
+      const snap = await getDocs(qRef);
       const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
       let t = 0;
@@ -901,8 +1124,9 @@ export default function Admin() {
         await batch.commit();
       }
 
-      // Rafraîchir le tableau
-      const snap2 = await getDocs(q);
+      // Rafraîchir le tableau (quiz courant uniquement)
+      const snap2 = await getDocs(qRef);
+
       setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
     } catch (e) {
       console.error("recalcAllTimecodesFromOrder error:", e);
@@ -938,6 +1162,7 @@ export default function Admin() {
       return next;
     });
   };
+
   const saveRoundOffsets = async (nextStrs) => {
     try {
       const secs = nextStrs.map((s) => {
@@ -947,7 +1172,33 @@ export default function Admin() {
         if (v == null) throw new Error("format");
         return v;
       });
-      await setDoc(doc(db, "quiz", "config"), { roundOffsetsSec: secs }, { merge: true });
+
+      const cfgRef = doc(db, "quiz", "config");
+      const key = selectedQuizKey || activeQuizKey || "quiz-test";
+
+      const existingByQuiz =
+        configDoc &&
+          configDoc.roundOffsetsSecByQuiz &&
+          typeof configDoc.roundOffsetsSecByQuiz === "object"
+          ? configDoc.roundOffsetsSecByQuiz
+          : {};
+
+      const nextByQuiz = {
+        ...existingByQuiz,
+        [key]: secs,
+      };
+
+      const patch = {
+        roundOffsetsSecByQuiz: nextByQuiz,
+      };
+
+      // Pour compatibilité avec Player/Screen : garder un roundOffsetsSec "global" pour le quiz actif
+      if (key === activeQuizKey) {
+        patch.roundOffsetsSec = secs;
+      }
+
+      await setDoc(cfgRef, patch, { merge: true });
+
       setRoundOffsetsSec(secs);
       setRoundOffsetsStr(secs.map((s) => (typeof s === "number" ? formatHMS(s) : "")));
       setNotice("Offsets enregistrés");
@@ -958,13 +1209,40 @@ export default function Admin() {
     }
   };
 
+
   // [4.4] Saisie/Enregistrement de la fin du quiz (global)
   const saveEndOffset = async (valStr) => {
     try {
       const t = (valStr || "").trim();
       const v = t ? parseHMS(t) : null; // null = pas de fin
       if (t && v == null) throw new Error("format");
-      await setDoc(doc(db, "quiz", "config"), { endOffsetSec: v }, { merge: true });
+
+      const cfgRef = doc(db, "quiz", "config");
+      const key = selectedQuizKey || activeQuizKey || "quiz-test";
+
+      const existingByQuiz =
+        configDoc &&
+          configDoc.endOffsetSecByQuiz &&
+          typeof configDoc.endOffsetSecByQuiz === "object"
+          ? configDoc.endOffsetSecByQuiz
+          : {};
+
+      const nextByQuiz = {
+        ...existingByQuiz,
+        [key]: v,
+      };
+
+      const patch = {
+        endOffsetSecByQuiz: nextByQuiz,
+      };
+
+      // Compat : copier sur le champ global pour le quiz actif (Player/Screen)
+      if (key === activeQuizKey) {
+        patch.endOffsetSec = v;
+      }
+
+      await setDoc(cfgRef, patch, { merge: true });
+
       setEndOffsetStr(v != null ? formatHMS(v) : "");
       setQuizEndSec(v);
       setNotice("Fin du quiz enregistrée");
@@ -974,6 +1252,7 @@ export default function Admin() {
       setTimeout(() => setNotice(null), 2000);
     }
   };
+
 
   // [4.5] Upload d'image (Storage) + binding sur la question
   const uploadImage = async (file) => {
@@ -1002,13 +1281,47 @@ export default function Admin() {
       return null;
     }
   };
-  const handleImageChange = async (id, file) => {
-    if (!file) return;
+
+  // 👇 Handler générique ciblé : "imageQuestionUrl" ou "imageReponseUrl"
+  const handleImageChange = async (id, file, targetField) => {
+    if (!file || !targetField) return;
     handleFieldChange(id, "_imageUploading", true);
     const url = await uploadImage(file);
-    if (url) handleFieldChange(id, "imageUrl", url);
+    if (url) handleFieldChange(id, targetField, url);
     handleFieldChange(id, "_imageUploading", false);
   };
+
+  // Supprimer l’image QUESTION (met à jour le brouillon local ; la suppression réelle se fait dans saveOne)
+  const handleRemoveImageQuestion = (id) => {
+    setItems((prev) =>
+      prev.map((it) => {
+        if (it.id !== id) return it;
+        return {
+          ...it,
+          imageQuestionUrl: "",
+          _deleteImageQuestion: true,
+        };
+      })
+    );
+  };
+
+  // Supprimer l’image RÉPONSE (idem)
+  const handleRemoveImageReponse = (id) => {
+    setItems((prev) =>
+      prev.map((it) => {
+        if (it.id !== id) return it;
+        return {
+          ...it,
+          imageReponseUrl: "",
+          // legacy visibles à l’écran via fallback lecture
+          imageUrl: "",
+          _deleteImageReponse: true,
+        };
+      })
+    );
+  };
+
+
 
   // [4.6] Sauvegarder une question (update Firestore)
   const saveOne = async (it) => {
@@ -1025,6 +1338,7 @@ export default function Admin() {
             ? clampTimeMusicSec(it.timeMusicSec)
             : DEFAULT_TIME_MUSIC_SEC;
 
+      // 1) Base payload (sans deleteField)
       const payload = {
         text: it.text ?? "",
         answers: hasAnswersCsv
@@ -1033,22 +1347,44 @@ export default function Admin() {
             ? it.answers
             : [],
 
-        // 🔎 Patch Matching — persist par question
         matchingMode: typeof it.matchingMode === "string" && it.matchingMode
           ? it.matchingMode
           : "strict",
 
         timeMusicSec: nextTimeMusicSec,
         timecodeSec: typeof it.timecodeSec === "number" ? it.timecodeSec : null,
-        imageUrl: it.imageUrl || "",
+
+        // Images (brutes, on ajustera juste après avec deleteField si besoin)
+        imageQuestionUrl: it.imageQuestionUrl || "",
+        imageReponseUrl: (it.imageReponseUrl || it.imageUrl || ""),
+
         order:
           typeof it.order === "number"
             ? it.order
             : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
       };
 
+      // 2) Construire l’objet d’update final (avec deleteField)
+      const updates = { ...payload };
 
-      await updateDoc(doc(db, "LesQuestions", it.id), payload);
+      // QUESTION : suppression demandée ou URL vide → deleteField + nettoyage legacy éventuel
+      if (it._deleteImageQuestion || !payload.imageQuestionUrl) {
+        updates.imageQuestionUrl = deleteField();
+        // autres clés possibles (au cas où)
+        updates.questionImageUrl = deleteField();
+        updates.imageQuestion = deleteField();
+      }
+
+      // RÉPONSE : suppression demandée ou URL vide → deleteField + legacy
+      if (it._deleteImageReponse || !payload.imageReponseUrl) {
+        updates.imageReponseUrl = deleteField();
+        updates.imageReponse = deleteField();
+        updates.imageUrl = deleteField(); // legacy visible côté UI
+        updates.image = deleteField();
+      }
+
+      await updateDoc(doc(db, "LesQuestions", it.id), updates);
+
       setSavedRowId(it.id);
       setTimeout(() => setSavedRowId(null), 2000);
     } catch (err) {
@@ -1057,8 +1393,14 @@ export default function Admin() {
     } finally {
       setSavingId(null);
       await (async () => {
-        const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-        const snap = await getDocs(q);
+        if (!selectedQuizKey) return;
+        const colRef = collection(db, "LesQuestions");
+        const qRef = query(
+          colRef,
+          where("quizKey", "==", selectedQuizKey),
+          orderBy("order", "asc")
+        );
+        const snap = await getDocs(qRef);
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
         await recalcAllTimecodesFromOrder();
       })();
@@ -1069,8 +1411,14 @@ export default function Admin() {
   const removeOne = async (id) => {
     if (!confirm("Supprimer cette question ?")) return;
     await deleteDoc(doc(db, "LesQuestions", id));
-    const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-    const snap = await getDocs(q);
+    if (!selectedQuizKey) return;
+    const colRef = collection(db, "LesQuestions");
+    const qRef = query(
+      colRef,
+      where("quizKey", "==", selectedQuizKey),
+      orderBy("order", "asc")
+    );
+    const snap = await getDocs(qRef);
     setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     await recalcAllTimecodesFromOrder();
   };
@@ -1083,21 +1431,38 @@ export default function Admin() {
     batch.update(doc(db, "LesQuestions", a.id), { order: b.order ?? (indexB + 1) * 1000 });
     batch.update(doc(db, "LesQuestions", b.id), { order: a.order ?? (indexA + 1) * 1000 });
     await batch.commit();
-    const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-    const snap = await getDocs(q);
+
+    if (!selectedQuizKey) return;
+    const colRef = collection(db, "LesQuestions");
+    const qRef = query(
+      colRef,
+      where("quizKey", "==", selectedQuizKey),
+      orderBy("order", "asc")
+    );
+    const snap = await getDocs(qRef);
     setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     await recalcAllTimecodesFromOrder();
   };
 
   // [4.9] Initialiser l'ordre une fois (fallback legacy)
   const initOrder = async () => {
-    const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
+    if (!selectedQuizKey) return;
+    const colRef = collection(db, "LesQuestions");
+    const q = query(
+      colRef,
+      where("quizKey", "==", selectedQuizKey),
+      orderBy("createdAt", "asc")
+    );
     const snap = await getDocs(q);
     const arr = snap.docs.map((d, i) => ({ id: d.id, ...d.data(), idx: i }));
     const batch = writeBatch(db);
-    arr.forEach((it, i) => batch.update(doc(db, "LesQuestions", it.id), { order: (i + 1) * 1000 }));
+    arr.forEach((it, i) => batch.update(doc(colRef, it.id), { order: (i + 1) * 1000 }));
     await batch.commit();
-    const q2 = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
+    const q2 = query(
+      colRef,
+      where("quizKey", "==", selectedQuizKey),
+      orderBy("order", "asc")
+    );
     const snap2 = await getDocs(q2);
     setItems(snap2.docs.map((d) => ({ id: d.id, ...d.data() })));
     await recalcAllTimecodesFromOrder();
@@ -1107,8 +1472,10 @@ export default function Admin() {
   const createOne = async () => {
     try {
       setCreating(true);
-      let imageUrl = "";
-      if (newQ.imageFile) imageUrl = (await uploadImage(newQ.imageFile)) || "";
+      let imageQuestionUrl = "";
+      let imageReponseUrl = "";
+      if (newQ.imageQuestionFile) imageQuestionUrl = (await uploadImage(newQ.imageQuestionFile)) || "";
+      if (newQ.imageReponseFile) imageReponseUrl = (await uploadImage(newQ.imageReponseFile)) || "";
 
       const answers = parseCSV(newQ.answersCsv);
       const timeMusicSec = clampTimeMusicSec(parseHMS(newQ.timeMusicStr));
@@ -1129,28 +1496,48 @@ export default function Admin() {
 
         timeMusicSec,
         timecodeSec: null, // recalculé par recalcAllTimecodesFromOrder
-        imageUrl,
+
+        // 👇 Nouveaux champs
+        imageQuestionUrl,
+        imageReponseUrl,
+
+        // ⚠️ On n’écrit plus imageUrl (déprécié)
+
         createdAt: new Date(),
         order,
         revealPhrases: cleanedRevealPhrases, // [] autorisé → fallback côté clients
+
+        // Quiz propriétaire : quiz sélectionné ou quiz actif, fallback "quiz-test"
+        quizKey: selectedQuizKey || activeQuizKey || "quiz-test",
       });
 
-      setNewQ({ text: "", answersCsv: "", timeMusicStr: "", imageFile: null });
+      setNewQ({
+        text: "",
+        answersCsv: "",
+        timeMusicStr: "",
+        imageQuestionFile: null,
+        imageReponseFile: null,
+      });
       setNewMatchingMode("strict");
       setNewRevealPhrases(["", "", "", "", ""]);
-
-
     } catch (err) {
       console.error("createOne error:", err);
       alert("Échec de la création : " + (err?.message || err));
     } finally {
       setCreating(false);
-      const q = query(collection(db, "LesQuestions"), orderBy("order", "asc"));
-      const snap = await getDocs(q);
+      if (!selectedQuizKey) return;
+      const colRef = collection(db, "LesQuestions");
+      const qRef = query(
+        colRef,
+        where("quizKey", "==", selectedQuizKey),
+        orderBy("order", "asc")
+      );
+      const snap = await getDocs(qRef);
       setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       await recalcAllTimecodesFromOrder();
     }
   };
+
 
   // ============================================================================
   // /pages/admin.js — Partie 5/6
@@ -1377,7 +1764,7 @@ export default function Admin() {
         setTimeout(() => setNotice(null), 1800);
         return;
       }
-      const boundary = Math.max(0, nextRoundStart - 1);
+      const boundary = Math.max(0, nextRoundStart);
 
       // PATCH(Admin): attribuer la question en pause avant de quitter la manche
       await awardCurrentQuestionIfNeeded();
@@ -1755,6 +2142,26 @@ export default function Admin() {
       ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
 
+  // Quiz : ordre des onglets (quiz actif en premier, puis autres par ordre alphabétique)
+  const quizTabsOrdered = useMemo(() => {
+    if (!Array.isArray(quizzes) || quizzes.length === 0) return [];
+    const active = quizzes.find((q) => q && q.key === activeQuizKey) || null;
+    const others = quizzes
+      .filter((q) => !active || q.key !== active.key)
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    return active ? [active, ...others] : others;
+  }, [quizzes, activeQuizKey]);
+
+  const currentQuiz = useMemo(() => {
+    if (!selectedQuizKey || !Array.isArray(quizzes)) return null;
+    return quizzes.find((q) => q.key === selectedQuizKey) || null;
+  }, [selectedQuizKey, quizzes]);
+
+  // On peut changer le quiz actif uniquement quand le gros bouton affiche "Démarrer le quiz"
+  const canChangeActiveQuiz = mainButtonLabel === "Démarrer le quiz";
+
+
   // --- Pause/Reprendre (même visuel qu'avant, juste le label qui bascule) ---
   const canPauseResume = isRunning && !!quizStartMs && !isQuizEnded; // pas avant départ, ni après fin
   const pauseBtnLabel = isPaused ? "Reprendre" : "Pause";
@@ -1808,6 +2215,163 @@ export default function Admin() {
     return new Map(rows.map((r) => [r.id, r._rank]));
   }, [players]);
 
+  // === Actions Quiz (créer / activer / dupliquer / supprimer) ===
+  const handleCreateQuiz = async () => {
+    try {
+      const defaultName = "Nouveau quiz";
+      const name = window.prompt("Nom du nouveau quiz :", defaultName);
+      if (!name) return;
+
+      const baseKey =
+        normKey(name)
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "quiz";
+      const existing = new Set((quizzes || []).map((q) => q.key));
+      let key = baseKey;
+      let i = 2;
+      while (existing.has(key)) {
+        key = `${baseKey}-${i++}`;
+      }
+
+      const newQuiz = { key, name };
+      const nextQuizzes = [...(quizzes || []), newQuiz];
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { quizzes: nextQuizzes },
+        { merge: true }
+      );
+
+      setSelectedQuizKey(key);
+      setAdminTab(`quiz:${key}`);
+    } catch (e) {
+      console.error("handleCreateQuiz error:", e);
+      alert("Échec de la création du quiz : " + (e?.message || e));
+    }
+  };
+
+  const handleSetActiveQuiz = async (quizKey) => {
+    try {
+      if (!canChangeActiveQuiz) return;
+      if (!quizKey || quizKey === activeQuizKey) return;
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { activeQuizKey: quizKey },
+        { merge: true }
+      );
+    } catch (e) {
+      console.error("handleSetActiveQuiz error:", e);
+      alert("Échec du changement de quiz actif : " + (e?.message || e));
+    }
+  };
+
+  const handleDuplicateQuiz = async (sourceKey) => {
+    try {
+      if (!sourceKey) return;
+      const src = (quizzes || []).find((q) => q.key === sourceKey);
+      const baseName = src?.name || "Quiz sans nom";
+      const name = window.prompt("Nom du nouveau quiz :", `${baseName} (copie)`);
+      if (!name) return;
+
+      const baseKey =
+        normKey(name)
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "quiz";
+      const existing = new Set((quizzes || []).map((q) => q.key));
+      let key = baseKey;
+      let i = 2;
+      while (existing.has(key)) {
+        key = `${baseKey}-${i++}`;
+      }
+
+      const newQuiz = { key, name };
+      const nextQuizzes = [...(quizzes || []), newQuiz];
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { quizzes: nextQuizzes },
+        { merge: true }
+      );
+
+      // Dupliquer les questions du quiz source vers le nouveau quiz
+      const colRef = collection(db, "LesQuestions");
+      const snap = await getDocs(
+        query(colRef, where("quizKey", "==", sourceKey))
+      );
+      for (const d of snap.docs) {
+        const data = d.data() || {};
+        const { id: _ignore, ...rest } = data;
+        await addDoc(colRef, {
+          ...rest,
+          quizKey: key,
+          createdAt: new Date(),
+        });
+      }
+
+      setSelectedQuizKey(key);
+      setAdminTab(`quiz:${key}`);
+    } catch (e) {
+      console.error("handleDuplicateQuiz error:", e);
+      alert("Échec de la duplication du quiz : " + (e?.message || e));
+    }
+  };
+
+  const handleDeleteQuiz = async (quizKey) => {
+    try {
+      if (!quizKey) return;
+      const all = quizzes || [];
+      if (all.length <= 1) {
+        alert("Impossible de supprimer le dernier quiz restant.");
+        return;
+      }
+      if (quizKey === activeQuizKey) {
+        alert("Impossible de supprimer le quiz actif. Active d’abord un autre quiz.");
+        return;
+      }
+
+      const src = all.find((q) => q.key === quizKey);
+      const label = src?.name || quizKey;
+      const ok = window.confirm(
+        `Supprimer le quiz « ${label} » et toutes ses questions ?`
+      );
+      if (!ok) return;
+
+      // Supprimer les questions de ce quiz
+      const colRef = collection(db, "LesQuestions");
+      const snap = await getDocs(
+        query(colRef, where("quizKey", "==", quizKey))
+      );
+      for (const d of snap.docs) {
+        await deleteDoc(doc(colRef, d.id));
+      }
+
+      // Mettre à jour la liste des quiz
+      const nextQuizzes = all.filter((q) => q.key !== quizKey);
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { quizzes: nextQuizzes },
+        { merge: true }
+      );
+
+      if (selectedQuizKey === quizKey) {
+        const fallback =
+          (activeQuizKey &&
+            nextQuizzes.some((q) => q.key === activeQuizKey) &&
+            activeQuizKey) ||
+          (nextQuizzes[0] && nextQuizzes[0].key) ||
+          null;
+        if (fallback) {
+          setSelectedQuizKey(fallback);
+          setAdminTab(`quiz:${fallback}`);
+        } else {
+          setSelectedQuizKey(null);
+          setAdminTab("players");
+        }
+      }
+    } catch (e) {
+      console.error("handleDeleteQuiz error:", e);
+      alert("Échec de la suppression du quiz : " + (e?.message || e));
+    }
+  };
+
   /* --- Tableau Questions (mémo) --- */
   const table = useMemo(() => {
     if (loading) return <p>Chargement…</p>;
@@ -1820,11 +2384,13 @@ export default function Admin() {
             <tr>
               <th style={{ width: 110, textAlign: "left", padding: "10px" }}>Ordre</th>
               <th style={{ width: "20%", textAlign: "left", padding: "10px" }}>Question</th>
+              <th style={{ width: "12%", textAlign: "left", padding: "10px" }}>Image question</th>
               <th style={{ width: "30%", textAlign: "left", padding: "10px" }}>Réponses acceptées</th>
-              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>TimeMusic</th>
               <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>TimeCode</th>
-              <th style={{ width: "15%", textAlign: "left", padding: "10px" }}>Image</th>
+              <th style={{ width: "8%", textAlign: "left", padding: "10px" }}>TimeMusic</th>
+              <th style={{ width: "12%", textAlign: "left", padding: "10px" }}>Image réponse</th>
               <th style={{ width: 180, padding: "10px" }}>Actions</th>
+
             </tr>
           </thead>
 
@@ -1876,6 +2442,53 @@ export default function Admin() {
                     />
                   </td>
 
+                  {/* Image question */}
+                  <td style={{ width: "12%", verticalAlign: "top", padding: "12px" }}>
+                    {it.imageQuestionUrl ? (
+                      <div style={{ position: "relative" }}>
+                        <img
+                          src={it.imageQuestionUrl}
+                          alt="image question"
+                          style={{ width: "100%", maxHeight: 120, objectFit: "contain", borderRadius: 6, border: "1px solid #2a2a2a" }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveImageQuestion(it.id)}
+                          disabled={it._imageUploading}
+                          title="Supprimer l’image question (valider avec « Modifier »)"
+                          aria-label="Supprimer l’image question"
+                          style={{
+                            position: "absolute",
+                            top: 6,
+                            right: 6,
+                            width: 24,
+                            height: 24,
+                            borderRadius: 6,
+                            border: "1px solid #2a2a2a",
+                            background: "#111",
+                            color: "#eee",
+                            fontWeight: 800,
+                            lineHeight: "20px",
+                            textAlign: "center",
+                            cursor: it._imageUploading ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 12, opacity: 0.7 }}>Pas d’image</div>
+                    )}
+
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => handleImageChange(it.id, e.target.files?.[0] || null, "imageQuestionUrl")}
+                      disabled={it._imageUploading}
+                      style={{ width: "100%", boxSizing: "border-box", margin: "6px 0 0 0" }}
+                    />
+                  </td>
+
                   <td style={{ width: "30%", verticalAlign: "top", padding: "12px" }}>
                     <input
                       type="text"
@@ -1905,6 +2518,17 @@ export default function Admin() {
                   <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
                     <input
                       type="text"
+                      value={timecodeStr}
+                      readOnly
+                      disabled
+                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0", opacity: 0.7 }}
+                      title="Calculé automatiquement d'après l’ordre et TimeMusic"
+                    />
+                  </td>
+
+                  <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
+                    <input
+                      type="text"
                       value={timeMusicStr}
                       onChange={(e) => handleFieldChange(it.id, "timeMusicStr", e.target.value)}
                       placeholder="ex: 00:00:35"
@@ -1917,37 +2541,58 @@ export default function Admin() {
                     )}
                   </td>
 
-                  <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
-                    <input
-                      type="text"
-                      value={timecodeStr}
-                      readOnly
-                      disabled
-                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0", opacity: 0.7 }}
-                      title="Calculé automatiquement d'après l’ordre et TimeMusic"
-                    />
-                  </td>
 
-                  <td style={{ width: "15%", verticalAlign: "top", padding: "12px" }}>
-                    {it.imageUrl ? (
-                      <div>
+
+
+
+                  {/* Image réponse (fallback lecture ancien imageUrl) */}
+                  <td style={{ width: "12%", verticalAlign: "top", padding: "12px" }}>
+                    {(it.imageReponseUrl || it.imageUrl) ? (
+                      <div style={{ position: "relative" }}>
                         <img
-                          src={it.imageUrl}
-                          alt="illustration"
-                          style={{ width: "100%", maxHeight: 120, objectFit: "contain" }}
+                          src={it.imageReponseUrl || it.imageUrl}
+                          alt="image réponse"
+                          style={{ width: "100%", maxHeight: 120, objectFit: "contain", borderRadius: 6, border: "1px solid #2a2a2a" }}
                         />
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveImageReponse(it.id)}
+                          disabled={it._imageUploading}
+                          title="Supprimer l’image réponse (valider avec « Modifier »)"
+                          aria-label="Supprimer l’image réponse"
+                          style={{
+                            position: "absolute",
+                            top: 6,
+                            right: 6,
+                            width: 24,
+                            height: 24,
+                            borderRadius: 6,
+                            border: "1px solid #2a2a2a",
+                            background: "#111",
+                            color: "#eee",
+                            fontWeight: 800,
+                            lineHeight: "20px",
+                            textAlign: "center",
+                            cursor: it._imageUploading ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          ×
+                        </button>
                       </div>
                     ) : (
                       <div style={{ fontSize: 12, opacity: 0.7 }}>Pas d’image</div>
                     )}
+
                     <input
                       type="file"
                       accept="image/*"
-                      onChange={(e) => handleImageChange(it.id, e.target.files?.[0] || null)}
+                      onChange={(e) => handleImageChange(it.id, e.target.files?.[0] || null, "imageReponseUrl")}
                       disabled={it._imageUploading}
-                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
+                      style={{ width: "100%", boxSizing: "border-box", margin: "6px 0 0 0" }}
                     />
                   </td>
+
+
 
                   <td style={{ textAlign: "center", whiteSpace: "nowrap", verticalAlign: "top", padding: "12px" }}>
                     <button onClick={() => saveOne(it)} disabled={savingId === it.id}>
@@ -2126,6 +2771,34 @@ export default function Admin() {
           ⏱ {formatHMS(elapsedSec)}
         </div>
 
+        {/* Info manche actuelle / suivante */}
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 2,
+            padding: "6px 10px",
+            borderRadius: 8,
+            background: "#020617",
+            border: "1px solid #1f2937",
+            minWidth: 170,
+            fontSize: 12,
+          }}
+        >
+          <div>
+            Manche actuelle : <b>M{currentRoundNumber}</b>
+          </div>
+          <div style={{ opacity: 0.85 }}>
+            Manche suivante :{" "}
+            {nextRoundIndex != null ? <b>M{nextRoundIndex + 1}</b> : <span>—</span>}
+          </div>
+          {atRoundBoundary && (
+            <div style={{ marginTop: 2, color: "#facc15" }}>
+              Fin de manche atteinte
+            </div>
+          )}
+        </div>
+
         {/* M1..M8 avec couleurs */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
@@ -2222,235 +2895,359 @@ export default function Admin() {
         </div>
       )}
 
-      {/* ===== Onglets + contenu ===== */}
+      {/* Bouton global : créer un quiz */}
+      <div style={{ marginTop: 8, marginBottom: 8 }}>
+        <button
+          type="button"
+          onClick={handleCreateQuiz}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 8,
+            border: "1px solid #1f2a2a",
+            background: "#2c5d8bff",
+            color: "#e6eeff",
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          + Créer un quiz
+        </button>
+
+      </div>
+
+      {/* Barre d’onglets */}
       <div
         style={{
-          margin: "24px -20px 8px",
-          background: "#2c5d8bff",
-          color: "white",
-          padding: "10px 20px",
+          marginTop: 8,
+          borderBottom: "1px solid #1f2a44",
+          display: "flex",
+          gap: 8,
+          flexWrap: "wrap",
         }}
       >
-        {/* Barre d’onglets */}
-        <div style={{ marginTop: 16, borderBottom: "1px solid #1f2a44", display: "flex", gap: 8 }}>
-          <button
-            type="button"
-            onClick={() => setAdminTab("players")}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "1px solid #1f2a44",
-              background: adminTab === "players" ? "#0b1e3d" : "transparent",
-              color: "#e6eeff",
-              cursor: "pointer",
-              fontWeight: adminTab === "players" ? 700 : 500,
-            }}
-          >
-            Joueurs
-          </button>
-          <button
-            type="button"
-            onClick={() => setAdminTab("questions")}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "1px solid #1f2a44",
-              background: adminTab === "questions" ? "#0b1e3d" : "transparent",
-              color: "#e6eeff",
-              cursor: "pointer",
-              fontWeight: adminTab === "questions" ? 700 : 500,
-            }}
-          >
-            Questions
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => setAdminTab("players")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #1f2a44",
+            background: adminTab === "players" ? "#2c5d8bff" : "transparent",
+            color: "#e6eeff",
+            cursor: "pointer",
+            fontWeight: adminTab === "players" ? 700 : 500,
+          }}
+        >
+          Joueurs
+        </button>
 
-        {/* Onglet Joueurs */}
-        {adminTab === "players" && (
-          <div style={{ marginTop: 16 }}>
-            <h2 style={{ margin: 0 }}>Joueurs</h2>
-            <div style={{ opacity: 0.9, marginTop: 6 }}>
-              Joueurs connectés : <b>{connectedCount}</b>
-              {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
-            </div>
 
-            {/* Tableau joueurs */}
-            <div style={{ marginTop: 12, overflowX: "auto" }}>
-              <table
-                style={{
-                  width: "100%",
-                  borderCollapse: "collapse",
-                  tableLayout: "fixed",
-                  minWidth: 820,
-                }}
-              >
-                <thead>
-                  <tr style={{ background: "#0b1e3d" }}>
-                    <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueurs</th>
-                    <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score</th>
-                    <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>Statut</th>
-                    <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {players.map((p) => {
-                    const status = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
-                    const statusBg =
-                      p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
-                    const statusColor =
-                      p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
+        {quizTabsOrdered.map((q) => {
+          const tabKey = `quiz:${q.key}`;
+          const isTabSelected = adminTab === tabKey;
+          const isQuizActive = q.key === activeQuizKey;
+          return (
+            <button
+              key={q.key}
+              type="button"
+              onClick={() => {
+                setSelectedQuizKey(q.key);
+                setAdminTab(tabKey);
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid #1f2a44",
+                background: isTabSelected ? "#2c5d8bff" : "transparent",
+                color: "#e6eeff",
+                cursor: "pointer",
+                fontWeight: isTabSelected ? 700 : 500,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
 
-                    const isAliased = !!p.nameLocked || p.nameStatus === "locked";
-                    // Rang (égalité) + médaille
-                    const rank = rankingForAdmin.get(p.id) ?? null;
-                    const s = Number(p.score || 0);
-                    const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+              <span>{q.name}</span>
+              {isQuizActive && <span style={{ color: "#22c55e" }}>✅</span>}
+            </button>
+          );
+        })}
+      </div>
 
-                    return (
-                      <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
-                        <td style={{ padding: "8px" }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                            <span
-                              title={p.color || ""}
-                              style={{
-                                width: 14,
-                                height: 14,
-                                borderRadius: 4,
-                                background: p.color || "#6b7280",
-                                display: "inline-block",
-                                border: "1px solid rgba(255,255,255,0.2)",
-                                flex: "0 0 auto",
-                              }}
-                            />
-                            <span
-                              title={p.name || "(sans nom)"}
-                              style={{
-                                fontWeight: 600,
-                                whiteSpace: "nowrap",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                maxWidth: "100%",
-                                display: "block",
-                              }}
-                            >
-                              {p.name || "(sans nom)"}
-                            </span>
-                          </div>
-                        </td>
 
-                        <td style={{ padding: "8px", textAlign: "center" }} title={rank != null ? `Rang #${rank}` : undefined}>
+      {/* Onglet Joueurs */}
+      {adminTab === "players" && (
+        <div style={{ marginTop: 16 }}>
+          <h2 style={{ margin: 0 }}>Joueurs</h2>
+          <div style={{ opacity: 0.9, marginTop: 6 }}>
+            Joueurs connectés : <b>{connectedCount}</b>
+            {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
+          </div>
+
+          {/* Tableau joueurs */}
+          <div style={{ marginTop: 12, overflowX: "auto" }}>
+            <table
+              style={{
+                width: "100%",
+                borderCollapse: "collapse",
+                tableLayout: "fixed",
+                minWidth: 820,
+              }}
+            >
+              <thead>
+                <tr style={{ background: "#2c5d8bff" }}>
+                  <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueurs</th>
+                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score</th>
+                  <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>Statut</th>
+                  <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {players.map((p) => {
+                  const status = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
+                  const statusBg =
+                    p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
+                  const statusColor =
+                    p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
+
+                  const isAliased = !!p.nameLocked || p.nameStatus === "locked";
+                  // Rang (égalité) + médaille
+                  const rank = rankingForAdmin.get(p.id) ?? null;
+                  const s = Number(p.score || 0);
+                  const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+
+                  return (
+                    <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
+                      <td style={{ padding: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                           <span
+                            title={p.color || ""}
                             style={{
-                              fontVariantNumeric: "tabular-nums",
-                              fontWeight: 800,
-                              letterSpacing: 0.2,
-                            }}
-                          >
-                            {Number(p.score || 0)}
-                          </span>
-                          {medal && <span style={{ marginLeft: 6 }}>{medal}</span>}
-                        </td>
-
-                        <td style={{ padding: "8px", textAlign: "center" }}>
-                          <span
-                            style={{
+                              width: 14,
+                              height: 14,
+                              borderRadius: 4,
+                              background: p.color || "#6b7280",
                               display: "inline-block",
-                              padding: "4px 8px",
-                              borderRadius: 6,
-                              background: statusBg,
-                              color: statusColor,
-                              fontWeight: 700,
+                              border: "1px solid rgba(255,255,255,0.2)",
+                              flex: "0 0 auto",
+                            }}
+                          />
+                          <span
+                            title={p.name || "(sans nom)"}
+                            style={{
+                              fontWeight: 600,
+                              whiteSpace: "nowrap",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              maxWidth: "100%",
+                              display: "block",
                             }}
                           >
-                            {status}
+                            {p.name || "(sans nom)"}
                           </span>
-                        </td>
+                        </div>
+                      </td>
 
-                        <td style={{ padding: "8px" }}>
-                          <button
-                            onClick={() => rejectPlayer(p.id, p.name)}
-                            disabled={p.isKicked || p.nameStatus === "rejected"}
-                            style={{
-                              padding: "6px 10px",
-                              borderRadius: 6,
-                              border: "1px solid #2a2a2a",
-                              background: "#fde68a",
-                              color: "#111827",
-                              fontWeight: 600,
-                              marginRight: 8,
-                              opacity: p.isKicked || p.nameStatus === "rejected" ? 0.6 : 1,
-                              cursor:
-                                p.isKicked || p.nameStatus === "rejected" ? "not-allowed" : "pointer",
-                            }}
-                            title="Refuser ce nom (le joueur devra en choisir un autre)"
-                          >
-                            Refuser
-                          </button>
+                      <td style={{ padding: "8px", textAlign: "center" }} title={rank != null ? `Rang #${rank}` : undefined}>
+                        <span
+                          style={{
+                            fontVariantNumeric: "tabular-nums",
+                            fontWeight: 800,
+                            letterSpacing: 0.2,
+                          }}
+                        >
+                          {Number(p.score || 0)}
+                        </span>
+                        {medal && <span style={{ marginLeft: 6 }}>{medal}</span>}
+                      </td>
 
-                          <button
-                            onClick={() => renameToAlias(p.id)}
-                            disabled={!isRunning || isAliased}
-                            title={
-                              !isRunning
-                                ? "Disponible une fois le quiz lancé"
-                                : isAliased
-                                  ? "Nom modéré (verrouillé)"
-                                  : "Fixer le nom sur « Player N »"
-                            }
-                            style={{
-                              padding: "6px 10px",
-                              borderRadius: 6,
-                              border: "1px solid #2a2a2a",
-                              background: isAliased ? "#e5e7eb" : "#c7d2fe",
-                              color: "#111827",
-                              fontWeight: 600,
-                              opacity: !isRunning || isAliased ? 0.6 : 1,
-                              cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
-                            }}
-                          >
-                            {isAliased ? "Owned :)" : "Player N"}
-                          </button>
+                      <td style={{ padding: "8px", textAlign: "center" }}>
+                        <span
+                          style={{
+                            display: "inline-block",
+                            padding: "4px 8px",
+                            borderRadius: 6,
+                            background: statusBg,
+                            color: statusColor,
+                            fontWeight: 700,
+                          }}
+                        >
+                          {status}
+                        </span>
+                      </td>
 
-                          <button
-                            onClick={() => kickPlayer(p.id)}
-                            disabled={p.isKicked}
-                            style={{
-                              marginLeft: 8,
-                              padding: "6px 10px",
-                              borderRadius: 6,
-                              border: "1px solid #2a2a2a",
-                              background: "#fecaca",
-                              color: "#111827",
-                              fontWeight: 600,
-                              opacity: p.isKicked ? 0.6 : 1,
-                              cursor: p.isKicked ? "not-allowed" : "pointer",
-                            }}
-                            title="Retirer ce joueur de la partie"
-                          >
-                            Kick
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                      <td style={{ padding: "8px" }}>
+                        <button
+                          onClick={() => rejectPlayer(p.id, p.name)}
+                          disabled={p.isKicked || p.nameStatus === "rejected"}
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            border: "1px solid #2a2a2a",
+                            background: "#fde68a",
+                            color: "#111827",
+                            fontWeight: 600,
+                            marginRight: 8,
+                            opacity: p.isKicked || p.nameStatus === "rejected" ? 0.6 : 1,
+                            cursor:
+                              p.isKicked || p.nameStatus === "rejected" ? "not-allowed" : "pointer",
+                          }}
+                          title="Refuser ce nom (le joueur devra en choisir un autre)"
+                        >
+                          Refuser
+                        </button>
 
-                  {players.length === 0 && !playersLoading && (
-                    <tr>
-                      <td colSpan={3} style={{ padding: 12, opacity: 0.7 }}>
-                        Aucun joueur pour l’instant.
+                        <button
+                          onClick={() => renameToAlias(p.id)}
+                          disabled={!isRunning || isAliased}
+                          title={
+                            !isRunning
+                              ? "Disponible une fois le quiz lancé"
+                              : isAliased
+                                ? "Nom modéré (verrouillé)"
+                                : "Fixer le nom sur « Player N »"
+                          }
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            border: "1px solid #2a2a2a",
+                            background: isAliased ? "#e5e7eb" : "#c7d2fe",
+                            color: "#111827",
+                            fontWeight: 600,
+                            opacity: !isRunning || isAliased ? 0.6 : 1,
+                            cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
+                          }}
+                        >
+                          {isAliased ? "Owned :)" : "Player N"}
+                        </button>
+
+                        <button
+                          onClick={() => kickPlayer(p.id)}
+                          disabled={p.isKicked}
+                          style={{
+                            marginLeft: 8,
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            border: "1px solid #2a2a2a",
+                            background: "#fecaca",
+                            color: "#111827",
+                            fontWeight: 600,
+                            opacity: p.isKicked ? 0.6 : 1,
+                            cursor: p.isKicked ? "not-allowed" : "pointer",
+                          }}
+                          title="Retirer ce joueur de la partie"
+                        >
+                          Kick
+                        </button>
                       </td>
                     </tr>
-                  )}
-                </tbody>
-              </table>
+                  );
+                })}
+
+                {players.length === 0 && !playersLoading && (
+                  <tr>
+                    <td colSpan={3} style={{ padding: 12, opacity: 0.7 }}>
+                      Aucun joueur pour l’instant.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Onglet Quiz (questions du quiz sélectionné) */}
+      {adminTab.startsWith("quiz:") && currentQuiz && (
+        <>
+          {/* Statut du quiz + actions Dupliquer / Supprimer */}
+          <div
+            style={{
+              marginTop: 16,
+              marginBottom: 12,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+              alignItems: "flex-start",
+            }}
+          >
+            <button
+              type="button"
+              disabled={!canChangeActiveQuiz || currentQuiz.key === activeQuizKey}
+              onClick={() =>
+                currentQuiz.key !== activeQuizKey
+                  ? handleSetActiveQuiz(currentQuiz.key)
+                  : null
+              }
+              style={{
+                padding: "6px 12px",
+                borderRadius: 8,
+                border: "1px solid #1f2a2a",
+                background:
+                  currentQuiz.key === activeQuizKey ? "#16a34a" : "#b91c1c",
+                color: "#f9fafb",
+                fontWeight: 700,
+                cursor:
+                  !canChangeActiveQuiz || currentQuiz.key === activeQuizKey
+                    ? "not-allowed"
+                    : "pointer",
+                opacity:
+                  !canChangeActiveQuiz && currentQuiz.key !== activeQuizKey
+                    ? 0.7
+                    : 1,
+              }}
+            >
+              {currentQuiz.key === activeQuizKey ? "Quiz actif" : "Quiz inactif"}
+            </button>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => handleDuplicateQuiz(currentQuiz.key)}
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: "1px solid #374151",
+                  background: "#111827",
+                  color: "#e5e7eb",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Dupliquer ce quiz
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteQuiz(currentQuiz.key)}
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: "1px solid #7f1d1d",
+                  background: "#b91c1c",
+                  color: "#f9fafb",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Supprimer ce quiz
+              </button>
             </div>
           </div>
-        )}
 
-        {/* Onglet Questions */}
-        {adminTab === "questions" && (
-          <>
-            <h2 style={{ margin: 0 }}>Créer une nouvelle question</h2>
+          {/* Bloc création + questions sous fond bleu clair */}
+          <div
+            style={{
+              marginTop: 8,
+              padding: 12,
+              borderRadius: 12,
+              background: "#2c5d8bff",
+              border: "1px solid #2d7ec940",
+            }}
+          >
+            <h2 style={{ margin: 0 }}>
+              {currentQuiz.name} — créer une nouvelle question
+            </h2>
 
             <div
               style={{
@@ -2459,6 +3256,7 @@ export default function Admin() {
                 gap: 16,
                 alignItems: "start",
                 maxWidth: 1100,
+                marginTop: 12,
                 marginBottom: 16,
               }}
             >
@@ -2475,11 +3273,27 @@ export default function Admin() {
                 </label>
 
                 <label>
+                  Image question (optionnelle)
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) =>
+                      setNewQ((p) => ({
+                        ...p,
+                        imageQuestionFile: e.target.files?.[0] || null,
+                      }))
+                    }
+                  />
+                </label>
+
+                <label>
                   Réponses acceptées (séparées par des virgules)
                   <input
                     type="text"
                     value={newQ.answersCsv}
-                    onChange={(e) => setNewQ((p) => ({ ...p, answersCsv: e.target.value }))}
+                    onChange={(e) =>
+                      setNewQ((p) => ({ ...p, answersCsv: e.target.value }))
+                    }
                     placeholder="ex: Mario, Super Mario"
                     style={{ width: "100%", boxSizing: "border-box" }}
                   />
@@ -2503,19 +3317,24 @@ export default function Admin() {
                   <input
                     type="text"
                     value={newQ.timeMusicStr}
-                    onChange={(e) => setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))}
+                    onChange={(e) =>
+                      setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))
+                    }
                     placeholder="ex: 00:00:35"
                     style={{ width: "100%", boxSizing: "border-box" }}
                   />
                 </label>
 
                 <label>
-                  Image (optionnelle)
+                  Image réponse (optionnelle)
                   <input
                     type="file"
                     accept="image/*"
                     onChange={(e) =>
-                      setNewQ((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))
+                      setNewQ((p) => ({
+                        ...p,
+                        imageReponseFile: e.target.files?.[0] || null,
+                      }))
                     }
                   />
                 </label>
@@ -2528,13 +3347,27 @@ export default function Admin() {
               </div>
 
               {/* Colonne droite : phrases de révélation */}
-              <fieldset style={{ border: "1px solid #333", padding: 12, borderRadius: 8 }}>
-                <legend style={{ padding: "0 6px" }}>Phrase de réponse aléatoire (max 5)</legend>
+              <fieldset
+                style={{
+                  border: "1px solid #333",
+                  padding: 12,
+                  borderRadius: 8,
+                  background: "rgba(15, 23, 42, 0.65)",
+                }}
+              >
+                <legend style={{ padding: "0 6px" }}>
+                  Phrase de réponse aléatoire (max 5)
+                </legend>
 
                 {newRevealPhrases.map((val, i) => (
                   <div
                     key={i}
-                    style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginBottom: 8,
+                    }}
                   >
                     <label style={{ width: 120 }}>Phrase {i + 1}</label>
                     <input
@@ -2558,9 +3391,122 @@ export default function Admin() {
             </div>
 
             {table}
-          </>
-        )}
-      </div>
+          </div>
+
+        </>
+      )}
+
     </div>
+
   );
-} 
+}
+
+export default function Admin() {
+  const ADMIN_PASSWORD = "ChoupiEleyBoxAdmin";
+
+  const [adminUnlocked, setAdminUnlocked] = useState(false);
+  const [adminPasswordInput, setAdminPasswordInput] = useState("");
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const ok = window.localStorage.getItem("eley_admin_unlocked") === "1";
+      if (ok) {
+        setAdminUnlocked(true);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  if (!adminUnlocked) {
+    return (
+      <div
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#020617",
+          color: "#e5e7eb",
+          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+        }}
+      >
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (adminPasswordInput === ADMIN_PASSWORD) {
+              setAdminUnlocked(true);
+              try {
+                if (typeof window !== "undefined") {
+                  window.localStorage.setItem("eley_admin_unlocked", "1");
+                }
+              } catch {
+                // ignore
+              }
+            } else {
+              alert("Mot de passe incorrect");
+            }
+          }}
+          style={{
+            padding: 24,
+            borderRadius: 12,
+            border: "1px solid #1f2937",
+            background: "#030712",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            minWidth: 260,
+            boxShadow: "0 20px 40px rgba(0,0,0,0.45)",
+          }}
+        >
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>
+            Accès admin
+          </h1>
+          <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
+            Cette page est réservée à l&apos;organisation du quiz.
+          </p>
+
+          <label style={{ fontSize: 14, marginTop: 8 }}>
+            Mot de passe :
+            <input
+              type="password"
+              value={adminPasswordInput}
+              onChange={(e) => setAdminPasswordInput(e.target.value)}
+              style={{
+                marginTop: 4,
+                width: "100%",
+                padding: "6px 8px",
+                borderRadius: 6,
+                border: "1px solid #4b5563",
+                background: "#020617",
+                color: "#e5e7eb",
+                outline: "none",
+              }}
+            />
+          </label>
+
+          <button
+            type="submit"
+            style={{
+              marginTop: 8,
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "none",
+              background: "#22c55e",
+              color: "#022c22",
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            Entrer
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  // Une fois déverrouillé → on rend ton vrai admin
+  return <AdminInner />;
+}
+

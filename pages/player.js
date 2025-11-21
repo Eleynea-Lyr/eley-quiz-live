@@ -557,6 +557,7 @@ export default function Player() {
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
   const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
+  const [activeQuizKey, setActiveQuizKey] = useState(null);
 
   // Joueur / inscription
   const [playerId, setPlayerId] = useState(null);
@@ -577,6 +578,7 @@ export default function Player() {
   const [result, setResult] = useState(null);
   const answerInputRef = useRef(null);
   const lastAnswerQidRef = useRef(null); // sécurité anti-stale
+
   // Horodatage (elapsedSec) de la 1ʳᵉ bonne réponse par question
   const answeredAtRef = useRef({}); // { [qid]: number }
 
@@ -588,11 +590,27 @@ export default function Player() {
   const backInfoRef = useRef({ lastBackQid: null, hadCorrectBeforeBack: false });
   const [backTick, setBackTick] = useState(0); // force un re-render lors d'un Back
 
+  // Reset complet de la session locale (utilisé après un reset Admin + nouveau join)
+  const resetLocalSessionState = () => {
+    // Oublier toutes les questions pour lesquelles on avait déjà bien répondu
+    answeredAtRef.current = {};
+
+    // Oublier les infos de "Back" (question précédente, médaille, etc.)
+    prevElapsedSecRef.current = null;
+    prevQuestionIdRef.current = null;
+    prevQidRef.current = null;
+    backInfoRef.current = { lastBackQid: null, hadCorrectBeforeBack: false };
+
+    // Forcer un petit "tick" pour invalider les dérivés éventuels du Back
+    setBackTick((x) => x + 1);
+  };
+
   // Anti-spam
   const [wrongTimes, setWrongTimes] = useState([]); // timestamps ms des erreurs
   const [cooldownUntilMs, setCooldownUntilMs] = useState(null);
   const [cooldownTick, setCooldownTick] = useState(0);
   const [lockPhraseIndex, setLockPhraseIndex] = useState(null);
+
 
   // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
@@ -817,7 +835,7 @@ export default function Player() {
     return () => unsub();
   }, []);
 
-  // 6) Purge blocklist locale à chaque reset global
+  // 6) Reset local (blocklist + runtime) à chaque reset global
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = snap.data() || {};
@@ -825,30 +843,85 @@ export default function Player() {
       if (t && typeof t.seconds === "number") {
         const ms = t.seconds * 1000 + Math.floor((t.nanoseconds || 0) / 1e6);
         const prev = Number(localStorage.getItem("playersResetAt") || 0);
+
+        // Nouveau reset détecté côté Admin → on resynchronise le joueur local
         if (!Number.isFinite(prev) || ms > prev) {
           localStorage.setItem("playersResetAt", String(ms));
           localStorage.removeItem("rejectedNamesCache");
-          startTransition(() => setRejectedNames([]));
+
+          // 1) Purge de la blocklist locale
+          startTransition(() => {
+            setRejectedNames([]);
+          });
+
+          // 2) Reset complet du runtime de la session (comme après un F5)
+          resetRuntimeForPlayer({
+            answeredAtRef,
+            lastAnswerQidRef,
+            lastInstantWinQidRef,
+            setInstantWin,
+            setResult,
+            setAnswer,
+            setWrongTimes,
+            setCooldownUntilMs,
+            setLockPhraseIndex,
+          });
+
+          // 3) Reset des marqueurs de Back & dérivés locaux
+          resetLocalSessionState();
         }
       }
     });
     return () => unsub();
   }, []);
 
-  // 7) Récupérer les questions
-  useEffect(() => {
-    (async () => {
-      const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
-      const snapshot = await getDocs(q);
-      setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
-    })();
-  }, []);
 
-  // 8) Config (manches + fin + durée de révélation)
+  // 7) Récupérer les questions du quiz ACTIF
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        // Pas de quiz actif → pas de questions (évite le mélange)
+        if (!activeQuizKey) {
+          if (!cancelled) setQuestionsList([]);
+          return;
+        }
+
+        const q = query(
+          collection(db, "LesQuestions"),
+          where("quizKey", "==", activeQuizKey)
+        );
+        const snapshot = await getDocs(q);
+        if (!cancelled) {
+          setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+        }
+      } catch (e) {
+        console.error("[Player] load questions failed:", e);
+        if (!cancelled) setQuestionsList([]);
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeQuizKey]);
+
+
+  // 8) Config (manches + fin + durée de révélation + quiz actif)
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
-      const d = snap.data();
+      const d = snap.data() || {};
       startTransition(() => {
+        // Quiz actif
+        const activeKey =
+          typeof d?.activeQuizKey === "string" && d.activeQuizKey.trim()
+            ? d.activeQuizKey.trim()
+            : null;
+        setActiveQuizKey(activeKey);
+
+        // Fin de quiz & manches
         setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
         setRoundOffsetsSec(
           Array.isArray(d?.roundOffsetsSec)
@@ -861,6 +934,7 @@ export default function Player() {
     });
     return () => unsub();
   }, []);
+
 
   // 8.5) Abonnement players → alimente le leaderboard local
   useEffect(() => {
@@ -993,17 +1067,37 @@ export default function Player() {
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
 
-  let effectiveNextTimeSec = null;
-  let nextKind = null; // "question" | "round" | "end"
+  // Manche qui est en train de se terminer pendant la fenêtre morte
+  const boundaryRoundIndex =
+    Number.isFinite(nextRoundStart)
+      ? roundIndexOfTime(Math.max(0, nextRoundStart - 0.001), roundOffsetsSec)
+      : null;
+
+    let effectiveNextTimeSec = null;
+
+  // On re-considère la frontière de manche (nextRoundBoundary) comme un
+  // "événement" à part entière pour retrouver le compte à rebours
+  // "Fin de la manche X dans :".
+  let nextKind = null; // "question" | "end" | "round"
   const cands = [];
-  if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: "question" });
-  if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: "round" });
-  if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: "end" });
+
+  if (Number.isFinite(nextTimeSec)) {
+    cands.push({ t: nextTimeSec, k: "question" });
+  }
+  if (Number.isFinite(quizEndSec)) {
+    cands.push({ t: quizEndSec, k: "end" });
+  }
+  if (Number.isFinite(nextRoundBoundary)) {
+    cands.push({ t: nextRoundBoundary, k: "round" });
+  }
+
   if (cands.length) {
     const best = cands.reduce((a, b) => (a.t < b.t ? a : b));
     effectiveNextTimeSec = best.t;
     nextKind = best.k;
   }
+
+
 
   // --- Bornes de la question courante
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
@@ -1065,30 +1159,89 @@ export default function Player() {
     : null;
   const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
 
-  // Fin de manche (pause posée par Admin à la frontière)
+    // Fin de manche (pause posée par l’Admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
 
-  // On considère "pause de manche" seulement si on est réellement très proche
-  // de la frontière correspondante (±2s). Sinon, c’est une pause manuelle.
+  // On ne considère "Fin de manche" que si :
+  //  - la pause vient bien d'une auto-pause (endedRoundIndex != null)
+  //  - ET qu'on est encore dans la fenêtre de temps de cette manche
   let isRoundBreak = false;
   if (isPaused && endedRoundIndex != null) {
-    const boundarySec =
-      (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex + 1]))
-        ? roundOffsetsSec[endedRoundIndex + 1]
-        : (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex]))
-          ? roundOffsetsSec[endedRoundIndex]
-          : null;
+    const endedRoundStartSec = Number.isFinite(roundOffsetsSec[endedRoundIndex])
+      ? roundOffsetsSec[endedRoundIndex]
+      : null;
 
-    const atBoundary =
-      Number.isFinite(boundarySec) && Math.abs(elapsedSec - boundarySec) <= 2;
+    let endedRoundEndSec = null;
+    if (endedRoundStartSec != null) {
+      const nextStart = nextRoundStartAfter(endedRoundStartSec, roundOffsetsSec);
+      if (Number.isFinite(nextStart)) {
+        endedRoundEndSec = nextStart;
+      } else if (Number.isFinite(quizEndSec)) {
+        // Dernière manche : on borne par la fin de quiz si connue
+        endedRoundEndSec = quizEndSec;
+      }
+    }
 
-    isRoundBreak = atBoundary;
+    const withinWindow =
+      endedRoundStartSec != null &&
+      elapsedSec >= endedRoundStartSec &&
+      (endedRoundEndSec == null || elapsedSec <= endedRoundEndSec + 0.5);
+
+    if (withinWindow) {
+      isRoundBreak = true;
+    }
   }
 
+
+
   // --- Phases
+  // On force un minimum de temps "question" avant la révélation,
+  // surtout pour la dernière question d'une manche / avant fin de quiz.
   const nextEvent = effectiveNextTimeSec;
-  const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
-  const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
+
+  let revealStart = null;
+  let countdownStart = null;
+
+  if (nextEvent != null) {
+    // Le décompte reste toujours sur les dernières COUNTDOWN_START_SEC secondes.
+    countdownStart = nextEvent - COUNTDOWN_START_SEC;
+
+    const hasQStart = Number.isFinite(qStartEffective);
+
+    if (hasQStart) {
+      const rawRevealStart = nextEvent - revealDurationSec;
+      const MIN_QUESTION_PHASE_SEC = 3; // minimum de temps d'affichage de la question
+
+      // On veut au moins MIN_QUESTION_PHASE_SEC entre qStartEffective et début de la révélation.
+      const minFromQuestion = qStartEffective + MIN_QUESTION_PHASE_SEC;
+
+      let candidate = rawRevealStart;
+
+      // Si le calcul brut remonte trop loin (avant la question),
+      // on remonte le début de la révélation juste après la phase "question".
+      if (!Number.isFinite(candidate) || candidate < minFromQuestion) {
+        candidate = minFromQuestion;
+      }
+
+      // Si jamais on est tellement serrés qu'on chevauche le décompte,
+      // on colle la révélation juste avant le décompte.
+      if (Number.isFinite(countdownStart) && candidate > countdownStart - 0.5) {
+        candidate = countdownStart - 0.5;
+      }
+
+      // Filet de sécurité : on s'assure que la révélation commence
+      // toujours *après* le début effectif de la question.
+      if (candidate <= qStartEffective) {
+        candidate = qStartEffective + 0.5;
+      }
+
+      revealStart = candidate;
+    } else {
+      // Cas de secours si jamais on n'a pas de qStartEffective (devrait être rare)
+      revealStart = nextEvent - revealDurationSec;
+    }
+  }
+
 
   const isQuestionPhase = !uiMasked && Boolean(
     currentQuestion &&
@@ -1191,7 +1344,10 @@ export default function Player() {
 
   // --- Préchargement image du reveal (anti-flicker)
   const [preloadedImage, setPreloadedImage] = useState(null);
-  const currentImageUrl = currentQuestion ? currentQuestion.imageUrl : null;
+  const currentImageUrl = currentQuestion
+    ? (currentQuestion.imageReponseUrl || currentQuestion.imageUrl || null)
+    : null;
+
 
   useEffect(() => {
     setPreloadedImage(null);
@@ -1222,7 +1378,7 @@ export default function Player() {
 
     const nextUrls = [];
     for (let k = idx + 1; k < sorted.length && nextUrls.length < 2; k++) {
-      const u = sorted[k]?.imageUrl;
+      const u = sorted[k]?.imageReponseUrl || sorted[k]?.imageUrl;
       if (typeof u === "string" && u.trim()) nextUrls.push(u);
     }
     if (!nextUrls.length) return;
@@ -2034,7 +2190,7 @@ export default function Player() {
         // Fenêtre morte juste avant la frontière
         <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
           <h2 style={{ fontSize: "clamp(1.2rem, 5.3vw, 1.8rem)", margin: 0 }}>
-            Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
+            Fin de la manche {boundaryRoundIndex != null ? boundaryRoundIndex + 1 : ""}
           </h2>
           <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>(transition…)</div>
         </div>
@@ -2069,9 +2225,43 @@ export default function Player() {
               </div>
             </div>
           ) : isQuestionPhase ? (
-            // Phase question
-            <h2 style={questionH2Style}>{currentQuestion.text}</h2>
+            <>
+              {/* Phase question */}
+              <h2 style={questionH2Style}>{currentQuestion.text}</h2>
+
+              {/* Image question (optionnelle) */}
+              {currentQuestion?.imageQuestionUrl ? (
+                <div
+                  style={{
+                    width: PLAYER_IMG_MAX,
+                    height: PLAYER_IMG_MAX,
+                    maxWidth: "100%",
+                    margin: "16px auto",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "#111",
+                    borderRadius: 8,
+                    overflow: "hidden",
+                  }}
+                >
+                  <img
+                    src={currentQuestion.imageQuestionUrl}
+                    alt="Indice visuel — question"
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "contain",
+                      imageRendering: "auto",
+                    }}
+                    loading="eager"
+                    decoding="async"
+                  />
+                </div>
+              ) : null}
+            </>
           ) : isRevealAnswerPhase ? (
+
             // Révélation de la réponse
             <div style={{ marginTop: 8, marginBottom: 4 }}>
               <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>

@@ -295,7 +295,7 @@ async function ensureAwardsForQuestionTx(qid) {
 // joueurs, config, état global) et timer local synchronisé.
 // ============================================================================
 
-export default function Screen() {
+function ScreenInner() {
   useMobileVH();
 
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
@@ -319,9 +319,11 @@ export default function Screen() {
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
   const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
+  const [activeQuizKey, setActiveQuizKey] = useState(null);
 
   // Image optionnelle au-dessus du QR (config: screenLeftImageUrl)
   const [leftImageUrl, setLeftImageUrl] = useState(null);
+
 
   // Leaderboard
   const [playersLB, setPlayersLB] = useState([]);
@@ -335,8 +337,14 @@ export default function Screen() {
   const serverDeltaRef = useRef(0);
   const [serverDeltaTick, setServerDeltaTick] = useState(0); // re-render léger si besoin
 
-  // Préchargement image pour éviter le flash au reveal
-  const [preloadedImage, setPreloadedImage] = useState(null);
+  // Dernier reset global des joueurs (playersResetAt) déjà pris en compte
+  const lastPlayersResetAtRef = useRef(0);
+
+  // Préchargement images (réponse + question) pour éviter le flash
+  const [preloadedAnswerImage, setPreloadedAnswerImage] = useState(null);
+  const [preloadedQuestionImage, setPreloadedQuestionImage] = useState(null);
+  const [syncHoleSince, setSyncHoleSince] = useState(null);
+
 
   // Table de points (pour afficher +30/+25/+20)
   const [scoringTable, setScoringTable] = useState(DEFAULT_SCORING_TABLE);
@@ -370,13 +378,43 @@ export default function Screen() {
 
   /* --------------------------- Charger les questions --------------------------- */
   useEffect(() => {
-    (async () => {
-      const q = query(collection(db, "LesQuestions"), orderBy("createdAt", "asc"));
-      const snapshot = await getDocs(q);
-      setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
-      setQuestionsLoaded(true);
-    })();
-  }, []);
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        // Pas de quiz actif connu → liste vide mais "loaded" (évite un splash infini)
+        if (!activeQuizKey) {
+          if (!cancelled) {
+            setQuestionsList([]);
+            setQuestionsLoaded(true);
+          }
+          return;
+        }
+
+        const q = query(
+          collection(db, "LesQuestions"),
+          where("quizKey", "==", activeQuizKey)
+        );
+        const snapshot = await getDocs(q);
+        if (!cancelled) {
+          setQuestionsList(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })));
+          setQuestionsLoaded(true);
+        }
+      } catch (e) {
+        console.error("[Screen] load questions failed:", e);
+        if (!cancelled) {
+          setQuestionsList([]);
+          setQuestionsLoaded(true);
+        }
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeQuizKey]);
+
 
   /* ----------------------------- Écouter players ------------------------------ */
   useEffect(() => {
@@ -404,9 +442,18 @@ export default function Screen() {
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "config"), (snap) => {
       const d = snap.data() || {};
+
+      // Quiz actif
+      const activeKey =
+        typeof d?.activeQuizKey === "string" && d.activeQuizKey.trim()
+          ? d.activeQuizKey.trim()
+          : null;
+      setActiveQuizKey(activeKey);
+
       // taille du top
       const topN = Number.isFinite(d?.leaderboardTopN) ? d.leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
       setLeaderboardTopN(topN);
+
       // bornes quiz & manches
       setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
       setRoundOffsetsSec(
@@ -424,17 +471,36 @@ export default function Screen() {
           : (LEFT_GENERIC_IMG_SRC || null)
       );
 
-
       setConfigLoaded(true);
-
     });
     return () => unsub();
   }, []);
+
 
   /* ------------------------------ Écouter /state ------------------------------ */
   useEffect(() => {
     const unsub = onSnapshot(doc(db, "quiz", "state"), (snap) => {
       const d = (snap && snap.data()) || {};
+
+      // Reset runtime local si un nouveau reset global est détecté
+      const tReset = d.playersResetAt;
+      if (tReset && typeof tReset.seconds === "number") {
+        const ms =
+          tReset.seconds * 1000 +
+          Math.floor((tReset.nanoseconds || tReset.nanos || 0) / 1e6);
+
+        // Nouveau reset vu → on vide toutes les sentinelles locales de session
+        if (ms > lastPlayersResetAtRef.current) {
+          lastPlayersResetAtRef.current = ms;
+
+          // Gardes TX (awards), top live, images et timer local
+          awardGuardRef.current = {};
+          setLiveFirsts([]);
+          setPreloadedAnswerImage(null);
+          setPreloadedQuestionImage(null);
+          setElapsedSec(0);
+        }
+      }
 
       // startMs depuis ancrage (anchorAt + anchorOffsetSec) si présent ; fallback legacy
       let startMs = null;
@@ -604,7 +670,7 @@ export default function Screen() {
     return rows.slice(0, top);
   }, [playersLB, leaderboardTopN]);
 
-  // Podium (fin de quiz) : groupes par médailles avec égalités (> 0 pts)
+  // Podium (fin de quiz) : basé sur les RANGS (1, 2, 3) comme dans le classement
   const podium = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
@@ -614,19 +680,38 @@ export default function Screen() {
         score: Number(p.score || 0),
         _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
       }))
-      .sort((a, b) => (a.score !== b.score ? b.score - a.score : a._nameKey.localeCompare(b._nameKey)));
+      .sort((a, b) => {
+        // Tri identique au leaderboard : score desc, puis nom
+        if (a.score !== b.score) return b.score - a.score;
+        return a._nameKey.localeCompare(b._nameKey);
+      });
 
-    const distinct = Array.from(new Set(rows.map((r) => r.score))).filter((s) => s > 0);
-    const goldScore = distinct[0];
-    const silverScore = distinct[1];
-    const bronzeScore = distinct[2];
+    // Calcul des rangs "compétition" : 1,1,3,4…
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = Number(p.score || 0);
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;
+      } else {
+        p._rank = i + 1;
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
 
-    return {
-      gold: typeof goldScore === "number" ? rows.filter((r) => r.score === goldScore) : [],
-      silver: typeof silverScore === "number" ? rows.filter((r) => r.score === silverScore) : [],
-      bronze: typeof bronzeScore === "number" ? rows.filter((r) => r.score === bronzeScore) : [],
-    };
+    // Groupes de médailles alignés sur le classement
+    const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
+    const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
+    const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
+
+    return { gold, silver, bronze };
   }, [playersLB]);
+
 
   /* ---------------- Dérivés & logique bornée par la manche ---------------- */
   const sorted = [...questionsList].sort((a, b) => getTimeSec(a) - getTimeSec(b));
@@ -686,20 +771,37 @@ export default function Screen() {
     secondsToRoundBoundary <= ROUND_DEADZONE_SEC &&
     secondsToRoundBoundary >= -0.25;
 
+  const boundaryRoundIndex =
+    Number.isFinite(nextRoundStart)
+      ? roundIndexOfTime(Math.max(0, nextRoundStart - 0.001), roundOffsetsSec)
+      : null;
+
   // Candidat minimal
+  // On re-considère la frontière de manche (nextRoundBoundary) comme un
+  // "événement" à part entière pour retrouver le compte à rebours
+  // "Fin de la manche X dans :".
   let effectiveNextTimeSec = null;
-  let nextKind = null; // "question" | "round" | "end"
+  let nextKind = null; // "question" | "end" | "round"
   {
     const cands = [];
-    if (Number.isFinite(nextTimeSec)) cands.push({ t: nextTimeSec, k: "question" });
-    if (Number.isFinite(nextRoundBoundary)) cands.push({ t: nextRoundBoundary, k: "round" });
-    if (Number.isFinite(quizEndSec)) cands.push({ t: quizEndSec, k: "end" });
+    if (Number.isFinite(nextTimeSec)) {
+      cands.push({ t: nextTimeSec, k: "question" });
+    }
+    if (Number.isFinite(quizEndSec)) {
+      cands.push({ t: quizEndSec, k: "end" });
+    }
+    if (Number.isFinite(nextRoundBoundary)) {
+      cands.push({ t: nextRoundBoundary, k: "round" });
+    }
+
     if (cands.length) {
       const best = cands.reduce((a, b) => (a.t < b.t ? a : b));
       effectiveNextTimeSec = best.t;
       nextKind = best.k;
     }
   }
+
+
 
   /* ------------------------- Phases & bornes locales ------------------------ */
   const qStart = Number.isFinite(getTimeSec(currentQuestion)) ? getTimeSec(currentQuestion) : null;
@@ -750,27 +852,86 @@ export default function Screen() {
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
 
-  // "Pause de manche" uniquement si on est réellement collé à la frontière (±2s).
+  // On ne considère "Fin de manche" que si :
+  //  - la pause vient bien d'une auto-pause (endedRoundIndex != null)
+  //  - ET qu'on est encore dans la fenêtre de temps de cette manche
   let isRoundBreak = false;
   if (isPaused && endedRoundIndex != null && !isQuizEnded) {
-    const boundarySec =
-      (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex + 1]))
-        ? roundOffsetsSec[endedRoundIndex + 1]
-        : (Array.isArray(roundOffsetsSec) && Number.isFinite(roundOffsetsSec[endedRoundIndex]))
-          ? roundOffsetsSec[endedRoundIndex]
-          : null;
+    const endedRoundStartSec = Number.isFinite(roundOffsetsSec[endedRoundIndex])
+      ? roundOffsetsSec[endedRoundIndex]
+      : null;
 
-    const atBoundary =
-      Number.isFinite(boundarySec) && Math.abs(elapsedSec - boundarySec) <= 2;
+    let endedRoundEndSec = null;
+    if (endedRoundStartSec != null) {
+      const nextStart = nextRoundStartAfter(endedRoundStartSec, roundOffsetsSec);
+      if (Number.isFinite(nextStart)) {
+        endedRoundEndSec = nextStart;
+      } else if (Number.isFinite(quizEndSec)) {
+        // Dernière manche : on borne par la fin de quiz si connue
+        endedRoundEndSec = quizEndSec;
+      }
+    }
 
-    isRoundBreak = atBoundary;
+    const withinWindow =
+      endedRoundStartSec != null &&
+      elapsedSec >= endedRoundStartSec &&
+      (endedRoundEndSec == null || elapsedSec <= endedRoundEndSec + 0.5);
+
+    if (withinWindow) {
+      isRoundBreak = true;
+    }
   }
 
 
+
+
   // Phases bornées (anti-flash)
+  // On force un minimum de temps "question" avant la révélation,
+  // surtout pour la dernière question d'une manche / avant fin de quiz.
   const nextEvent = effectiveNextTimeSec;
-  const revealStart = nextEvent != null ? nextEvent - revealDurationSec : null;
-  const countdownStart = nextEvent != null ? nextEvent - COUNTDOWN_START_SEC : null;
+
+  let revealStart = null;
+  let countdownStart = null;
+
+  if (nextEvent != null) {
+    // Le décompte reste toujours sur les dernières COUNTDOWN_START_SEC secondes.
+    countdownStart = nextEvent - COUNTDOWN_START_SEC;
+
+    const hasQStart = Number.isFinite(qStartEffective);
+
+    if (hasQStart) {
+      const rawRevealStart = nextEvent - revealDurationSec;
+      const MIN_QUESTION_PHASE_SEC = 3; // minimum de temps d'affichage de la question
+
+      // On veut au moins MIN_QUESTION_PHASE_SEC entre qStartEffective et début de la révélation.
+      const minFromQuestion = qStartEffective + MIN_QUESTION_PHASE_SEC;
+
+      let candidate = rawRevealStart;
+
+      // Si le calcul brut remonte trop loin (avant la question),
+      // on remonte le début de la révélation juste après la phase "question".
+      if (!Number.isFinite(candidate) || candidate < minFromQuestion) {
+        candidate = minFromQuestion;
+      }
+
+      // Si jamais on est tellement serrés qu'on chevauche le décompte,
+      // on colle la révélation juste avant le décompte.
+      if (Number.isFinite(countdownStart) && candidate > countdownStart - 0.5) {
+        candidate = countdownStart - 0.5;
+      }
+
+      // Filet de sécurité : on s'assure que la révélation commence
+      // toujours *après* le début effectif de la question.
+      if (candidate <= qStartEffective) {
+        candidate = qStartEffective + 0.5;
+      }
+
+      revealStart = candidate;
+    } else {
+      // Cas de secours si jamais on n'a pas de qStartEffective (devrait être rare)
+      revealStart = nextEvent - revealDurationSec;
+    }
+  }
 
   const isRoundIntroPhase = !uiMasked && Boolean(
     isFirstQuestionOfRound &&
@@ -864,6 +1025,34 @@ export default function Screen() {
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
 
+  // URLs images (question / réponse) avec fallbacks :
+  // - questionImgUrl : seulement les champs dédiés "image question" (jamais l'ancien 'image')
+  // - answerImgUrl   : champs dédiés "image réponse", puis (legacy) 'imageUrl' / 'image'
+  const questionImgUrl = useMemo(() => {
+    const q = currentQuestion || {};
+    // champs possibles côté Admin pour l'image de la question
+    return (
+      (typeof q.questionImageUrl === "string" && q.questionImageUrl.trim()) ||
+      (typeof q.imageQuestionUrl === "string" && q.imageQuestionUrl.trim()) ||
+      (typeof q.imageQuestion === "string" && q.imageQuestion.trim()) ||
+      null
+    );
+  }, [currentQuestionId]);
+
+  const answerImgUrl = useMemo(() => {
+    const q = currentQuestion || {};
+    // champs dédiés "image réponse", puis compat avec anciens champs
+    return (
+      (typeof q.answerImageUrl === "string" && q.answerImageUrl.trim()) ||
+      (typeof q.imageReponseUrl === "string" && q.imageReponseUrl.trim()) ||
+      (typeof q.imageReponse === "string" && q.imageReponse.trim()) ||
+      (typeof q.imageUrl === "string" && q.imageUrl.trim()) || // legacy
+      (typeof q.image === "string" && q.image.trim()) || // très legacy ("image" tout court)
+      null
+    );
+  }, [currentQuestionId]);
+
+
   // Abonnement live aux 3 premiers joueurs ayant trouvé (pendant la phase question)
   useEffect(() => {
     // Reset à chaque nouvelle question ou si on sort de la phase "question"
@@ -919,30 +1108,97 @@ export default function Screen() {
   // Pré-start
   const showPreStart = !(quizStartMs && isRunning);
 
+  // Watchdog de synchronisation :
+  // si on reste coincé trop longtemps sans question alors que le quiz tourne,
+  // on force un reload doux pour se recaler.
+  useEffect(() => {
+    const inSyncHole =
+      isRunning &&
+      !isPaused &&
+      !isQuizEnded &&
+      earliestTimeSec != null &&
+      elapsedSec >= earliestTimeSec + 2 && // on laisse 2s de marge
+      !currentQuestion;
+
+    if (!inSyncHole) {
+      if (syncHoleSince !== null) {
+        setSyncHoleSince(null);
+      }
+      return;
+    }
+
+    // Première fois qu'on détecte le trou de synchro → on démarre le chrono
+    if (syncHoleSince === null) {
+      setSyncHoleSince(Date.now());
+      return;
+    }
+
+    // Si ça dure plus de 4s → reload automatique
+    const elapsedMs = Date.now() - syncHoleSince;
+    if (elapsedMs > 2000) {
+      try {
+        window.location.reload();
+      } catch {
+        // no-op si le contexte ne permet pas le reload
+      }
+    }
+  }, [
+    isRunning,
+    isPaused,
+    isQuizEnded,
+    earliestTimeSec,
+    elapsedSec,
+    currentQuestion,
+    syncHoleSince,
+  ]);
+
+
   // Variables spécifiques au leaderboard pendant reveal
   const currentQuestionIdForLB = currentQuestionId;
   const inRevealWindowForLB = Boolean(isRevealAnswerPhase || isCountdownPhase);
 
-  // Préchargement image (anti-flicker au reveal)
+  // Préchargement image RÉPONSE (anti-flicker au reveal)
   useEffect(() => {
-    setPreloadedImage(null);
-    const url = currentQuestion?.imageUrl;
+    setPreloadedAnswerImage(null);
+    const url = answerImgUrl;
     if (!url) return;
 
     let cancelled = false;
     const img = new Image();
     img.src = url;
 
-    const markReady = () => { if (!cancelled) setPreloadedImage(url); };
+    const markReady = () => { if (!cancelled) setPreloadedAnswerImage(url); };
 
     if (typeof img.decode === "function") {
       img.decode().then(markReady).catch(markReady);
     } else {
       img.onload = markReady;
-      img.onerror = () => { if (!cancelled) setPreloadedImage(null); };
+      img.onerror = () => { if (!cancelled) setPreloadedAnswerImage(null); };
     }
     return () => { cancelled = true; };
-  }, [currentQuestionId]);
+  }, [answerImgUrl, currentQuestionId]);
+
+  // Préchargement image QUESTION (anti-flicker pendant la phase question)
+  useEffect(() => {
+    setPreloadedQuestionImage(null);
+    const url = questionImgUrl;
+    if (!url) return;
+
+    let cancelled = false;
+    const img = new Image();
+    img.src = url;
+
+    const markReady = () => { if (!cancelled) setPreloadedQuestionImage(url); };
+
+    if (typeof img.decode === "function") {
+      img.decode().then(markReady).catch(markReady);
+    } else {
+      img.onload = markReady;
+      img.onerror = () => { if (!cancelled) setPreloadedQuestionImage(null); };
+    }
+    return () => { cancelled = true; };
+  }, [questionImgUrl, currentQuestionId]);
+
 
 
   // UI mask : neutralise les transitions CSS le temps du voile
@@ -1236,7 +1492,7 @@ export default function Screen() {
         ) : inRoundBoundaryWindow ? (
           <div style={{ marginTop: 8, marginBottom: 4 }}>
             <h1 style={{ fontSize: "2rem", margin: 0 }}>
-              Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
+              Fin de la manche {boundaryRoundIndex != null ? boundaryRoundIndex + 1 : ""}
             </h1>
             <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>(transition…)</div>
           </div>
@@ -1283,6 +1539,38 @@ export default function Screen() {
                 {currentQuestion.text}
               </h1>
             )}
+
+            {/* Image pendant la PHASE QUESTION (champs dédiés) */}
+            {isQuestionPhase && questionImgUrl ? (
+              <div
+                style={{
+                  width: SCREEN_IMG_MAX,
+                  height: SCREEN_IMG_MAX,
+                  maxWidth: "100%",
+                  margin: "16px auto 8px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "#111",
+                  borderRadius: 8,
+                  overflow: "hidden",
+                }}
+              >
+                <img
+                  src={questionImgUrl}
+                  alt="Indice visuel — question"
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    imageRendering: "auto",
+                  }}
+                  loading="eager"
+                  decoding="async"
+                />
+              </div>
+            ) : null}
+
 
             {/* Barre de temps sous la question */}
             {canShowTimeBar && (
@@ -1371,8 +1659,8 @@ export default function Screen() {
 
 
 
-            {/* Image pendant la révélation */}
-            {isRevealAnswerPhase && currentQuestion?.imageUrl ? (
+            {/* Image pendant la RÉVÉLATION (réponse) */}
+            {isRevealAnswerPhase && answerImgUrl ? (
               <div
                 style={{
                   width: SCREEN_IMG_MAX,
@@ -1388,20 +1676,21 @@ export default function Screen() {
                 }}
               >
                 <img
-                  src={currentQuestion.imageUrl}
+                  src={answerImgUrl}
                   alt="Révélation — œuvre"
                   style={{
                     width: "100%",
                     height: "100%",
                     objectFit: "contain",
                     imageRendering: "auto",
-                    visibility: preloadedImage ? "visible" : "hidden",
                   }}
                   loading="lazy"
                   decoding="async"
                 />
+
               </div>
             ) : null}
+
           </>
         ) : (
           <>
@@ -1555,4 +1844,115 @@ export default function Screen() {
       </aside>
     </div>
   );
+}
+
+export default function Screen() {
+  const SCREEN_PASSWORD = "ChoupiEleyBoxScreen";
+
+  const [screenUnlocked, setScreenUnlocked] = useState(false);
+  const [screenPasswordInput, setScreenPasswordInput] = useState("");
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const ok = window.localStorage.getItem("eley_screen_unlocked") === "1";
+      if (ok) {
+        setScreenUnlocked(true);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  if (!screenUnlocked) {
+    return (
+      <div
+        style={{
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "#000814",
+          color: "#e5e7eb",
+          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+          padding: 16,
+        }}
+      >
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (screenPasswordInput === SCREEN_PASSWORD) {
+              setScreenUnlocked(true);
+              try {
+                if (typeof window !== "undefined") {
+                  window.localStorage.setItem("eley_screen_unlocked", "1");
+                }
+              } catch {
+                // ignore
+              }
+            } else {
+              alert("Mot de passe incorrect");
+            }
+          }}
+          style={{
+            padding: 24,
+            borderRadius: 12,
+            border: "1px solid #1f2937",
+            background: "#020617",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            minWidth: 260,
+            maxWidth: 360,
+            boxShadow: "0 20px 40px rgba(0,0,0,0.45)",
+          }}
+        >
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, textAlign: "center" }}>
+            Accès écran scène
+          </h1>
+          <p style={{ margin: 0, fontSize: 13, opacity: 0.8, textAlign: "center" }}>
+            Réservé à l&apos;écran de projection du quiz.
+          </p>
+
+          <label style={{ fontSize: 14, marginTop: 8 }}>
+            Mot de passe :
+            <input
+              type="password"
+              value={screenPasswordInput}
+              onChange={(e) => setScreenPasswordInput(e.target.value)}
+              style={{
+                marginTop: 4,
+                width: "100%",
+                padding: "6px 8px",
+                borderRadius: 6,
+                border: "1px solid #4b5563",
+                background: "#020617",
+                color: "#e5e7eb",
+                outline: "none",
+              }}
+            />
+          </label>
+
+          <button
+            type="submit"
+            style={{
+              marginTop: 8,
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: "none",
+              background: "#3b82f6",
+              color: "#0b1120",
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            Afficher l&apos;écran
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  // Une fois déverrouillé → on rend ton vrai écran public
+  return <ScreenInner />;
 }
