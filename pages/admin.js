@@ -1,12 +1,11 @@
 // ============================================================================
 // /pages/admin.js — Partie 1/6
-// Scope : Imports + Couleurs & helpers joueurs + Defaults globales +
-//         ensureConfigDefaults + cache scoring + TX d’attribution (awards)
-// Règles : aucune modification fonctionnelle ; uniquement cosmétique (titres,
-//          séparateurs, indentation/espaces, commentaires d’ancrage).
+// Scope : Imports + couleurs & helpers joueurs + constantes globales +
+//         config Firestore par défaut + cache scoring + attribution TX +
+//         toggle Pause/Reprendre.
+// Règles : aucune modification fonctionnelle ; uniquement mise en forme/commentaires.
 // ============================================================================
 
-// [1.1] Imports
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db, storage } from "../lib/firebase";
 import {
@@ -32,15 +31,29 @@ import {
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
-
+// ============================================================================
 // [1.2] Couleurs & helpers joueurs
+// ============================================================================
+
 /* ========================= COULEURS & HELPERS JOUEURS ========================= */
 
 const PLAYER_COLORS = [
-  "#f87171", "#fb923c", "#fbbf24", "#a3e635",
-  "#34d399", "#22d3ee", "#60a5fa", "#818cf8",
-  "#a78bfa", "#f472b6", "#fda4af", "#f59e0b",
-  "#10b981", "#06b6d4", "#3b82f6", "#8b5cf6",
+  "#f87171",
+  "#fb923c",
+  "#fbbf24",
+  "#a3e635",
+  "#34d399",
+  "#22d3ee",
+  "#60a5fa",
+  "#818cf8",
+  "#a78bfa",
+  "#f472b6",
+  "#fda4af",
+  "#f59e0b",
+  "#10b981",
+  "#06b6d4",
+  "#3b82f6",
+  "#8b5cf6",
 ];
 
 // Normalisation alpha (casse/accents-insensible)
@@ -51,53 +64,77 @@ function normKey(s) {
     .toLowerCase()
     .trim();
 }
+
+// Couleur de joueur, en évitant de répéter la précédente si possible
 function pickColorDifferent(prev) {
   const pool = PLAYER_COLORS.filter((c) => c !== prev);
   const bag = pool.length ? pool : PLAYER_COLORS;
   return bag[Math.floor(Math.random() * bag.length)];
 }
 
-
+// ============================================================================
 // [1.3] Defaults & constantes globales
+// ============================================================================
+
 /* ========================= DEFAULTS & CONSTANTES GLOBALES ========================= */
 
-const DEFAULT_SCORING_TABLE = [30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-const DEFAULT_REVEAL_DURATION_SEC = 20;   // 15s affichage + 5s décompte
+const DEFAULT_SCORING_TABLE = [
+  30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+  1,
+];
+
+const DEFAULT_REVEAL_DURATION_SEC = 20; // 15s affichage + 5s décompte
 const DEFAULT_LEADERBOARD_TOP_N = 20;
 
-const TIME_MUSIC_MIN_SEC = 20;     // reveal incompressible
+const TIME_MUSIC_MIN_SEC = 20; // reveal incompressible
 const DEFAULT_TIME_MUSIC_SEC = 35; // ex: 15s jeu + 20s reveal
 
+// Pour changer la durée par défaut de la musique, modifier DEFAULT_TIME_MUSIC_SEC.
 function clampTimeMusicSec(sec) {
   const n = Number(sec);
   if (!Number.isFinite(n)) return DEFAULT_TIME_MUSIC_SEC;
   return Math.max(TIME_MUSIC_MIN_SEC, Math.floor(n));
 }
 
-
+// ============================================================================
 // [1.4] Config par défaut (idempotent)
-/* =================== CONFIG PAR DÉFAUT (IDEMPOTENT) =================== */
+// ============================================================================
 
+/* =================== CONFIG PAR DÉFAUT (IDEMPOTENT) =================== */
+/**
+ * S'assure que le doc "quiz/config" existe et contient au minimum :
+ * - scoringTable
+ * - revealDurationSec
+ * - leaderboardTopN
+ * - quizzes[] avec un quiz par défaut
+ * - activeQuizKey
+ * + backfill des questions existantes (quizKey par défaut si manquant).
+ */
 async function ensureConfigDefaults() {
   const cfgRef = doc(db, "quiz", "config");
   const snap = await getDoc(cfgRef);
   const data = snap.exists() ? snap.data() : {};
-
   const patch = {};
 
   // Defaults existants
   if (!("scoringTable" in data)) patch.scoringTable = DEFAULT_SCORING_TABLE;
-  if (!("revealDurationSec" in data)) patch.revealDurationSec = DEFAULT_REVEAL_DURATION_SEC;
-  if (!("leaderboardTopN" in data)) patch.leaderboardTopN = DEFAULT_LEADERBOARD_TOP_N;
+  if (!("revealDurationSec" in data)) {
+    patch.revealDurationSec = DEFAULT_REVEAL_DURATION_SEC;
+  }
+  if (!("leaderboardTopN" in data)) {
+    patch.leaderboardTopN = DEFAULT_LEADERBOARD_TOP_N;
+  }
 
-  // === Nouveau : gestion des quiz ===
+  // === Gestion des quizzes ===
   // Clé par défaut pour le premier quiz (ancien onglet "Questions")
   const defaultQuizKey =
     typeof data.activeQuizKey === "string" && data.activeQuizKey
       ? data.activeQuizKey
       : "quiz-test";
 
-  let quizzes = Array.isArray(data.quizzes) ? data.quizzes.filter((q) => q && q.key && q.name) : [];
+  let quizzes = Array.isArray(data.quizzes)
+    ? data.quizzes.filter((q) => q && q.key && q.name)
+    : [];
 
   if (!quizzes.length) {
     // Premier quiz : "Quiz test"
@@ -126,9 +163,14 @@ async function ensureConfigDefaults() {
   await backfillQuestionsQuizKey(defaultQuizKey);
 }
 
+/**
+ * Ajoute quizKey = defaultQuizKey à toutes les questions de LesQuestions
+ * qui n'ont pas encore de quizKey.
+ */
 async function backfillQuestionsQuizKey(defaultQuizKey) {
   try {
     if (!defaultQuizKey) return;
+
     const colRef = collection(db, "LesQuestions");
     const snap = await getDocs(colRef);
 
@@ -139,14 +181,21 @@ async function backfillQuestionsQuizKey(defaultQuizKey) {
 
     if (!docsToFix.length) return;
 
-    console.log("[Admin] backfill quizKey on", docsToFix.length, "questions");
+    console.log(
+      "[Admin] backfill quizKey on",
+      docsToFix.length,
+      "questions"
+    );
 
+    // Batch par blocs de 400 pour rester safe côté Firestore
     while (docsToFix.length) {
       const chunk = docsToFix.splice(0, 400);
       const batch = writeBatch(db);
+
       chunk.forEach((docSnap) => {
         batch.update(doc(colRef, docSnap.id), { quizKey: defaultQuizKey });
       });
+
       await batch.commit();
     }
   } catch (e) {
@@ -154,19 +203,30 @@ async function backfillQuestionsQuizKey(defaultQuizKey) {
   }
 }
 
-
+// ============================================================================
 // [1.5] Scoring (cache)
+// ============================================================================
+
 /* ========== SCORING (CACHE) ========== */
 
 let _cachedScoringTable = null;
+
+/**
+ * Récupère la table de points (scoringTable) depuis quiz/config,
+ * avec un petit cache en mémoire côté Admin.
+ */
 async function getScoringTableAdmin() {
   if (_cachedScoringTable) return _cachedScoringTable;
+
   try {
     const cfgRef = doc(db, "quiz", "config");
     const snap = await getDoc(cfgRef);
-    const tbl = (snap.exists() && Array.isArray(snap.data().scoringTable))
-      ? snap.data().scoringTable
-      : DEFAULT_SCORING_TABLE;
+
+    const tbl =
+      snap.exists() && Array.isArray(snap.data().scoringTable)
+        ? snap.data().scoringTable
+        : DEFAULT_SCORING_TABLE;
+
     _cachedScoringTable = tbl;
     return tbl;
   } catch (e) {
@@ -176,16 +236,24 @@ async function getScoringTableAdmin() {
   }
 }
 
-
+// ============================================================================
 // [1.6] Attribution transactionnelle (anti-doublons)
+// ============================================================================
+
 /* ========== ATTRIBUTION TRANSACTIONNELLE (ANTI-DOUBLONS) ========== */
-// PATCH(Admin): robust awards TX (aligné sur Screen)
+/**
+ * Attribue les points pour une question donnée (qid) en se basant sur
+ * les bonnes réponses (isCorrect = true) dans answers/{qid}/submissions.
+ * - Trie localement par timestamp (plusieurs champs possibles).
+ * - Aligne la logique sur Screen (TX robuste + idempotente).
+ */
 async function ensureAwardsForQuestionTx(qid) {
   if (!qid) return { ok: false, reason: "no-qid" };
 
   // 1) Lire toutes les bonnes réponses (sans orderBy)
   const subsCol = collection(db, "answers", qid, "submissions");
   let subsSnap;
+
   try {
     subsSnap = await getDocs(query(subsCol, where("isCorrect", "==", true)));
   } catch (e) {
@@ -197,14 +265,26 @@ async function ensureAwardsForQuestionTx(qid) {
   function toMs(obj) {
     if (!obj) return Infinity;
     if (typeof obj.toMillis === "function") return obj.toMillis();
+
     if (typeof obj.seconds === "number") {
-      return obj.seconds * 1000 + Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6);
+      return (
+        obj.seconds * 1000 +
+        Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6)
+      );
     }
-    if (typeof obj === "number" && Number.isFinite(obj)) return Math.floor(obj);
+
+    if (typeof obj === "number" && Number.isFinite(obj)) {
+      return Math.floor(obj);
+    }
+
     return Infinity;
   }
 
-  const raw = subsSnap.docs.map(d => ({ id: d.id, data: d.data() || {} }));
+  const raw = subsSnap.docs.map((d) => ({
+    id: d.id,
+    data: d.data() || {},
+  }));
+
   const ranked = raw
     .map(({ id, data }) => {
       const candidates = [
@@ -216,7 +296,7 @@ async function ensureAwardsForQuestionTx(qid) {
       const t = Math.min(...candidates);
       return { id, t };
     })
-    .filter(x => Number.isFinite(x.t))
+    .filter((x) => Number.isFinite(x.t))
     .sort((a, b) => a.t - b.t);
 
   if (ranked.length === 0) {
@@ -231,36 +311,60 @@ async function ensureAwardsForQuestionTx(qid) {
   // 3) TX: idempotence + attributions
   return await runTransaction(db, async (tx) => {
     const snap = await tx.get(qDocRef);
+
     if (snap.exists() && snap.data()?.awarded === true) {
       return { ok: true, reason: "already-awarded" };
     }
 
-    tx.set(qDocRef, {
-      awarded: true,
-      awardedAt: serverTimestamp(),
-      awardedCount: ranked.length,
-    }, { merge: true });
+    tx.set(
+      qDocRef,
+      {
+        awarded: true,
+        awardedAt: serverTimestamp(),
+        awardedCount: ranked.length,
+      },
+      { merge: true }
+    );
 
     for (let i = 0; i < ranked.length; i++) {
       const pid = ranked[i].id;
       const points = table[i] ?? 0;
 
-      tx.set(doc(db, "answers", qid, "awards", pid), {
-        points, rank: i + 1, awardedAt: serverTimestamp()
-      }, { merge: true });
+      tx.set(
+        doc(db, "answers", qid, "awards", pid),
+        {
+          points,
+          rank: i + 1,
+          awardedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
 
-      tx.set(doc(playersCol, pid), {
-        score: increment(points),
-        lastDelta: points,
-        lastDeltaForQuestionId: qid,
-      }, { merge: true });
+      tx.set(
+        doc(playersCol, pid),
+        {
+          score: increment(points),
+          lastDelta: points,
+          lastDeltaForQuestionId: qid,
+        },
+        { merge: true }
+      );
     }
 
     return { ok: true, reason: "awarded", count: ranked.length };
   });
 }
 
-// [1.7] Toggle Pause / Reprendre — même logique que Back/Next/Start, reprise exacte
+// ============================================================================
+// [1.7] Toggle Pause / Reprendre — même logique que Back/Next/Start
+// ============================================================================
+
+/**
+ * Bascule entre Pause et Reprise du quiz live.
+ * - Reconstruit startMs à partir de anchorAt/anchorOffsetSec ou startAt/startEpochMs.
+ * - Empêche Pause/Reprendre avant le départ ou après la fin.
+ * - Lors de la reprise, ré-ancre exactement à l'elapsed au moment de la pause.
+ */
 async function togglePauseResume(db) {
   const stateRef = doc(db, "quiz", "state");
   const snap = await getDoc(stateRef);
@@ -268,12 +372,22 @@ async function togglePauseResume(db) {
 
   // Reconstruit startMs depuis l’ancrage si présent ; fallback legacy
   let startMs = null;
+
   if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
-    const anchorMs = d.anchorAt.seconds * 1000 + Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
-    const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
+    const anchorMs =
+      d.anchorAt.seconds * 1000 +
+      Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
+    const offsetSec = Number.isFinite(d.anchorOffsetSec)
+      ? d.anchorOffsetSec
+      : 0;
+
+    // On veut : elapsed ≈ (now - anchorAt) + offsetSec
+    // ⇔ (now - startMs) ≈ (now - (anchorAt - offsetSec * 1000))
     startMs = anchorMs - offsetSec * 1000;
   } else if (d.startAt && typeof d.startAt.seconds === "number") {
-    startMs = d.startAt.seconds * 1000 + Math.floor((d.startAt.nanoseconds || 0) / 1e6);
+    startMs =
+      d.startAt.seconds * 1000 +
+      Math.floor((d.startAt.nanoseconds || 0) / 1e6);
   } else if (typeof d.startEpochMs === "number") {
     startMs = d.startEpochMs;
   }
@@ -282,12 +396,18 @@ async function togglePauseResume(db) {
   const running = !!d.isRunning;
   const hasStart = Number.isFinite(startMs) && startMs > 0;
   const endOffset = Number.isFinite(d.endOffsetSec) ? d.endOffsetSec : null;
+
   const nowMs = Date.now();
-  const elapsedIfRunning = hasStart ? Math.floor((nowMs - startMs) / 1000) : 0;
-  const isEnded = Number.isFinite(endOffset) ? elapsedIfRunning >= endOffset : false;
+  const elapsedIfRunning = hasStart
+    ? Math.floor((nowMs - startMs) / 1000)
+    : 0;
+
+  const isEnded = Number.isFinite(endOffset)
+    ? elapsedIfRunning >= endOffset
+    : false;
 
   if (!running || !hasStart || isEnded) {
-    // no-op : on ignore le click en dehors des phases valides
+    // en dehors des phases valides → on ignore
     return;
   }
 
@@ -304,15 +424,21 @@ async function togglePauseResume(db) {
       return;
     }
 
-    const pauseAtMs = d.pauseAt.seconds * 1000 + Math.floor((d.pauseAt.nanoseconds || d.pauseAt.nanos || 0) / 1e6);
-    const lastElapsedSec = Math.max(0, Math.floor((pauseAtMs - startMs) / 1000));
+    const pauseAtMs =
+      d.pauseAt.seconds * 1000 +
+      Math.floor((d.pauseAt.nanoseconds || d.pauseAt.nanos || 0) / 1e6);
+
+    const lastElapsedSec = Math.max(
+      0,
+      Math.floor((pauseAtMs - startMs) / 1000)
+    );
 
     await updateDoc(stateRef, {
       isPaused: false,
       // re-ancre proprement pour repartir EXACTEMENT au même elapsed
       anchorAt: serverTimestamp(),
       anchorOffsetSec: lastElapsedSec,
-      // très important : on nettoie la sentinelle de fin de manche
+      // important : on nettoie la sentinelle de fin de manche
       lastAutoPausedRoundIndex: null,
       navSeq: (Number(d.navSeq) || 0) + 1,
     });
@@ -321,12 +447,11 @@ async function togglePauseResume(db) {
     await updateDoc(stateRef, {
       isPaused: true,
       pauseAt: serverTimestamp(),
-      lastAutoPausedRoundIndex: null, // 👈 ne pas afficher "Fin de la manche"
+      lastAutoPausedRoundIndex: null, // ne pas afficher "Fin de la manche"
       navSeq: (Number(d.navSeq) || 0) + 1,
     });
   }
 }
-
 // ============================================================================
 // /pages/admin.js — Partie 2/6
 // Scope : Début du composant Admin — états, helpers internes, effets 1→3
@@ -334,24 +459,32 @@ async function togglePauseResume(db) {
 // ============================================================================
 
 /* =============================== COMPOSANT =============================== */
-
 /* ====================== ÉTATS & HELPERS INTERNES (PARTIE 2/6) ====================== */
+
 function AdminInner() {
   /* [2.1] Étape 0 : injecter la config par défaut si absente */
   useEffect(() => {
-    ensureConfigDefaults().catch((e) => console.error("ensureConfigDefaults error:", e));
+    ensureConfigDefaults().catch((e) =>
+      console.error("ensureConfigDefaults error:", e)
+    );
   }, []);
 
   // [2.2] Garde locale pour l’attribution auto (anti multi-déclenchements UI)
   const awardGuardRef = useRef({});
 
   /* [2.3] Helpers internes (déclarés ici pour usage dans tout le composant) */
+
   function parseCSV(input = "") {
-    return String(input).split(",").map((s) => s.trim()).filter(Boolean);
+    return String(input)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
   }
+
   function toCSV(list = []) {
     return (list || []).join(", ");
   }
+
   function parseHMS(input) {
     if (input == null) return null;
     const s = String(input).trim();
@@ -361,31 +494,43 @@ function AdminInner() {
     if (s.includes(":")) {
       const parts = s.split(":").map((p) => p.trim());
       if (parts.length > 3) return null;
+
       const [hStr, mStr, sStr] =
         parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
-      const h = Number(hStr), m = Number(mStr), sec = Number(sStr);
+
+      const h = Number(hStr),
+        m = Number(mStr),
+        sec = Number(sStr);
+
       if (![h, m, sec].every((n) => Number.isFinite(n) && n >= 0)) return null;
       if (m >= 60 || sec >= 60) return null;
       return h * 3600 + m * 60 + sec;
     }
+
     // nombre simple → minutes décimales (legacy)
     const num = Number(s);
     if (!Number.isFinite(num) || num < 0) return null;
     return Math.round(num * 60);
   }
+
   function formatHMS(totalSeconds) {
     if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "";
     const h = Math.floor(totalSeconds / 3600);
     const m = Math.floor((totalSeconds % 3600) / 60);
     const s = Math.floor(totalSeconds % 60);
-    return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
+    return [h, m, s]
+      .map((n) => String(n).padStart(2, "0"))
+      .join(":");
   }
+
   function getTimeSec(q) {
     if (!q || typeof q !== "object") return Infinity;
-    if (typeof q.timecodeSec === "number") return q.timecodeSec;            // secondes (nouveau)
-    if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
+    if (typeof q.timecodeSec === "number") return q.timecodeSec; // secondes (nouveau)
+    if (typeof q.timecode === "number")
+      return Math.round(q.timecode * 60); // minutes (legacy)
     return Infinity;
   }
+
   function coerceOffsetsToNumbers(arr) {
     const out = [];
     for (let i = 0; i < 8; i++) {
@@ -400,6 +545,7 @@ function AdminInner() {
     }
     return out;
   }
+
   function roundIndexOfTime(t, offsets) {
     if (!Array.isArray(offsets)) return 0;
     let idx = -1;
@@ -409,11 +555,11 @@ function AdminInner() {
     }
     return Math.max(0, idx);
   }
+
   function withAlpha(hex, alpha = 0.35) {
     if (typeof hex !== "string") return hex;
     const s0 = hex.trim();
     if (!s0.startsWith("#")) return hex;
-
     const s = s0.slice(1);
     const A = Math.max(0, Math.min(1, Number(alpha)));
 
@@ -424,6 +570,7 @@ function AdminInner() {
       const b = parseInt(s[2] + s[2], 16);
       return `rgba(${r}, ${g}, ${b}, ${A})`;
     }
+
     // #RRGGBB / #RRGGBBAA
     if (s.length === 6 || s.length === 8) {
       const r = parseInt(s.slice(0, 2), 16);
@@ -431,15 +578,16 @@ function AdminInner() {
       const b = parseInt(s.slice(4, 6), 16);
       return `rgba(${r}, ${g}, ${b}, ${A})`;
     }
+
     return hex;
   }
 
   /* [2.4] États UI/DATA */
 
   // === Quiz (métadonnées + sélection) ===
-  const [quizzes, setQuizzes] = useState([]);          // [{ key, name }]
+  const [quizzes, setQuizzes] = useState([]); // [{ key, name }]
   const [activeQuizKey, setActiveQuizKey] = useState(null); // quiz utilisé en live (Player/Screen)
-  const [selectedQuizKey, setSelectedQuizKey] = useState(null); // quiz actuellement affiché dans l’onglet
+  const [selectedQuizKey, setSelectedQuizKey] = useState(null); // quiz affiché dans l’onglet
 
   // Questions (du quiz sélectionné)
   const [items, setItems] = useState([]);
@@ -465,11 +613,21 @@ function AdminInner() {
   const nextPlayerOrderRef = useRef(1);
 
   const [configDoc, setConfigDoc] = useState(null);
+
   // Rounds & fin
   const [roundOffsetsStr, setRoundOffsetsStr] = useState([
-    "00:00:00", "00:16:00", "00:31:00", "00:46:00", "", "", "", "",
+    "00:00:00",
+    "00:16:00",
+    "00:31:00",
+    "00:46:00",
+    "",
+    "",
+    "",
+    "",
   ]);
-  const [roundOffsetsSec, setRoundOffsetsSec] = useState([0, 960, 1860, 2760, null, null, null, null]);
+  const [roundOffsetsSec, setRoundOffsetsSec] = useState([
+    0, 960, 1860, 2760, null, null, null, null,
+  ]);
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [endOffsetStr, setEndOffsetStr] = useState("");
 
@@ -477,7 +635,8 @@ function AdminInner() {
   const [isIntro, setIsIntro] = useState(false);
   const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
   const [introRoundIndex, setIntroRoundIndex] = useState(null);
-  const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
+  const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] =
+    useState(null);
 
   // Offset d’horloge serveur (ms) — mis à jour via /quiz/state.serverNow
   const serverDeltaRef = useRef(0);
@@ -485,13 +644,12 @@ function AdminInner() {
 
   // Live state
   const [isRunning, setIsRunning] = useState(false);
-
   const [quizStartMs, setQuizStartMs] = useState(null);
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
 
-  // --- Refs pour connaître la phase courante sans dépendance d'ordre ---
+  // Refs pour connaître la phase courante sans dépendance d'ordre
   const isCountdownRef = useRef(false);
   const isRevealRef = useRef(false);
 
@@ -500,11 +658,11 @@ function AdminInner() {
     text: "",
     answersCsv: "",
     timeMusicStr: "",
-    imageQuestionFile: null, // 👈 nouveau (image affichée pendant la phase "question")
-    imageReponseFile: null,  // 👈 nouveau (image affichée pendant la "révélation")
+    imageQuestionFile: null, // image affichée pendant la phase "question"
+    imageReponseFile: null, // image affichée pendant la "révélation"
   });
 
-  // 🔎 Patch Matching — champs création
+  // Matching — champs création
   // matchingMode: "strict" | "relaxed" | "numeric"
   const [newMatchingMode, setNewMatchingMode] = useState("strict");
 
@@ -515,9 +673,15 @@ function AdminInner() {
     "La bonne réponse :",
     "Réponse :",
   ];
-  const [newRevealPhrases, setNewRevealPhrases] = useState(["", "", "", "", ""]);
+  const [newRevealPhrases, setNewRevealPhrases] = useState([
+    "",
+    "",
+    "",
+    "",
+    "",
+  ]);
 
-  /* [2.5] Effects — 1) Charger questions du quiz sélectionné (ordre asc) */
+  /* [2.5] Effect — 1) Charger questions du quiz sélectionné (ordre ascendant) */
   useEffect(() => {
     if (!selectedQuizKey) {
       setItems([]);
@@ -537,7 +701,9 @@ function AdminInner() {
         const snap = await getDocs(qRef);
         const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
         setItems(arr);
-        setNeedsOrderInit(arr.some((it) => typeof it.order !== "number"));
+        setNeedsOrderInit(
+          arr.some((it) => typeof it.order !== "number")
+        );
       } catch (e) {
         console.error("load LesQuestions error:", e);
       } finally {
@@ -546,8 +712,7 @@ function AdminInner() {
     })();
   }, [selectedQuizKey]);
 
-
-  /* [2.6] Effects — 2) Écouter config (rounds + fin + quiz actifs) */
+  /* [2.6] Effect — 2) Écouter config (rounds + fin + quiz actifs) */
   useEffect(() => {
     const unsub = onSnapshot(
       doc(db, "quiz", "config"),
@@ -555,10 +720,11 @@ function AdminInner() {
         const d = snap.data() || {};
         setConfigDoc(d);
 
-        // === Quiz : métadonnées + actif ===
+        // Quiz : métadonnées + actif
         let cfgQuizzes = Array.isArray(d.quizzes)
           ? d.quizzes.filter((q) => q && q.key && q.name)
           : [];
+
         let cfgActiveQuizKey =
           typeof d.activeQuizKey === "string" && d.activeQuizKey
             ? d.activeQuizKey
@@ -567,7 +733,10 @@ function AdminInner() {
         if (!cfgQuizzes.length) {
           cfgQuizzes = [{ key: cfgActiveQuizKey, name: "Quiz test" }];
         } else if (!cfgQuizzes.some((q) => q.key === cfgActiveQuizKey)) {
-          cfgQuizzes = [...cfgQuizzes, { key: cfgActiveQuizKey, name: "Quiz test" }];
+          cfgQuizzes = [
+            ...cfgQuizzes,
+            { key: cfgActiveQuizKey, name: "Quiz test" },
+          ];
         }
 
         setQuizzes(cfgQuizzes);
@@ -582,10 +751,11 @@ function AdminInner() {
       },
       (e) => console.error("onSnapshot config error:", e)
     );
+
     return () => unsub();
   }, []);
 
-  /* [2.6bis] Dériver offsets/fin par quiz (selectedQuizKey ↔ configDoc) */
+  /* [2.6bis] Effect — Dériver offsets/fin par quiz (selectedQuizKey ↔ configDoc) */
   useEffect(() => {
     if (!configDoc) {
       return;
@@ -596,7 +766,8 @@ function AdminInner() {
 
     // roundOffsetsSec par quiz
     const byQuiz =
-      d.roundOffsetsSecByQuiz && typeof d.roundOffsetsSecByQuiz === "object"
+      d.roundOffsetsSecByQuiz &&
+      typeof d.roundOffsetsSecByQuiz === "object"
         ? d.roundOffsetsSecByQuiz
         : null;
 
@@ -611,11 +782,14 @@ function AdminInner() {
     }
 
     setRoundOffsetsSec(offs);
-    setRoundOffsetsStr(offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : "")));
+    setRoundOffsetsStr(
+      offs.map((s) => (Number.isFinite(s) ? formatHMS(s) : ""))
+    );
 
     // endOffsetSec par quiz
     const endByQuiz =
-      d.endOffsetSecByQuiz && typeof d.endOffsetSecByQuiz === "object"
+      d.endOffsetSecByQuiz &&
+      typeof d.endOffsetSecByQuiz === "object"
         ? d.endOffsetSecByQuiz
         : null;
 
@@ -638,8 +812,7 @@ function AdminInner() {
     }
   }, [configDoc, selectedQuizKey, activeQuizKey]);
 
-
-  /* [2.7] Effects — 3) Écouter état live (Timestamp ou startEpochMs) */
+  /* [2.7] Effect — 3) Écouter état live (Timestamp ou startEpochMs) */
   useEffect(() => {
     const unsub = onSnapshot(
       doc(db, "quiz", "state"),
@@ -647,16 +820,19 @@ function AdminInner() {
         const d = snap.data() || {};
 
         // startMs reconstruit depuis l'ancrage (anchorAt + anchorOffsetSec) si présent.
-        // Fallback: startAt (Timestamp) puis startEpochMs (legacy).
+        // Fallback : startAt (Timestamp) puis startEpochMs (legacy).
         let startMs = null;
 
         if (d.anchorAt && typeof d.anchorAt.seconds === "number") {
           const anchorMs =
             d.anchorAt.seconds * 1000 +
-            Math.floor((d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6);
-          const offsetSec = Number.isFinite(d.anchorOffsetSec) ? d.anchorOffsetSec : 0;
-          // On veut : elapsed ≈ (now - anchorAt) + offsetSec
-          // ⇔ (now - startMs) ≈ (now - (anchorAt - offsetSec*1000))
+            Math.floor(
+              (d.anchorAt.nanoseconds || d.anchorAt.nanos || 0) / 1e6
+            );
+          const offsetSec = Number.isFinite(d.anchorOffsetSec)
+            ? d.anchorOffsetSec
+            : 0;
+
           startMs = anchorMs - offsetSec * 1000;
         } else if (d.startAt && typeof d.startAt.seconds === "number") {
           startMs =
@@ -670,25 +846,24 @@ function AdminInner() {
         if (d.serverNow && typeof d.serverNow.seconds === "number") {
           const serverNowMs =
             d.serverNow.seconds * 1000 +
-            Math.floor((d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6);
+            Math.floor(
+              (d.serverNow.nanoseconds || d.serverNow.nanos || 0) / 1e6
+            );
+          const instantDelta = serverNowMs - Date.now();
 
-          const instantDelta = serverNowMs - Date.now(); // (>0) = ma clock est en retard
-
-          // Buffer des derniers deltas pour une correction “best-of”
           if (!serverDeltaRef.buffer) serverDeltaRef.buffer = [];
           serverDeltaRef.buffer.push(instantDelta);
-          if (serverDeltaRef.buffer.length > 8) serverDeltaRef.buffer.shift();
+          if (serverDeltaRef.buffer.length > 8)
+            serverDeltaRef.buffer.shift();
 
-          // On prend le percentile 90 (valeur haute sans aller à l’extrême)
           const sorted = [...serverDeltaRef.buffer].sort((a, b) => a - b);
-          const p90 = sorted[Math.floor(sorted.length * 0.9)] ?? instantDelta;
+          const p90 =
+            sorted[Math.floor(sorted.length * 0.9)] ?? instantDelta;
 
-          // Lissage EMA vers cette valeur
           const prev = serverDeltaRef.current || 0;
           const alpha = 0.25;
           serverDeltaRef.current = prev * (1 - alpha) + p90 * alpha;
 
-          // Tick léger pour réactualiser si besoin d’afficher qqch basé sur Date.now()
           setServerDeltaTick((t) => (t + 1) & 0xfff);
         }
 
@@ -711,7 +886,6 @@ function AdminInner() {
           }
         }
 
-        // flags UI/state
         setIsIntro(!!d.isIntro);
         setIntroEndsAtMs(
           typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null
@@ -727,370 +901,404 @@ function AdminInner() {
       },
       (e) => console.error("onSnapshot state error:", e)
     );
-    return () => unsub();
-  }, []);
-
-
-  // ============================================================================
-  // /pages/admin.js — Partie 3/6
-  // Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
-  //         Watcher d’attribution automatique
-  // Règles : aucune modification fonctionnelle ; uniquement cosmétique.
-  // ============================================================================
-
-  // [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
-  useEffect(() => {
-    if (!quizStartMs) {
-      setElapsedSec(0);
-      return;
-    }
-    if (isPaused && pauseAtMs) {
-      const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
-      const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
-      setElapsedSec(clamped < 0 ? 0 : clamped);
-      return;
-    }
-    if (!isRunning) {
-      setElapsedSec(0);
-      return;
-    }
-
-    const computeNow = () =>
-      Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
-
-    const first = computeNow();
-    const firstClamped = Number.isFinite(quizEndSec)
-      ? Math.min(first, quizEndSec)
-      : first;
-    setElapsedSec(firstClamped < 0 ? 0 : firstClamped);
-
-    const id = setInterval(() => {
-      const raw = computeNow();
-      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
-        setElapsedSec(Math.max(0, quizEndSec));
-        clearInterval(id);
-      } else {
-        setElapsedSec(raw < 0 ? 0 : raw);
-      }
-    }, 500);
-    return () => clearInterval(id);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
-
-
-  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
-  useEffect(() => {
-    if (!isRunning || isPaused) return;
-    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null)) return;
-
-    // Manche courante = dernière dont l’offset ≤ elapsedSec
-    let prevIdx = -1;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) {
-        prevIdx = i;
-      }
-    }
-    if (prevIdx < 0) return; // garde de sûreté
-
-    const nextStart =
-      typeof roundOffsetsSec[prevIdx + 1] === "number"
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
-    if (typeof nextStart !== "number") return; // pas de manche suivante
-
-    // Frontière = 1 seconde AVANT le début de la manche suivante
-    const boundary = Math.max(0, nextStart - 1);
-
-    // On attend d'avoir réellement atteint la frontière
-    if (elapsedSec < boundary) return;
-
-    // Déjà auto-pausé pour cette manche → ne rien refaire
-    if (lastAutoPausedRoundIndex === prevIdx) return;
-
-    setDoc(
-      doc(db, "quiz", "state"),
-      {
-        isPaused: true,
-        pauseAt: serverTimestamp(),
-        lastAutoPausedRoundIndex: prevIdx,
-      },
-      { merge: true }
-    ).catch(console.error);
-  }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
-
-
-
-
-  // [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
-  useEffect(() => {
-    const playersCol = collection(db, "quiz", "state", "players");
-    const unsub = onSnapshot(playersCol, (snap) => {
-      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-      // 1) Normaliser nameNorm + 2) Assigner une couleur si manquante
-      arr.forEach((p) => {
-        const pref = doc(db, "quiz", "state", "players", p.id);
-
-        // 1) nameNorm : utile pour la modération et le tri "insensible"
-        if ((!p.nameNorm || typeof p.nameNorm !== "string") && typeof p.name === "string") {
-          updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => { });
-        }
-
-        // 2) Couleur : si manquante, poser une couleur (anti-répétition locale)
-        if (!p.color && !assignedColorRef.current.has(p.id)) {
-          assignedColorRef.current.add(p.id);
-          const prev = lastAssignedColorRef.current;
-          const color = pickColorDifferent(prev);
-          lastAssignedColorRef.current = color;
-          updateDoc(pref, { color }).catch(() => { });
-        }
-      });
-
-      // Mémoriser l’ordre d’arrivée (local, stable)
-      arr.forEach((p) => {
-        if (!playerOrderRef.current.has(p.id)) {
-          playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
-        }
-      });
-
-      // Tri par ordre d’arrivée
-      arr.sort(
-        (a, b) =>
-          (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
-          (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
-      );
-
-      setPlayers(arr);
-      setPlayersLoading(false);
-    });
 
     return () => unsub();
   }, []);
 
-  // [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
-  useEffect(() => {
-    const stateRef = doc(db, "quiz", "state");
+// ============================================================================
+// /pages/admin.js — Partie 3/6
+// Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
+//         Watcher d’attribution automatique
+// Règles : aucune modification fonctionnelle ; uniquement cosmétique.
+// ============================================================================
 
-    let intervalMs = 5000;
-    let hbId = null;        // interval courant du heartbeat
-    let watchId = null;     // observeur local “phases”
-    let boostTimer = null;  // timer pour hbBoost
+// [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
+useEffect(() => {
+  if (!quizStartMs) {
+    setElapsedSec(0);
+    return;
+  }
 
-    const tick = () =>
-      setDoc(stateRef, { serverNow: serverTimestamp() }, { merge: true }).catch(() => { });
+  if (isPaused && pauseAtMs) {
+    const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
+    const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
+    setElapsedSec(clamped < 0 ? 0 : clamped);
+    return;
+  }
 
-    const startHB = () => {
-      clearInterval(hbId);
-      hbId = setInterval(tick, intervalMs);
-    };
+  if (!isRunning) {
+    setElapsedSec(0);
+    return;
+  }
 
-    // Snapshot pour capter hbBoost: true
-    const unsub = onSnapshot(stateRef, (snap) => {
-      const d = snap.data() || {};
-      if (d.hbBoost === true) {
-        clearTimeout(boostTimer);
-        intervalMs = 200;      // boost
-        startHB();
-        boostTimer = setTimeout(() => {
-          intervalMs = (isCountdownRef.current || isRevealRef.current) ? 500 : 5000;
-          startHB();
-          setDoc(stateRef, { hbBoost: false }, { merge: true }).catch(() => { });
-        }, 1500);
-      }
-    });
+  const computeNow = () =>
+    Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
 
-    // Observer local : ajuster 500ms pendant reveal/countdown sinon 5000ms
-    watchId = setInterval(() => {
-      if (boostTimer) return; // priorité au boost
-      const target = (isCountdownRef.current || isRevealRef.current) ? 500 : 5000;
-      if (target !== intervalMs) {
-        intervalMs = target;
-        startHB();
-      }
-    }, 300);
+  const first = computeNow();
+  const firstClamped = Number.isFinite(quizEndSec)
+    ? Math.min(first, quizEndSec)
+    : first;
+  setElapsedSec(firstClamped < 0 ? 0 : firstClamped);
 
-    // Lancer
-    tick();
-    startHB();
-
-    // Cleanup
-    return () => {
-      clearInterval(hbId);
-      clearInterval(watchId);
-      clearTimeout(boostTimer);
-      unsub();
-    };
-  }, []); // NOTE: on lit les .current des refs, pas besoin de dépendances
-
-
-  // ========================================================================
-  // DÉRIVÉS & PHASES (rounds/reveal/countdown) + Watcher attribution auto
-  // ========================================================================
-
-  /* --------- Dérivés simples --------- */
-  const connectedCount = useMemo(
-    () => players.filter((p) => !p?.isKicked).length,
-    [players]
-  );
-
-  const plannedTimes = useMemo(
-    () =>
-      items
-        .map(getTimeSec)
-        .filter((t) => Number.isFinite(t))
-        .sort((a, b) => a - b),
-    [items]
-  );
-
-  /* --------- Dérivés “rounds & reveal” --------- */
-  const currentRoundIndex = useMemo(() => {
-    let lastIdx = -1;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
+  const id = setInterval(() => {
+    const raw = computeNow();
+    if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+      setElapsedSec(Math.max(0, quizEndSec));
+      clearInterval(id);
+    } else {
+      setElapsedSec(raw < 0 ? 0 : raw);
     }
-    if (lastIdx >= 0) return lastIdx;
-    const firstActiveIdx = roundOffsetsSec.findIndex((t) => Number.isFinite(t));
-    return firstActiveIdx !== -1 ? firstActiveIdx : 0;
-  }, [elapsedSec, roundOffsetsSec]);
+  }, 500);
 
-  const nextRoundIndex = useMemo(() => {
-    if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
-      const idx = lastAutoPausedRoundIndex + 1;
-      return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
-    }
-    // ⚠️ strict ">" : on veut la VRAIE manche suivante, pas la manche courante
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && t > elapsedSec) return i;
-    }
-    return null;
-  }, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
+  return () => clearInterval(id);
+}, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
+// [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
+useEffect(() => {
+  if (!isRunning || isPaused) return;
+  if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
+    return;
 
-  const roundBoundarySec = useMemo(() => {
-    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
-      return null;
-    let prevIdx = -1;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
+  // Manche courante = dernière dont l’offset ≤ elapsedSec
+  let prevIdx = -1;
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && elapsedSec >= t) {
+      prevIdx = i;
     }
-    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+  }
+  if (prevIdx < 0) return;
+
+  const nextStart =
+    typeof roundOffsetsSec[prevIdx + 1] === "number"
       ? roundOffsetsSec[prevIdx + 1]
       : null;
-    // Frontière de manche = 1s avant la manche suivante
-    return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-  }, [elapsedSec, roundOffsetsSec]);
+  if (typeof nextStart !== "number") return;
 
+  // Frontière = 1 seconde AVANT le début de la manche suivante
+  const boundary = Math.max(0, nextStart - 1);
 
+  if (elapsedSec < boundary) return;
 
-  const atRoundBoundary = Boolean(
-    isPaused && typeof roundBoundarySec === "number" && elapsedSec >= roundBoundarySec
-  );
+  // Déjà auto-pausé pour cette manche → ne rien refaire
+  if (lastAutoPausedRoundIndex === prevIdx) return;
 
-  // Question courante bornée à la manche
-  const sortedQuestions = useMemo(
-    () => [...items].sort((a, b) => getTimeSec(a) - getTimeSec(b)),
-    [items]
-  );
+  setDoc(
+    doc(db, "quiz", "state"),
+    {
+      isPaused: true,
+      pauseAt: serverTimestamp(),
+      lastAutoPausedRoundIndex: prevIdx,
+    },
+    { merge: true }
+  ).catch(console.error);
+}, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
 
-  const currentRoundStart = useMemo(() => {
-    let s = 0;
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && elapsedSec >= t) s = t;
+// [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
+useEffect(() => {
+  const playersCol = collection(db, "quiz", "state", "players");
+
+  const unsub = onSnapshot(playersCol, (snap) => {
+    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    // Normaliser nameNorm + assigner une couleur si manquante
+    arr.forEach((p) => {
+      const pref = doc(db, "quiz", "state", "players", p.id);
+
+      if (
+        (!p.nameNorm || typeof p.nameNorm !== "string") &&
+        typeof p.name === "string"
+      ) {
+        updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => {});
+      }
+
+      if (!p.color && !assignedColorRef.current.has(p.id)) {
+        assignedColorRef.current.add(p.id);
+        const prev = lastAssignedColorRef.current;
+        const color = pickColorDifferent(prev);
+        lastAssignedColorRef.current = color;
+        updateDoc(pref, { color }).catch(() => {});
+      }
+    });
+
+    // Mémoriser l’ordre d’arrivée (local, stable)
+    arr.forEach((p) => {
+      if (!playerOrderRef.current.has(p.id)) {
+        playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
+      }
+    });
+
+    // Tri par ordre d’arrivée
+    arr.sort(
+      (a, b) =>
+        (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
+        (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
+    );
+
+    setPlayers(arr);
+    setPlayersLoading(false);
+  });
+
+  return () => unsub();
+}, []);
+
+// [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
+useEffect(() => {
+  const stateRef = doc(db, "quiz", "state");
+  let intervalMs = 5000;
+  let hbId = null;
+  let watchId = null;
+  let boostTimer = null;
+
+  const tick = () =>
+    setDoc(stateRef, { serverNow: serverTimestamp() }, { merge: true }).catch(
+      () => {}
+    );
+
+  const startHB = () => {
+    clearInterval(hbId);
+    hbId = setInterval(tick, intervalMs);
+  };
+
+  const unsub = onSnapshot(stateRef, (snap) => {
+    const d = snap.data() || {};
+    if (d.hbBoost === true) {
+      clearTimeout(boostTimer);
+      intervalMs = 200;
+      startHB();
+      boostTimer = setTimeout(() => {
+        intervalMs =
+          isCountdownRef.current || isRevealRef.current ? 500 : 5000;
+        startHB();
+        setDoc(stateRef, { hbBoost: false }, { merge: true }).catch(() => {});
+      }, 1500);
     }
-    return s;
-  }, [elapsedSec, roundOffsetsSec]);
+  });
 
-  const currentRoundEnd = useMemo(() => {
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const t = roundOffsetsSec[i];
-      if (Number.isFinite(t) && t > currentRoundStart) return t;
+  // Observer local : ajuster 500 ms pendant reveal/countdown sinon 5000 ms
+  watchId = setInterval(() => {
+    if (boostTimer) return;
+    const target =
+      isCountdownRef.current || isRevealRef.current ? 500 : 5000;
+    if (target !== intervalMs) {
+      intervalMs = target;
+      startHB();
     }
-    return Infinity;
-  }, [roundOffsetsSec, currentRoundStart]);
+  }, 300);
 
-  let _activeIdx = -1;
-  for (let i = 0; i < sortedQuestions.length; i++) {
-    const t = getTimeSec(sortedQuestions[i]);
-    if (!Number.isFinite(t) || t < currentRoundStart) continue;
-    if (t <= elapsedSec && t < currentRoundEnd) _activeIdx = i;
-    else if (t >= currentRoundEnd) break;
+  tick();
+  startHB();
+
+  return () => {
+    clearInterval(hbId);
+    clearInterval(watchId);
+    clearTimeout(boostTimer);
+    unsub();
+  };
+}, []);
+
+// ========================================================================
+// DÉRIVÉS & PHASES (rounds/reveal/countdown) + Watcher attribution auto
+// ========================================================================
+
+/* --------- Dérivés simples --------- */
+const connectedCount = useMemo(
+  () => players.filter((p) => !p?.isKicked).length,
+  [players]
+);
+
+const plannedTimes = useMemo(
+  () =>
+    items
+      .map(getTimeSec)
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => a - b),
+  [items]
+);
+
+/* --------- Dérivés “rounds & reveal” --------- */
+const currentRoundIndex = useMemo(() => {
+  let lastIdx = -1;
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
   }
-  const currentQuestion = _activeIdx >= 0 ? sortedQuestions[_activeIdx] : null;
+  if (lastIdx >= 0) return lastIdx;
 
-  // Prochain événement (question / frontière / fin)
-  let nextTimeSec = null;
-  for (let i = 0; i < sortedQuestions.length; i++) {
-    const t = getTimeSec(sortedQuestions[i]);
-    if (Number.isFinite(t) && t > elapsedSec) { nextTimeSec = t; break; }
+  const firstActiveIdx = roundOffsetsSec.findIndex((t) =>
+    Number.isFinite(t)
+  );
+  return firstActiveIdx !== -1 ? firstActiveIdx : 0;
+}, [elapsedSec, roundOffsetsSec]);
+
+const nextRoundIndex = useMemo(() => {
+  if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
+    const idx = lastAutoPausedRoundIndex + 1;
+    return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
   }
-  const _nextRoundStart = (() => {
-    for (let i = 0; i < roundOffsetsSec.length; i++) {
-      const v = roundOffsetsSec[i];
-      if (typeof v === "number" && v > elapsedSec) return v;
-    }
+
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && t > elapsedSec) return i;
+  }
+  return null;
+}, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
+
+const roundBoundarySec = useMemo(() => {
+  if (
+    !Array.isArray(roundOffsetsSec) ||
+    roundOffsetsSec.every((v) => v == null)
+  )
     return null;
-  })();
-  const nextRoundBoundary = Number.isFinite(_nextRoundStart) ? Math.max(0, _nextRoundStart) : null;
 
+  let prevIdx = -1;
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
+  }
 
-  const candidates = [];
-  if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
-  if (Number.isFinite(nextRoundBoundary)) candidates.push(nextRoundBoundary);
-  if (Number.isFinite(quizEndSec)) candidates.push(quizEndSec);
-  const effectiveNextTimeSec = candidates.length ? Math.min(...candidates) : null;
+  const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
+    ? roundOffsetsSec[prevIdx + 1]
+    : null;
 
-  // Fenêtres reveal / countdown
-  const REVEAL_DURATION_SEC = DEFAULT_REVEAL_DURATION_SEC;
-  const COUNTDOWN_START_SEC = 5;
-  const revealStart = effectiveNextTimeSec != null ? (effectiveNextTimeSec - REVEAL_DURATION_SEC) : null;
-  const countdownStart = effectiveNextTimeSec != null ? (effectiveNextTimeSec - COUNTDOWN_START_SEC) : null;
+  return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
+}, [elapsedSec, roundOffsetsSec]);
 
-  const isRevealAnswerPhase = Boolean(
-    currentQuestion &&
+const atRoundBoundary = Boolean(
+  isPaused &&
+    typeof roundBoundarySec === "number" &&
+    elapsedSec >= roundBoundarySec
+);
+
+// Questions triées par timecode
+const sortedQuestions = useMemo(
+  () => [...items].sort((a, b) => getTimeSec(a) - getTimeSec(b)),
+  [items]
+);
+
+const currentRoundStart = useMemo(() => {
+  let s = 0;
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && elapsedSec >= t) s = t;
+  }
+  return s;
+}, [elapsedSec, roundOffsetsSec]);
+
+const currentRoundEnd = useMemo(() => {
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const t = roundOffsetsSec[i];
+    if (Number.isFinite(t) && t > currentRoundStart) return t;
+  }
+  return Infinity;
+}, [roundOffsetsSec, currentRoundStart]);
+
+let _activeIdx = -1;
+for (let i = 0; i < sortedQuestions.length; i++) {
+  const t = getTimeSec(sortedQuestions[i]);
+  if (!Number.isFinite(t) || t < currentRoundStart) continue;
+  if (t <= elapsedSec && t < currentRoundEnd) _activeIdx = i;
+  else if (t >= currentRoundEnd) break;
+}
+const currentQuestion = _activeIdx >= 0 ? sortedQuestions[_activeIdx] : null;
+
+// Prochain événement (question / frontière / fin)
+let nextTimeSec = null;
+for (let i = 0; i < sortedQuestions.length; i++) {
+  const t = getTimeSec(sortedQuestions[i]);
+  if (Number.isFinite(t) && t > elapsedSec) {
+    nextTimeSec = t;
+    break;
+  }
+}
+
+const _nextRoundStart = (() => {
+  for (let i = 0; i < roundOffsetsSec.length; i++) {
+    const v = roundOffsetsSec[i];
+    if (typeof v === "number" && v > elapsedSec) return v;
+  }
+  return null;
+})();
+
+const nextRoundBoundary = Number.isFinite(_nextRoundStart)
+  ? Math.max(0, _nextRoundStart)
+  : null;
+
+const candidates = [];
+if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
+if (Number.isFinite(nextRoundBoundary)) candidates.push(nextRoundBoundary);
+if (Number.isFinite(quizEndSec)) candidates.push(quizEndSec);
+
+const effectiveNextTimeSec = candidates.length
+  ? Math.min(...candidates)
+  : null;
+
+// Fenêtres reveal / countdown
+const REVEAL_DURATION_SEC = DEFAULT_REVEAL_DURATION_SEC;
+const COUNTDOWN_START_SEC = 5;
+
+const revealStart =
+  effectiveNextTimeSec != null
+    ? effectiveNextTimeSec - REVEAL_DURATION_SEC
+    : null;
+
+const countdownStart =
+  effectiveNextTimeSec != null
+    ? effectiveNextTimeSec - COUNTDOWN_START_SEC
+    : null;
+
+const isRevealAnswerPhase = Boolean(
+  currentQuestion &&
     revealStart != null &&
     countdownStart != null &&
     elapsedSec >= revealStart &&
     elapsedSec < countdownStart &&
     !isPaused
-  );
+);
 
-  const isCountdownPhase = Boolean(
-    currentQuestion &&
+const isCountdownPhase = Boolean(
+  currentQuestion &&
     countdownStart != null &&
     effectiveNextTimeSec != null &&
     elapsedSec >= countdownStart &&
     elapsedSec < effectiveNextTimeSec &&
     !isPaused
-  );
+);
 
-  useEffect(() => { isCountdownRef.current = !!isCountdownPhase; }, [isCountdownPhase]);
-  useEffect(() => { isRevealRef.current = !!isRevealAnswerPhase; }, [isRevealAnswerPhase]);
+useEffect(() => {
+  isCountdownRef.current = !!isCountdownPhase;
+}, [isCountdownPhase]);
 
-  /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
-  useEffect(() => {
-    const qid = currentQuestion?.id || null;
-    const isReveal = isRevealAnswerPhase || isCountdownPhase;
-    if (!qid || !isReveal) return;
+useEffect(() => {
+  isRevealRef.current = !!isRevealAnswerPhase;
+}, [isRevealAnswerPhase]);
 
-    if (awardGuardRef.current[qid]) return; // garde UI locale (une fois par qid)
+/* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
+useEffect(() => {
+  const qid = currentQuestion?.id || null;
+  const isReveal = isRevealAnswerPhase || isCountdownPhase;
+  if (!qid || !isReveal) return;
+  if (awardGuardRef.current[qid]) return;
 
-    awardGuardRef.current[qid] = "pending";
-    ensureAwardsForQuestionTx(qid)
-      .catch((e) => {
-        console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
-        delete awardGuardRef.current[qid]; // autorise un retry si échec
-      });
-  }, [currentQuestion?.id, isRevealAnswerPhase, isCountdownPhase, elapsedSec, isPaused]);
+  awardGuardRef.current[qid] = "pending";
 
-  // ============================================================================
-  // /pages/admin.js — Partie 4/6
-  // Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
-  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-  // ============================================================================
+  ensureAwardsForQuestionTx(qid).catch((e) => {
+    console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
+    delete awardGuardRef.current[qid];
+  });
+}, [
+  currentQuestion?.id,
+  isRevealAnswerPhase,
+  isCountdownPhase,
+  elapsedSec,
+  isPaused,
+]);
+
+// ============================================================================
+// /pages/admin.js — Partie 4/6
+// Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
   // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic (par quiz)
   async function recalcAllTimecodesFromOrder() {
@@ -1153,7 +1361,6 @@ function AdminInner() {
     );
   };
 
-
   // [4.3] Saisie des offsets de manches (UI) + sauvegarde
   const handleRoundOffsetChange = (i, value) => {
     setRoundOffsetsStr((prev) => {
@@ -1178,8 +1385,8 @@ function AdminInner() {
 
       const existingByQuiz =
         configDoc &&
-          configDoc.roundOffsetsSecByQuiz &&
-          typeof configDoc.roundOffsetsSecByQuiz === "object"
+        configDoc.roundOffsetsSecByQuiz &&
+        typeof configDoc.roundOffsetsSecByQuiz === "object"
           ? configDoc.roundOffsetsSecByQuiz
           : {};
 
@@ -1200,7 +1407,9 @@ function AdminInner() {
       await setDoc(cfgRef, patch, { merge: true });
 
       setRoundOffsetsSec(secs);
-      setRoundOffsetsStr(secs.map((s) => (typeof s === "number" ? formatHMS(s) : "")));
+      setRoundOffsetsStr(
+        secs.map((s) => (typeof s === "number" ? formatHMS(s) : ""))
+      );
       setNotice("Offsets enregistrés");
       setTimeout(() => setNotice(null), 1500);
     } catch {
@@ -1208,7 +1417,6 @@ function AdminInner() {
       setTimeout(() => setNotice(null), 2000);
     }
   };
-
 
   // [4.4] Saisie/Enregistrement de la fin du quiz (global)
   const saveEndOffset = async (valStr) => {
@@ -1222,8 +1430,8 @@ function AdminInner() {
 
       const existingByQuiz =
         configDoc &&
-          configDoc.endOffsetSecByQuiz &&
-          typeof configDoc.endOffsetSecByQuiz === "object"
+        configDoc.endOffsetSecByQuiz &&
+        typeof configDoc.endOffsetSecByQuiz === "object"
           ? configDoc.endOffsetSecByQuiz
           : {};
 
@@ -1253,20 +1461,21 @@ function AdminInner() {
     }
   };
 
-
   // [4.5] Upload d'image (Storage) + binding sur la question
   const uploadImage = async (file) => {
     if (!file) return null;
     try {
       const storageRef = ref(
         storage,
-        `questions/${Date.now()}-${Math.random().toString(36).slice(2)}-${file.name}`
+        `questions/${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2)}-${file.name}`
       );
       const task = uploadBytesResumable(storageRef, file);
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => { },
+          () => {},
           (err) => {
             console.error("[UPLOAD] Erreur:", err);
             alert("Échec de l’upload : " + (err?.message || err));
@@ -1282,7 +1491,7 @@ function AdminInner() {
     }
   };
 
-  // 👇 Handler générique ciblé : "imageQuestionUrl" ou "imageReponseUrl"
+  // Handler générique ciblé : "imageQuestionUrl" ou "imageReponseUrl"
   const handleImageChange = async (id, file, targetField) => {
     if (!file || !targetField) return;
     handleFieldChange(id, "_imageUploading", true);
@@ -1321,8 +1530,6 @@ function AdminInner() {
     );
   };
 
-
-
   // [4.6] Sauvegarder une question (update Firestore)
   const saveOne = async (it) => {
     try {
@@ -1331,32 +1538,33 @@ function AdminInner() {
       const hasAnswersCsv = typeof it.answersCsv === "string";
       const hasTimeMusicStr = typeof it.timeMusicStr === "string";
 
-      const nextTimeMusicSec =
-        hasTimeMusicStr
-          ? clampTimeMusicSec(parseHMS(it.timeMusicStr))
-          : Number.isFinite(it.timeMusicSec)
-            ? clampTimeMusicSec(it.timeMusicSec)
-            : DEFAULT_TIME_MUSIC_SEC;
+      const nextTimeMusicSec = hasTimeMusicStr
+        ? clampTimeMusicSec(parseHMS(it.timeMusicStr))
+        : Number.isFinite(it.timeMusicSec)
+        ? clampTimeMusicSec(it.timeMusicSec)
+        : DEFAULT_TIME_MUSIC_SEC;
 
-      // 1) Base payload (sans deleteField)
+      // Base payload (sans deleteField)
       const payload = {
         text: it.text ?? "",
         answers: hasAnswersCsv
           ? parseCSV(it.answersCsv)
           : Array.isArray(it.answers)
-            ? it.answers
-            : [],
+          ? it.answers
+          : [],
 
-        matchingMode: typeof it.matchingMode === "string" && it.matchingMode
-          ? it.matchingMode
-          : "strict",
+        matchingMode:
+          typeof it.matchingMode === "string" && it.matchingMode
+            ? it.matchingMode
+            : "strict",
 
         timeMusicSec: nextTimeMusicSec,
-        timecodeSec: typeof it.timecodeSec === "number" ? it.timecodeSec : null,
+        timecodeSec:
+          typeof it.timecodeSec === "number" ? it.timecodeSec : null,
 
         // Images (brutes, on ajustera juste après avec deleteField si besoin)
         imageQuestionUrl: it.imageQuestionUrl || "",
-        imageReponseUrl: (it.imageReponseUrl || it.imageUrl || ""),
+        imageReponseUrl: it.imageReponseUrl || it.imageUrl || "",
 
         order:
           typeof it.order === "number"
@@ -1364,13 +1572,12 @@ function AdminInner() {
             : (items.findIndex((x) => x.id === it.id) + 1) * 1000,
       };
 
-      // 2) Construire l’objet d’update final (avec deleteField)
+      // Construire l’objet d’update final (avec deleteField)
       const updates = { ...payload };
 
       // QUESTION : suppression demandée ou URL vide → deleteField + nettoyage legacy éventuel
       if (it._deleteImageQuestion || !payload.imageQuestionUrl) {
         updates.imageQuestionUrl = deleteField();
-        // autres clés possibles (au cas où)
         updates.questionImageUrl = deleteField();
         updates.imageQuestion = deleteField();
       }
@@ -1425,11 +1632,22 @@ function AdminInner() {
 
   // [4.8] Reorder (swap deux lignes)
   const swapOrder = async (indexA, indexB) => {
-    if (indexA < 0 || indexB < 0 || indexA >= items.length || indexB >= items.length) return;
-    const a = items[indexA], b = items[indexB];
+    if (
+      indexA < 0 ||
+      indexB < 0 ||
+      indexA >= items.length ||
+      indexB >= items.length
+    )
+      return;
+    const a = items[indexA],
+      b = items[indexB];
     const batch = writeBatch(db);
-    batch.update(doc(db, "LesQuestions", a.id), { order: b.order ?? (indexB + 1) * 1000 });
-    batch.update(doc(db, "LesQuestions", b.id), { order: a.order ?? (indexA + 1) * 1000 });
+    batch.update(doc(db, "LesQuestions", a.id), {
+      order: b.order ?? (indexB + 1) * 1000,
+    });
+    batch.update(doc(db, "LesQuestions", b.id), {
+      order: a.order ?? (indexA + 1) * 1000,
+    });
     await batch.commit();
 
     if (!selectedQuizKey) return;
@@ -1456,7 +1674,9 @@ function AdminInner() {
     const snap = await getDocs(q);
     const arr = snap.docs.map((d, i) => ({ id: d.id, ...d.data(), idx: i }));
     const batch = writeBatch(db);
-    arr.forEach((it, i) => batch.update(doc(colRef, it.id), { order: (i + 1) * 1000 }));
+    arr.forEach((it, i) =>
+      batch.update(doc(colRef, it.id), { order: (i + 1) * 1000 })
+    );
     await batch.commit();
     const q2 = query(
       colRef,
@@ -1474,8 +1694,10 @@ function AdminInner() {
       setCreating(true);
       let imageQuestionUrl = "";
       let imageReponseUrl = "";
-      if (newQ.imageQuestionFile) imageQuestionUrl = (await uploadImage(newQ.imageQuestionFile)) || "";
-      if (newQ.imageReponseFile) imageReponseUrl = (await uploadImage(newQ.imageReponseFile)) || "";
+      if (newQ.imageQuestionFile)
+        imageQuestionUrl = (await uploadImage(newQ.imageQuestionFile)) || "";
+      if (newQ.imageReponseFile)
+        imageReponseUrl = (await uploadImage(newQ.imageReponseFile)) || "";
 
       const answers = parseCSV(newQ.answersCsv);
       const timeMusicSec = clampTimeMusicSec(parseHMS(newQ.timeMusicStr));
@@ -1491,17 +1713,16 @@ function AdminInner() {
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
-        // 🔎 Patch Matching — champs persistant côté question
+
+        // Champs persistant pour le matching
         matchingMode: newMatchingMode || "strict",
 
         timeMusicSec,
         timecodeSec: null, // recalculé par recalcAllTimecodesFromOrder
 
-        // 👇 Nouveaux champs
         imageQuestionUrl,
         imageReponseUrl,
-
-        // ⚠️ On n’écrit plus imageUrl (déprécié)
+        // imageUrl déprécié
 
         createdAt: new Date(),
         order,
@@ -1538,13 +1759,12 @@ function AdminInner() {
     }
   };
 
-
   // ============================================================================
-  // /pages/admin.js — Partie 5/6
-  // Scope : Actions — Live (start/pause/seek/back/next/round) +
-  //         Joueurs (reject/kick/alias) + purge/reset complet
-  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-  // ============================================================================
+// /pages/admin.js — Partie 5/6
+// Scope : Actions — Live (start/pause/seek/back/next/round) +
+//         Joueurs (reject/kick/alias) + purge/reset complet
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
   /* ------------------------------- Actions: Live ------------------------------- */
 
@@ -1555,14 +1775,12 @@ function AdminInner() {
         {
           isRunning: true,
           isPaused: false,
-          startAt: serverTimestamp(),   // ✅ horloge serveur
+          startAt: serverTimestamp(),
           pauseAt: null,
-          // Nouveau couple d’ancrage serveur
-          anchorAt: serverTimestamp(),  // ✅ même « maintenant » côté serveur
-          anchorOffsetSec: 0,           // on démarre à t = 0s
-          // On n’écrit plus startEpochMs (utile uniquement pour compat legacy)
+          anchorAt: serverTimestamp(),
+          anchorOffsetSec: 0,
           startEpochMs: null,
-          navSeq: increment(1),           // 👈 NEW
+          navSeq: increment(1),
           hbBoost: true,
         },
         { merge: true }
@@ -1580,7 +1798,6 @@ function AdminInner() {
         {
           isPaused: true,
           pauseAt: serverTimestamp(),
-          // Pause MANUELLE : effacer la sentinelle pour ne pas afficher "Fin de manche"
           lastAutoPausedRoundIndex: null,
         },
         { merge: true }
@@ -1594,7 +1811,7 @@ function AdminInner() {
   const seekTo = async (targetSec) => {
     try {
       const target = Math.max(0, Math.floor(targetSec));
-      // Neutraliser l'auto-pause si on saute au début d'une manche
+
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
@@ -1609,13 +1826,12 @@ function AdminInner() {
       const payload = {
         isRunning: true,
         isPaused: false,
-        startAt: serverTimestamp(),   // ✅ horloge serveur
+        startAt: serverTimestamp(),
         pauseAt: null,
-        // Nouveau couple d’ancrage
-        anchorAt: serverTimestamp(),  // ✅ « maintenant » serveur
-        anchorOffsetSec: target,      // t = target (s) sur la timeline
-        startEpochMs: null,           // n’écrit plus l’epoch local
-        navSeq: increment(1),           // 👈 NEW
+        anchorAt: serverTimestamp(),
+        anchorOffsetSec: target,
+        startEpochMs: null,
+        navSeq: increment(1),
         hbBoost: true,
       };
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
@@ -1632,8 +1848,6 @@ function AdminInner() {
     try {
       const elapsed = Math.max(0, Math.floor(elapsedSec));
 
-      // Reprise simple : on repart EXACTEMENT à elapsed,
-      // et on nettoie la sentinelle (sinon "Fin de la manche X" persiste)
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -1646,7 +1860,7 @@ function AdminInner() {
           startEpochMs: null,
           navSeq: increment(1),
           hbBoost: true,
-          lastAutoPausedRoundIndex: null, // 👈 important : purge
+          lastAutoPausedRoundIndex: null,
         },
         { merge: true }
       );
@@ -1656,12 +1870,10 @@ function AdminInner() {
     }
   };
 
-
   const jumpToRoundStartAndPlay = async (roundStartSec) => {
     try {
       const target = Math.max(0, Math.floor(roundStartSec));
 
-      // Sentinelle = index de la manche précédente au point (roundStartSec - 1)
       let prevIdx = -1;
       for (let i = 0; i < roundOffsetsSec.length; i++) {
         const t = roundOffsetsSec[i];
@@ -1673,13 +1885,12 @@ function AdminInner() {
         {
           isRunning: true,
           isPaused: false,
-          startAt: serverTimestamp(),   // ✅ serveur
+          startAt: serverTimestamp(),
           pauseAt: null,
-          // Ancrage serveur
           anchorAt: serverTimestamp(),
           anchorOffsetSec: target,
           startEpochMs: null,
-          navSeq: increment(1),           // 👈 NEW
+          navSeq: increment(1),
           hbBoost: true,
           lastAutoPausedRoundIndex: prevIdx,
         },
@@ -1709,13 +1920,12 @@ function AdminInner() {
       const payload = {
         isRunning: true,
         isPaused: true,
-        startAt: serverTimestamp(),    // ✅ serveur
-        pauseAt: serverTimestamp(),    // ✅ serveur
-        // Ancrage serveur
+        startAt: serverTimestamp(),
+        pauseAt: serverTimestamp(),
         anchorAt: serverTimestamp(),
         anchorOffsetSec: target,
         startEpochMs: null,
-        navSeq: increment(1),           // 👈 NEW
+        navSeq: increment(1),
         hbBoost: true,
       };
       if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
@@ -1742,20 +1952,18 @@ function AdminInner() {
       return;
     }
 
-    // 1) Première fois (quiz pas démarré) → démarrer
     if (!isRunning || !quizStartMs) {
       await startQuiz();
       return;
     }
 
-    // 2) En pause → contexte :
-    //    - si elapsed < boundary (nextStart - 1) → SAUT au début de la manche suivante
-    //    - sinon → reprise simple
     if (isPaused) {
       let nextRoundStart = null;
       if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
         const idx = lastAutoPausedRoundIndex + 1;
-        nextRoundStart = Number.isFinite(roundOffsetsSec[idx]) ? roundOffsetsSec[idx] : null;
+        nextRoundStart = Number.isFinite(roundOffsetsSec[idx])
+          ? roundOffsetsSec[idx]
+          : null;
       } else {
         nextRoundStart = actives.find((t) => t >= elapsedSec);
       }
@@ -1766,7 +1974,6 @@ function AdminInner() {
       }
       const boundary = Math.max(0, nextRoundStart);
 
-      // PATCH(Admin): attribuer la question en pause avant de quitter la manche
       await awardCurrentQuestionIfNeeded();
 
       if (elapsedSec < boundary) {
@@ -1778,13 +1985,13 @@ function AdminInner() {
     }
   };
 
-  // PATCH(Admin): helper pour attribuer la question active si besoin
   async function awardCurrentQuestionIfNeeded() {
     try {
-      const qid = currentQuestion?.id || null; // currentQuestion est déjà dérivé plus bas
+      const qid = currentQuestion?.id || null;
       if (!qid) return { ok: false, reason: "no-active-question" };
       const res = await ensureAwardsForQuestionTx(qid);
-      if (res?.reason) console.log("[Admin] awardCurrentQuestionIfNeeded:", res.reason);
+      if (res?.reason)
+        console.log("[Admin] awardCurrentQuestionIfNeeded:", res.reason);
       return res;
     } catch (e) {
       console.error("[Admin] awardCurrentQuestionIfNeeded error:", e);
@@ -1795,7 +2002,6 @@ function AdminInner() {
   const handleBack = async () => {
     if (!isPaused) return;
 
-    // Si on est sur la frontière de manche → bloqué (UX)
     if (atRoundBoundary) {
       setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
       setTimeout(() => setNotice(null), 1600);
@@ -1806,7 +2012,8 @@ function AdminInner() {
       .filter((t) => typeof t === "number")
       .sort((a, b) => a - b);
     const firstActive = actives[0] ?? 0;
-    const roundStart = actives.filter((t) => t <= elapsedSec).slice(-1)[0] ?? firstActive;
+    const roundStart =
+      actives.filter((t) => t <= elapsedSec).slice(-1)[0] ?? firstActive;
     const roundEnd = actives.find((t) => t > roundStart) ?? Infinity;
 
     if (!plannedTimes.length || elapsedSec < firstActive) {
@@ -1814,7 +2021,9 @@ function AdminInner() {
       return;
     }
 
-    const inRound = plannedTimes.filter((t) => t >= roundStart && t < roundEnd);
+    const inRound = plannedTimes.filter(
+      (t) => t >= roundStart && t < roundEnd
+    );
     if (!inRound.some((t) => t <= elapsedSec)) {
       await seekTo(roundStart);
       return;
@@ -1849,11 +2058,15 @@ function AdminInner() {
         .filter((t) => typeof t === "number" && t <= elapsedSec)
         .slice(-1)[0] ?? 0;
     const currentRoundEndLocal =
-      roundOffsetsSec.find((t) => typeof t === "number" && t > currentRoundStartLocal) ?? Infinity;
+      roundOffsetsSec.find(
+        (t) => typeof t === "number" && t > currentRoundStartLocal
+      ) ?? Infinity;
 
-    const next = plannedTimes.find((t) => t > elapsedSec && t < currentRoundEndLocal);
+    const next = plannedTimes.find(
+      (t) => t > elapsedSec && t < currentRoundEndLocal
+    );
     if (typeof next === "number") {
-      await awardCurrentQuestionIfNeeded(); // PATCH(Admin): attribuer la question en pause avant de sauter
+      await awardCurrentQuestionIfNeeded();
       await seekTo(next);
     } else {
       setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
@@ -1862,12 +2075,15 @@ function AdminInner() {
   };
 
   async function goToRoundEndPaused() {
-    const prevIdx = roundIndexOfTime(Math.max(0, elapsedSec - 1), roundOffsetsSec);
+    const prevIdx = roundIndexOfTime(
+      Math.max(0, elapsedSec - 1),
+      roundOffsetsSec
+    );
     const nextStart =
       typeof roundOffsetsSec[prevIdx + 1] === "number"
         ? roundOffsetsSec[prevIdx + 1]
         : null;
-    if (!Number.isFinite(nextStart)) return; // pas de manche suivante
+    if (!Number.isFinite(nextStart)) return;
 
     const targetSec = Math.max(0, Math.floor(nextStart));
     try {
@@ -1876,13 +2092,12 @@ function AdminInner() {
         {
           isRunning: true,
           isPaused: true,
-          startAt: serverTimestamp(),     // ✅ serveur
-          pauseAt: serverTimestamp(),     // ✅ serveur
-          // Ancrage serveur
+          startAt: serverTimestamp(),
+          pauseAt: serverTimestamp(),
           anchorAt: serverTimestamp(),
           anchorOffsetSec: targetSec,
           startEpochMs: null,
-          navSeq: increment(1),           // 👈 NEW
+          navSeq: increment(1),
           hbBoost: true,
           lastAutoPausedRoundIndex: prevIdx,
         },
@@ -1893,22 +2108,22 @@ function AdminInner() {
     }
   }
 
-
   /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
 
-  // [5.1] Récupère un N unique et libre pour "Player N"
+  // [5.1] Alias "Player N"
   async function getNextAliasNumber() {
     const stateRef = doc(db, "quiz", "state");
     let reservedN = await runTransaction(db, async (tx) => {
       const snap = await tx.get(stateRef);
       const data = snap.exists() ? snap.data() : {};
-      const current = Number.isFinite(data?.aliasCounter) ? data.aliasCounter : 1;
+      const current = Number.isFinite(data?.aliasCounter)
+        ? data.aliasCounter
+        : 1;
       const next = current + 1;
       tx.set(stateRef, { aliasCounter: next }, { merge: true });
-      return current; // on utilise la valeur actuelle
+      return current;
     });
 
-    // Collision (rare) : si "Player reservedN" existe déjà -> on boucle
     while (true) {
       const nameNorm = normKey(`Player ${reservedN}`);
       const playersCol = collection(db, "quiz", "state", "players");
@@ -1919,7 +2134,9 @@ function AdminInner() {
       reservedN = await runTransaction(db, async (tx) => {
         const snap2 = await tx.get(stateRef);
         const data2 = snap2.exists() ? snap2.data() : {};
-        const current2 = Number.isFinite(data2?.aliasCounter) ? data2.aliasCounter : 1;
+        const current2 = Number.isFinite(data2?.aliasCounter)
+          ? data2.aliasCounter
+          : 1;
         const next2 = current2 + 1;
         tx.set(stateRef, { aliasCounter: next2 }, { merge: true });
         return current2;
@@ -1933,23 +2150,25 @@ function AdminInner() {
       const playersCol = collection(db, "quiz", "state", "players");
       const ref = doc(playersCol, playerId);
 
-      // Lire l’état courant pour savoir si c’est un alias “Player N”
       const snap = await getDoc(ref);
       if (!snap.exists()) return;
       const d = snap.data() || {};
 
-      const isAliased = !!d.isAlias; // flag posé par “Player N”
-      const norm = normKey(typeof d.name === "string" ? d.name : (currentName || ""));
+      const isAliased = !!d.isAlias;
+      const norm = normKey(
+        typeof d.name === "string" ? d.name : currentName || ""
+      );
 
-      // Base: passer en "rejected" et déverrouiller
       const baseUpdates = {
         nameStatus: "rejected",
         nameLocked: false,
         isAlias: false,
-        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+        updatedAt:
+          typeof serverTimestamp === "function"
+            ? serverTimestamp()
+            : new Date(),
       };
 
-      // ⛔️ On n’ajoute PAS “player n” dans rejectedNames
       const updates = isAliased
         ? baseUpdates
         : { ...baseUpdates, rejectedNames: arrayUnion(norm) };
@@ -1983,11 +2202,14 @@ function AdminInner() {
       await updateDoc(ref, {
         name: alias,
         nameNorm: aliasNorm,
-        nameLocked: true,        // verrouille le nom
-        nameStatus: "locked",    // UI: bouton "Player N" devient "Owned :)"
+        nameLocked: true,
+        nameStatus: "locked",
         isAlias: true,
         aliasNumber: n,
-        updatedAt: (typeof serverTimestamp === "function" ? serverTimestamp() : new Date()),
+        updatedAt:
+          typeof serverTimestamp === "function"
+            ? serverTimestamp()
+            : new Date(),
       });
     } catch (e) {
       console.error("renameToAlias", e);
@@ -2016,7 +2238,6 @@ function AdminInner() {
     for (const qDoc of answersSnap.docs) {
       const qid = qDoc.id;
 
-      // Submissions/*
       const subsCol = collection(db, "answers", qid, "submissions");
       const subsSnap = await getDocs(subsCol);
       if (!subsSnap.empty) {
@@ -2029,7 +2250,6 @@ function AdminInner() {
         }
       }
 
-      // Awards/*
       const awardsCol = collection(db, "answers", qid, "awards");
       const awardsSnap = await getDocs(awardsCol);
       if (!awardsSnap.empty) {
@@ -2042,19 +2262,19 @@ function AdminInner() {
         }
       }
 
-      // Doc racine answers/{qid}
       await deleteDoc(doc(answersCol, qid));
     }
   }
 
   // [5.7] Reset complet du quiz + joueurs + answers/*
   async function resetQuizAndPlayers() {
-    const ok = window.confirm("Tout remettre à zéro ? (quiz/state, joueurs, answers/*)");
+    const ok = window.confirm(
+      "Tout remettre à zéro ? (quiz/state, joueurs, answers/*)"
+    );
     if (!ok) return;
 
     setNotice("Réinitialisation…");
     try {
-      // 1) Stopper proprement /quiz/state
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -2071,13 +2291,10 @@ function AdminInner() {
         { merge: true }
       );
 
-      // 2) Purger toute l’arbo answers/*
       await purgeAnswersTree();
 
-      // 3) Supprimer tous les joueurs
       await deleteAllPlayers();
 
-      // 4) Marqueur de reset + compteur d’alias
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -2096,14 +2313,16 @@ function AdminInner() {
     }
   }
 
-  // ============================================================================
-  // /pages/admin.js — Partie 6/6
-  // Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
-  //         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
-  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-  // ============================================================================
+// ============================================================================
+// /pages/admin.js — Partie 6/6
+// Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
+//         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
+// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// ============================================================================
 
-  /* ================= UI DÉRIVÉES & RENDU (PARTIE 4/4) ================= */
+// ===================== PARTIE 6.1/6 — AdminInner : UI =====================
+
+  /* ================= UI DÉRIVÉES ================= */
 
   /* --- Couleurs & libellés UI --- */
   const roundColors = [
@@ -2172,8 +2391,6 @@ function AdminInner() {
   // Largeur fixe + couleur pastel différente quand on est en "Reprendre"
   const PAUSE_BTN_WIDTH = 120; // px, dimensionnée pour "Reprendre"
   const pauseBtnBg = isPaused ? "#dfd6ff" : "#FECACA"; // Reprendre = pêche pastel, Pause = saumon pastel d'origine
-
-
 
 
   // ===== Rangs (égalité) pour l'affichage des médailles et du rang (sans toucher l'ordre du tableau)
@@ -2541,10 +2758,6 @@ function AdminInner() {
                     )}
                   </td>
 
-
-
-
-
                   {/* Image réponse (fallback lecture ancien imageUrl) */}
                   <td style={{ width: "12%", verticalAlign: "top", padding: "12px" }}>
                     {(it.imageReponseUrl || it.imageUrl) ? (
@@ -2592,8 +2805,6 @@ function AdminInner() {
                     />
                   </td>
 
-
-
                   <td style={{ textAlign: "center", whiteSpace: "nowrap", verticalAlign: "top", padding: "12px" }}>
                     <button onClick={() => saveOne(it)} disabled={savingId === it.id}>
                       {savingId === it.id ? "Modification…" : "Modifier"}
@@ -2615,7 +2826,7 @@ function AdminInner() {
   }, [items, loading, savingId, savedRowId, roundOffsetsSec, quizEndSec]);
 
 
-  /* --------------------------------- Rendu --------------------------------- */
+// ===================== PARTIE 6.2/6 — AdminInner : Rendu =====================
   return (
     <div style={{ background: "#0a0a1a", color: "white", minHeight: "100vh", padding: 20 }}>
       {/* Header */}
@@ -3401,6 +3612,8 @@ function AdminInner() {
   );
 }
 
+// ===================== PARTIE 6.3/6 — Wrapper protégé par mot de passe =====================
+
 export default function Admin() {
   const ADMIN_PASSWORD = "ChoupiEleyBoxAdmin";
 
@@ -3509,4 +3722,3 @@ export default function Admin() {
   // Une fois déverrouillé → on rend ton vrai admin
   return <AdminInner />;
 }
-
