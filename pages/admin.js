@@ -767,7 +767,7 @@ function AdminInner() {
     // roundOffsetsSec par quiz
     const byQuiz =
       d.roundOffsetsSecByQuiz &&
-      typeof d.roundOffsetsSecByQuiz === "object"
+        typeof d.roundOffsetsSecByQuiz === "object"
         ? d.roundOffsetsSecByQuiz
         : null;
 
@@ -789,7 +789,7 @@ function AdminInner() {
     // endOffsetSec par quiz
     const endByQuiz =
       d.endOffsetSecByQuiz &&
-      typeof d.endOffsetSecByQuiz === "object"
+        typeof d.endOffsetSecByQuiz === "object"
         ? d.endOffsetSecByQuiz
         : null;
 
@@ -905,400 +905,400 @@ function AdminInner() {
     return () => unsub();
   }, []);
 
-// ============================================================================
-// /pages/admin.js — Partie 3/6
-// Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
-//         Watcher d’attribution automatique
-// Règles : aucune modification fonctionnelle ; uniquement cosmétique.
-// ============================================================================
+  // ============================================================================
+  // /pages/admin.js — Partie 3/6
+  // Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
+  //         Watcher d’attribution automatique
+  // Règles : aucune modification fonctionnelle ; uniquement cosmétique.
+  // ============================================================================
 
-// [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
-useEffect(() => {
-  if (!quizStartMs) {
-    setElapsedSec(0);
-    return;
-  }
-
-  if (isPaused && pauseAtMs) {
-    const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
-    const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
-    setElapsedSec(clamped < 0 ? 0 : clamped);
-    return;
-  }
-
-  if (!isRunning) {
-    setElapsedSec(0);
-    return;
-  }
-
-  const computeNow = () =>
-    Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
-
-  const first = computeNow();
-  const firstClamped = Number.isFinite(quizEndSec)
-    ? Math.min(first, quizEndSec)
-    : first;
-  setElapsedSec(firstClamped < 0 ? 0 : firstClamped);
-
-  const id = setInterval(() => {
-    const raw = computeNow();
-    if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
-      setElapsedSec(Math.max(0, quizEndSec));
-      clearInterval(id);
-    } else {
-      setElapsedSec(raw < 0 ? 0 : raw);
+  // [3.1] Effect — 4) Timer local (avec clamp fin de quiz)
+  useEffect(() => {
+    if (!quizStartMs) {
+      setElapsedSec(0);
+      return;
     }
-  }, 500);
 
-  return () => clearInterval(id);
-}, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
-
-// [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
-useEffect(() => {
-  if (!isRunning || isPaused) return;
-  if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
-    return;
-
-  // Manche courante = dernière dont l’offset ≤ elapsedSec
-  let prevIdx = -1;
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && elapsedSec >= t) {
-      prevIdx = i;
+    if (isPaused && pauseAtMs) {
+      const e = Math.floor((pauseAtMs - quizStartMs) / 1000);
+      const clamped = Number.isFinite(quizEndSec) ? Math.min(e, quizEndSec) : e;
+      setElapsedSec(clamped < 0 ? 0 : clamped);
+      return;
     }
-  }
-  if (prevIdx < 0) return;
 
-  const nextStart =
-    typeof roundOffsetsSec[prevIdx + 1] === "number"
+    if (!isRunning) {
+      setElapsedSec(0);
+      return;
+    }
+
+    const computeNow = () =>
+      Math.floor(((Date.now() + serverDeltaRef.current) - quizStartMs) / 1000);
+
+    const first = computeNow();
+    const firstClamped = Number.isFinite(quizEndSec)
+      ? Math.min(first, quizEndSec)
+      : first;
+    setElapsedSec(firstClamped < 0 ? 0 : firstClamped);
+
+    const id = setInterval(() => {
+      const raw = computeNow();
+      if (Number.isFinite(quizEndSec) && raw >= quizEndSec) {
+        setElapsedSec(Math.max(0, quizEndSec));
+        clearInterval(id);
+      } else {
+        setElapsedSec(raw < 0 ? 0 : raw);
+      }
+    }, 500);
+
+    return () => clearInterval(id);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
+
+  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
+  useEffect(() => {
+    if (!isRunning || isPaused) return;
+    if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
+      return;
+
+    // Manche courante = dernière dont l’offset ≤ elapsedSec
+    let prevIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) {
+        prevIdx = i;
+      }
+    }
+    if (prevIdx < 0) return;
+
+    const nextStart =
+      typeof roundOffsetsSec[prevIdx + 1] === "number"
+        ? roundOffsetsSec[prevIdx + 1]
+        : null;
+    if (typeof nextStart !== "number") return;
+
+    // Frontière = 1 seconde AVANT le début de la manche suivante
+    const boundary = Math.max(0, nextStart - 1);
+
+    if (elapsedSec < boundary) return;
+
+    // Déjà auto-pausé pour cette manche → ne rien refaire
+    if (lastAutoPausedRoundIndex === prevIdx) return;
+
+    setDoc(
+      doc(db, "quiz", "state"),
+      {
+        isPaused: true,
+        pauseAt: serverTimestamp(),
+        lastAutoPausedRoundIndex: prevIdx,
+      },
+      { merge: true }
+    ).catch(console.error);
+  }, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
+
+  // [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
+  useEffect(() => {
+    const playersCol = collection(db, "quiz", "state", "players");
+
+    const unsub = onSnapshot(playersCol, (snap) => {
+      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+      // Normaliser nameNorm + assigner une couleur si manquante
+      arr.forEach((p) => {
+        const pref = doc(db, "quiz", "state", "players", p.id);
+
+        if (
+          (!p.nameNorm || typeof p.nameNorm !== "string") &&
+          typeof p.name === "string"
+        ) {
+          updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => { });
+        }
+
+        if (!p.color && !assignedColorRef.current.has(p.id)) {
+          assignedColorRef.current.add(p.id);
+          const prev = lastAssignedColorRef.current;
+          const color = pickColorDifferent(prev);
+          lastAssignedColorRef.current = color;
+          updateDoc(pref, { color }).catch(() => { });
+        }
+      });
+
+      // Mémoriser l’ordre d’arrivée (local, stable)
+      arr.forEach((p) => {
+        if (!playerOrderRef.current.has(p.id)) {
+          playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
+        }
+      });
+
+      // Tri par ordre d’arrivée
+      arr.sort(
+        (a, b) =>
+          (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
+          (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
+      );
+
+      setPlayers(arr);
+      setPlayersLoading(false);
+    });
+
+    return () => unsub();
+  }, []);
+
+  // [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
+  useEffect(() => {
+    const stateRef = doc(db, "quiz", "state");
+    let intervalMs = 5000;
+    let hbId = null;
+    let watchId = null;
+    let boostTimer = null;
+
+    const tick = () =>
+      setDoc(stateRef, { serverNow: serverTimestamp() }, { merge: true }).catch(
+        () => { }
+      );
+
+    const startHB = () => {
+      clearInterval(hbId);
+      hbId = setInterval(tick, intervalMs);
+    };
+
+    const unsub = onSnapshot(stateRef, (snap) => {
+      const d = snap.data() || {};
+      if (d.hbBoost === true) {
+        clearTimeout(boostTimer);
+        intervalMs = 200;
+        startHB();
+        boostTimer = setTimeout(() => {
+          intervalMs =
+            isCountdownRef.current || isRevealRef.current ? 500 : 5000;
+          startHB();
+          setDoc(stateRef, { hbBoost: false }, { merge: true }).catch(() => { });
+        }, 1500);
+      }
+    });
+
+    // Observer local : ajuster 500 ms pendant reveal/countdown sinon 5000 ms
+    watchId = setInterval(() => {
+      if (boostTimer) return;
+      const target =
+        isCountdownRef.current || isRevealRef.current ? 500 : 5000;
+      if (target !== intervalMs) {
+        intervalMs = target;
+        startHB();
+      }
+    }, 300);
+
+    tick();
+    startHB();
+
+    return () => {
+      clearInterval(hbId);
+      clearInterval(watchId);
+      clearTimeout(boostTimer);
+      unsub();
+    };
+  }, []);
+
+  // ========================================================================
+  // DÉRIVÉS & PHASES (rounds/reveal/countdown) + Watcher attribution auto
+  // ========================================================================
+
+  /* --------- Dérivés simples --------- */
+  const connectedCount = useMemo(
+    () => players.filter((p) => !p?.isKicked).length,
+    [players]
+  );
+
+  const plannedTimes = useMemo(
+    () =>
+      items
+        .map(getTimeSec)
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => a - b),
+    [items]
+  );
+
+  /* --------- Dérivés “rounds & reveal” --------- */
+  const currentRoundIndex = useMemo(() => {
+    let lastIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
+    }
+    if (lastIdx >= 0) return lastIdx;
+
+    const firstActiveIdx = roundOffsetsSec.findIndex((t) =>
+      Number.isFinite(t)
+    );
+    return firstActiveIdx !== -1 ? firstActiveIdx : 0;
+  }, [elapsedSec, roundOffsetsSec]);
+
+  const nextRoundIndex = useMemo(() => {
+    if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
+      const idx = lastAutoPausedRoundIndex + 1;
+      return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
+    }
+
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && t > elapsedSec) return i;
+    }
+    return null;
+  }, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
+
+  const roundBoundarySec = useMemo(() => {
+    if (
+      !Array.isArray(roundOffsetsSec) ||
+      roundOffsetsSec.every((v) => v == null)
+    )
+      return null;
+
+    let prevIdx = -1;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
+    }
+
+    const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
       ? roundOffsetsSec[prevIdx + 1]
       : null;
-  if (typeof nextStart !== "number") return;
 
-  // Frontière = 1 seconde AVANT le début de la manche suivante
-  const boundary = Math.max(0, nextStart - 1);
+    return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
+  }, [elapsedSec, roundOffsetsSec]);
 
-  if (elapsedSec < boundary) return;
-
-  // Déjà auto-pausé pour cette manche → ne rien refaire
-  if (lastAutoPausedRoundIndex === prevIdx) return;
-
-  setDoc(
-    doc(db, "quiz", "state"),
-    {
-      isPaused: true,
-      pauseAt: serverTimestamp(),
-      lastAutoPausedRoundIndex: prevIdx,
-    },
-    { merge: true }
-  ).catch(console.error);
-}, [isRunning, isPaused, elapsedSec, roundOffsetsSec, lastAutoPausedRoundIndex]);
-
-// [3.3] Effect — 6) Écouter /quiz/state/players : normaliser + couleurs + ordre d’arrivée
-useEffect(() => {
-  const playersCol = collection(db, "quiz", "state", "players");
-
-  const unsub = onSnapshot(playersCol, (snap) => {
-    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-    // Normaliser nameNorm + assigner une couleur si manquante
-    arr.forEach((p) => {
-      const pref = doc(db, "quiz", "state", "players", p.id);
-
-      if (
-        (!p.nameNorm || typeof p.nameNorm !== "string") &&
-        typeof p.name === "string"
-      ) {
-        updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => {});
-      }
-
-      if (!p.color && !assignedColorRef.current.has(p.id)) {
-        assignedColorRef.current.add(p.id);
-        const prev = lastAssignedColorRef.current;
-        const color = pickColorDifferent(prev);
-        lastAssignedColorRef.current = color;
-        updateDoc(pref, { color }).catch(() => {});
-      }
-    });
-
-    // Mémoriser l’ordre d’arrivée (local, stable)
-    arr.forEach((p) => {
-      if (!playerOrderRef.current.has(p.id)) {
-        playerOrderRef.current.set(p.id, nextPlayerOrderRef.current++);
-      }
-    });
-
-    // Tri par ordre d’arrivée
-    arr.sort(
-      (a, b) =>
-        (playerOrderRef.current.get(a.id) ?? Number.POSITIVE_INFINITY) -
-        (playerOrderRef.current.get(b.id) ?? Number.POSITIVE_INFINITY)
-    );
-
-    setPlayers(arr);
-    setPlayersLoading(false);
-  });
-
-  return () => unsub();
-}, []);
-
-// [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
-useEffect(() => {
-  const stateRef = doc(db, "quiz", "state");
-  let intervalMs = 5000;
-  let hbId = null;
-  let watchId = null;
-  let boostTimer = null;
-
-  const tick = () =>
-    setDoc(stateRef, { serverNow: serverTimestamp() }, { merge: true }).catch(
-      () => {}
-    );
-
-  const startHB = () => {
-    clearInterval(hbId);
-    hbId = setInterval(tick, intervalMs);
-  };
-
-  const unsub = onSnapshot(stateRef, (snap) => {
-    const d = snap.data() || {};
-    if (d.hbBoost === true) {
-      clearTimeout(boostTimer);
-      intervalMs = 200;
-      startHB();
-      boostTimer = setTimeout(() => {
-        intervalMs =
-          isCountdownRef.current || isRevealRef.current ? 500 : 5000;
-        startHB();
-        setDoc(stateRef, { hbBoost: false }, { merge: true }).catch(() => {});
-      }, 1500);
-    }
-  });
-
-  // Observer local : ajuster 500 ms pendant reveal/countdown sinon 5000 ms
-  watchId = setInterval(() => {
-    if (boostTimer) return;
-    const target =
-      isCountdownRef.current || isRevealRef.current ? 500 : 5000;
-    if (target !== intervalMs) {
-      intervalMs = target;
-      startHB();
-    }
-  }, 300);
-
-  tick();
-  startHB();
-
-  return () => {
-    clearInterval(hbId);
-    clearInterval(watchId);
-    clearTimeout(boostTimer);
-    unsub();
-  };
-}, []);
-
-// ========================================================================
-// DÉRIVÉS & PHASES (rounds/reveal/countdown) + Watcher attribution auto
-// ========================================================================
-
-/* --------- Dérivés simples --------- */
-const connectedCount = useMemo(
-  () => players.filter((p) => !p?.isKicked).length,
-  [players]
-);
-
-const plannedTimes = useMemo(
-  () =>
-    items
-      .map(getTimeSec)
-      .filter((t) => Number.isFinite(t))
-      .sort((a, b) => a - b),
-  [items]
-);
-
-/* --------- Dérivés “rounds & reveal” --------- */
-const currentRoundIndex = useMemo(() => {
-  let lastIdx = -1;
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && elapsedSec >= t) lastIdx = i;
-  }
-  if (lastIdx >= 0) return lastIdx;
-
-  const firstActiveIdx = roundOffsetsSec.findIndex((t) =>
-    Number.isFinite(t)
-  );
-  return firstActiveIdx !== -1 ? firstActiveIdx : 0;
-}, [elapsedSec, roundOffsetsSec]);
-
-const nextRoundIndex = useMemo(() => {
-  if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
-    const idx = lastAutoPausedRoundIndex + 1;
-    return Number.isFinite(roundOffsetsSec[idx]) ? idx : null;
-  }
-
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && t > elapsedSec) return i;
-  }
-  return null;
-}, [elapsedSec, roundOffsetsSec, isPaused, lastAutoPausedRoundIndex]);
-
-const roundBoundarySec = useMemo(() => {
-  if (
-    !Array.isArray(roundOffsetsSec) ||
-    roundOffsetsSec.every((v) => v == null)
-  )
-    return null;
-
-  let prevIdx = -1;
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && elapsedSec >= t) prevIdx = i;
-  }
-
-  const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
-    ? roundOffsetsSec[prevIdx + 1]
-    : null;
-
-  return typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-}, [elapsedSec, roundOffsetsSec]);
-
-const atRoundBoundary = Boolean(
-  isPaused &&
+  const atRoundBoundary = Boolean(
+    isPaused &&
     typeof roundBoundarySec === "number" &&
     elapsedSec >= roundBoundarySec
-);
+  );
 
-// Questions triées par timecode
-const sortedQuestions = useMemo(
-  () => [...items].sort((a, b) => getTimeSec(a) - getTimeSec(b)),
-  [items]
-);
+  // Questions triées par timecode
+  const sortedQuestions = useMemo(
+    () => [...items].sort((a, b) => getTimeSec(a) - getTimeSec(b)),
+    [items]
+  );
 
-const currentRoundStart = useMemo(() => {
-  let s = 0;
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && elapsedSec >= t) s = t;
+  const currentRoundStart = useMemo(() => {
+    let s = 0;
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && elapsedSec >= t) s = t;
+    }
+    return s;
+  }, [elapsedSec, roundOffsetsSec]);
+
+  const currentRoundEnd = useMemo(() => {
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const t = roundOffsetsSec[i];
+      if (Number.isFinite(t) && t > currentRoundStart) return t;
+    }
+    return Infinity;
+  }, [roundOffsetsSec, currentRoundStart]);
+
+  let _activeIdx = -1;
+  for (let i = 0; i < sortedQuestions.length; i++) {
+    const t = getTimeSec(sortedQuestions[i]);
+    if (!Number.isFinite(t) || t < currentRoundStart) continue;
+    if (t <= elapsedSec && t < currentRoundEnd) _activeIdx = i;
+    else if (t >= currentRoundEnd) break;
   }
-  return s;
-}, [elapsedSec, roundOffsetsSec]);
+  const currentQuestion = _activeIdx >= 0 ? sortedQuestions[_activeIdx] : null;
 
-const currentRoundEnd = useMemo(() => {
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const t = roundOffsetsSec[i];
-    if (Number.isFinite(t) && t > currentRoundStart) return t;
+  // Prochain événement (question / frontière / fin)
+  let nextTimeSec = null;
+  for (let i = 0; i < sortedQuestions.length; i++) {
+    const t = getTimeSec(sortedQuestions[i]);
+    if (Number.isFinite(t) && t > elapsedSec) {
+      nextTimeSec = t;
+      break;
+    }
   }
-  return Infinity;
-}, [roundOffsetsSec, currentRoundStart]);
 
-let _activeIdx = -1;
-for (let i = 0; i < sortedQuestions.length; i++) {
-  const t = getTimeSec(sortedQuestions[i]);
-  if (!Number.isFinite(t) || t < currentRoundStart) continue;
-  if (t <= elapsedSec && t < currentRoundEnd) _activeIdx = i;
-  else if (t >= currentRoundEnd) break;
-}
-const currentQuestion = _activeIdx >= 0 ? sortedQuestions[_activeIdx] : null;
+  const _nextRoundStart = (() => {
+    for (let i = 0; i < roundOffsetsSec.length; i++) {
+      const v = roundOffsetsSec[i];
+      if (typeof v === "number" && v > elapsedSec) return v;
+    }
+    return null;
+  })();
 
-// Prochain événement (question / frontière / fin)
-let nextTimeSec = null;
-for (let i = 0; i < sortedQuestions.length; i++) {
-  const t = getTimeSec(sortedQuestions[i]);
-  if (Number.isFinite(t) && t > elapsedSec) {
-    nextTimeSec = t;
-    break;
-  }
-}
-
-const _nextRoundStart = (() => {
-  for (let i = 0; i < roundOffsetsSec.length; i++) {
-    const v = roundOffsetsSec[i];
-    if (typeof v === "number" && v > elapsedSec) return v;
-  }
-  return null;
-})();
-
-const nextRoundBoundary = Number.isFinite(_nextRoundStart)
-  ? Math.max(0, _nextRoundStart)
-  : null;
-
-const candidates = [];
-if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
-if (Number.isFinite(nextRoundBoundary)) candidates.push(nextRoundBoundary);
-if (Number.isFinite(quizEndSec)) candidates.push(quizEndSec);
-
-const effectiveNextTimeSec = candidates.length
-  ? Math.min(...candidates)
-  : null;
-
-// Fenêtres reveal / countdown
-const REVEAL_DURATION_SEC = DEFAULT_REVEAL_DURATION_SEC;
-const COUNTDOWN_START_SEC = 5;
-
-const revealStart =
-  effectiveNextTimeSec != null
-    ? effectiveNextTimeSec - REVEAL_DURATION_SEC
+  const nextRoundBoundary = Number.isFinite(_nextRoundStart)
+    ? Math.max(0, _nextRoundStart)
     : null;
 
-const countdownStart =
-  effectiveNextTimeSec != null
-    ? effectiveNextTimeSec - COUNTDOWN_START_SEC
+  const candidates = [];
+  if (Number.isFinite(nextTimeSec)) candidates.push(nextTimeSec);
+  if (Number.isFinite(nextRoundBoundary)) candidates.push(nextRoundBoundary);
+  if (Number.isFinite(quizEndSec)) candidates.push(quizEndSec);
+
+  const effectiveNextTimeSec = candidates.length
+    ? Math.min(...candidates)
     : null;
 
-const isRevealAnswerPhase = Boolean(
-  currentQuestion &&
+  // Fenêtres reveal / countdown
+  const REVEAL_DURATION_SEC = DEFAULT_REVEAL_DURATION_SEC;
+  const COUNTDOWN_START_SEC = 5;
+
+  const revealStart =
+    effectiveNextTimeSec != null
+      ? effectiveNextTimeSec - REVEAL_DURATION_SEC
+      : null;
+
+  const countdownStart =
+    effectiveNextTimeSec != null
+      ? effectiveNextTimeSec - COUNTDOWN_START_SEC
+      : null;
+
+  const isRevealAnswerPhase = Boolean(
+    currentQuestion &&
     revealStart != null &&
     countdownStart != null &&
     elapsedSec >= revealStart &&
     elapsedSec < countdownStart &&
     !isPaused
-);
+  );
 
-const isCountdownPhase = Boolean(
-  currentQuestion &&
+  const isCountdownPhase = Boolean(
+    currentQuestion &&
     countdownStart != null &&
     effectiveNextTimeSec != null &&
     elapsedSec >= countdownStart &&
     elapsedSec < effectiveNextTimeSec &&
     !isPaused
-);
+  );
 
-useEffect(() => {
-  isCountdownRef.current = !!isCountdownPhase;
-}, [isCountdownPhase]);
+  useEffect(() => {
+    isCountdownRef.current = !!isCountdownPhase;
+  }, [isCountdownPhase]);
 
-useEffect(() => {
-  isRevealRef.current = !!isRevealAnswerPhase;
-}, [isRevealAnswerPhase]);
+  useEffect(() => {
+    isRevealRef.current = !!isRevealAnswerPhase;
+  }, [isRevealAnswerPhase]);
 
-/* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
-useEffect(() => {
-  const qid = currentQuestion?.id || null;
-  const isReveal = isRevealAnswerPhase || isCountdownPhase;
-  if (!qid || !isReveal) return;
-  if (awardGuardRef.current[qid]) return;
+  /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
+  useEffect(() => {
+    const qid = currentQuestion?.id || null;
+    const isReveal = isRevealAnswerPhase || isCountdownPhase;
+    if (!qid || !isReveal) return;
+    if (awardGuardRef.current[qid]) return;
 
-  awardGuardRef.current[qid] = "pending";
+    awardGuardRef.current[qid] = "pending";
 
-  ensureAwardsForQuestionTx(qid).catch((e) => {
-    console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
-    delete awardGuardRef.current[qid];
-  });
-}, [
-  currentQuestion?.id,
-  isRevealAnswerPhase,
-  isCountdownPhase,
-  elapsedSec,
-  isPaused,
-]);
+    ensureAwardsForQuestionTx(qid).catch((e) => {
+      console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
+      delete awardGuardRef.current[qid];
+    });
+  }, [
+    currentQuestion?.id,
+    isRevealAnswerPhase,
+    isCountdownPhase,
+    elapsedSec,
+    isPaused,
+  ]);
 
-// ============================================================================
-// /pages/admin.js — Partie 4/6
-// Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // ============================================================================
+  // /pages/admin.js — Partie 4/6
+  // Scope : Actions — Questions (recalc timecodes, CRUD, uploads, offsets/fin)
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
   // [4.1] Recalcul global des timecodes depuis l'ordre + TimeMusic (par quiz)
   async function recalcAllTimecodesFromOrder() {
@@ -1385,8 +1385,8 @@ useEffect(() => {
 
       const existingByQuiz =
         configDoc &&
-        configDoc.roundOffsetsSecByQuiz &&
-        typeof configDoc.roundOffsetsSecByQuiz === "object"
+          configDoc.roundOffsetsSecByQuiz &&
+          typeof configDoc.roundOffsetsSecByQuiz === "object"
           ? configDoc.roundOffsetsSecByQuiz
           : {};
 
@@ -1430,8 +1430,8 @@ useEffect(() => {
 
       const existingByQuiz =
         configDoc &&
-        configDoc.endOffsetSecByQuiz &&
-        typeof configDoc.endOffsetSecByQuiz === "object"
+          configDoc.endOffsetSecByQuiz &&
+          typeof configDoc.endOffsetSecByQuiz === "object"
           ? configDoc.endOffsetSecByQuiz
           : {};
 
@@ -1475,7 +1475,7 @@ useEffect(() => {
       return await new Promise((resolve, reject) => {
         task.on(
           "state_changed",
-          () => {},
+          () => { },
           (err) => {
             console.error("[UPLOAD] Erreur:", err);
             alert("Échec de l’upload : " + (err?.message || err));
@@ -1541,8 +1541,8 @@ useEffect(() => {
       const nextTimeMusicSec = hasTimeMusicStr
         ? clampTimeMusicSec(parseHMS(it.timeMusicStr))
         : Number.isFinite(it.timeMusicSec)
-        ? clampTimeMusicSec(it.timeMusicSec)
-        : DEFAULT_TIME_MUSIC_SEC;
+          ? clampTimeMusicSec(it.timeMusicSec)
+          : DEFAULT_TIME_MUSIC_SEC;
 
       // Base payload (sans deleteField)
       const payload = {
@@ -1550,8 +1550,8 @@ useEffect(() => {
         answers: hasAnswersCsv
           ? parseCSV(it.answersCsv)
           : Array.isArray(it.answers)
-          ? it.answers
-          : [],
+            ? it.answers
+            : [],
 
         matchingMode:
           typeof it.matchingMode === "string" && it.matchingMode
@@ -1760,13 +1760,31 @@ useEffect(() => {
   };
 
   // ============================================================================
-// /pages/admin.js — Partie 5/6
-// Scope : Actions — Live (start/pause/seek/back/next/round) +
-//         Joueurs (reject/kick/alias) + purge/reset complet
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // /pages/admin.js — Partie 5/6
+  // Scope : Actions — Live (start/pause/seek/back/next/round) +
+  //         Joueurs (reject/kick/alias) + purge/reset complet
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
-  /* ------------------------------- Actions: Live ------------------------------- */
+  
+
+  // Garde-fou : dès que le quiz démarre réellement, on force l’onglet sur le quiz actif
+  const wasRunningRefForTab = useRef(false);
+
+  useEffect(() => {
+    const nowRunning = isRunning && !!quizStartMs;
+    const wasRunning = wasRunningRefForTab.current;
+
+    // Transition "pas en cours" -> "en cours"
+    if (!wasRunning && nowRunning && activeQuizKey) {
+      setSelectedQuizKey(activeQuizKey);
+      setAdminTab(`quiz:${activeQuizKey}`);
+    }
+
+    wasRunningRefForTab.current = nowRunning;
+  }, [isRunning, quizStartMs, activeQuizKey, setAdminTab, setSelectedQuizKey]);
+
+/* ------------------------------- Actions: Live ------------------------------- */
 
   const startQuiz = async () => {
     try {
@@ -2313,14 +2331,14 @@ useEffect(() => {
     }
   }
 
-// ============================================================================
-// /pages/admin.js — Partie 6/6
-// Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
-//         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
-// ============================================================================
+  // ============================================================================
+  // /pages/admin.js — Partie 6/6
+  // Scope : UI dérivées (couleurs/libellés/ranking), tableau Questions (mémo),
+  //         Rendu JSX complet (header, toolbar, onglets Joueurs/Questions)
+  // Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+  // ============================================================================
 
-// ===================== PARTIE 6.1/6 — AdminInner : UI =====================
+  // ===================== PARTIE 6.1/6 — AdminInner : UI =====================
 
   /* ================= UI DÉRIVÉES ================= */
 
@@ -2360,6 +2378,9 @@ useEffect(() => {
     mainButtonRoundIdx != null && mainButtonRoundIdx >= 0
       ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
+
+  // Quand un quiz est en cours, on verrouille la config de temps (manches + fin de quiz)
+  const timeConfigLocked = isRunning && !!activeQuizKey;
 
   // Quiz : ordre des onglets (quiz actif en premier, puis autres par ordre alphabétique)
   const quizTabsOrdered = useMemo(() => {
@@ -2826,7 +2847,7 @@ useEffect(() => {
   }, [items, loading, savingId, savedRowId, roundOffsetsSec, quizEndSec]);
 
 
-// ===================== PARTIE 6.2/6 — AdminInner : Rendu =====================
+  // ===================== PARTIE 6.2/6 — AdminInner : Rendu =====================
   return (
     <div style={{ background: "#0a0a1a", color: "white", minHeight: "100vh", padding: 20 }}>
       {/* Header */}
@@ -3039,6 +3060,7 @@ useEffect(() => {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") saveRoundOffsets(roundOffsetsStr);
                 }}
+                disabled={timeConfigLocked}
                 style={{
                   width: 90,
                   padding: "4px 6px",
@@ -3047,9 +3069,19 @@ useEffect(() => {
                   background: "#111",
                   color: "#fff",
                   fontFamily: "monospace",
-                  opacity: typeof roundOffsetsSec[i] === "number" ? 1 : 0.75,
+                  opacity: timeConfigLocked
+                    ? 0.5
+                    : typeof roundOffsetsSec[i] === "number"
+                      ? 1
+                      : 0.75,
                 }}
+                title={
+                  timeConfigLocked
+                    ? "Réglages des manches verrouillés pendant un quiz en cours"
+                    : "Heure de début de la manche"
+                }
               />
+
             </label>
           ))}
         </div>
@@ -3067,6 +3099,7 @@ useEffect(() => {
                 if (e.key === "Enter") saveEndOffset(endOffsetStr);
               }}
               placeholder="ex: 01:58:00"
+              disabled={timeConfigLocked}
               style={{
                 width: 110,
                 padding: "4px 6px",
@@ -3075,8 +3108,13 @@ useEffect(() => {
                 background: "#111",
                 color: "#fff",
                 fontFamily: "monospace",
+                opacity: timeConfigLocked ? 0.5 : 1,
               }}
-              title="Point de fin global (utilisé pour la révélation & le décompte final)"
+              title={
+                timeConfigLocked
+                  ? "Fin de quiz verrouillée pendant un quiz en cours"
+                  : "Point de fin global (utilisé pour la révélation & le décompte final)"
+              }
             />
           </label>
         </div>
@@ -3157,33 +3195,46 @@ useEffect(() => {
           const tabKey = `quiz:${q.key}`;
           const isTabSelected = adminTab === tabKey;
           const isQuizActive = q.key === activeQuizKey;
+          // Pendant un quiz en cours, on interdit d’ouvrir un autre quiz que le quiz actif
+          const canOpenThisQuiz =
+            !isRunning || !activeQuizKey || q.key === activeQuizKey;
+
           return (
             <button
               key={q.key}
               type="button"
               onClick={() => {
+                if (!canOpenThisQuiz) return;
                 setSelectedQuizKey(q.key);
                 setAdminTab(tabKey);
               }}
+              disabled={!canOpenThisQuiz}
+              aria-disabled={!canOpenThisQuiz ? "true" : "false"}
               style={{
                 padding: "8px 12px",
                 borderRadius: 8,
                 border: "1px solid #1f2a44",
                 background: isTabSelected ? "#2c5d8bff" : "transparent",
                 color: "#e6eeff",
-                cursor: "pointer",
+                cursor: canOpenThisQuiz ? "pointer" : "not-allowed",
                 fontWeight: isTabSelected ? 700 : 500,
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 6,
+                opacity: canOpenThisQuiz ? 1 : 0.6,
               }}
+              title={
+                !canOpenThisQuiz
+                  ? "Onglet verrouillé pendant un quiz en cours"
+                  : undefined
+              }
             >
-
               <span>{q.name}</span>
               {isQuizActive && <span style={{ color: "#22c55e" }}>✅</span>}
             </button>
           );
         })}
+
       </div>
 
 
