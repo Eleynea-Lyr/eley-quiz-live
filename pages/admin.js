@@ -1956,7 +1956,19 @@ function AdminInner() {
     }
   };
 
-  const startOrNextRound = async () => {
+    // Sauvegarder automatiquement la config de temps (manches + fin) avant un départ à froid
+  const autoSaveTimeConfigBeforeStart = async () => {
+    try {
+      // On se base sur ce qui est actuellement saisi dans les champs M1..M8 + Fin du quiz
+      await saveRoundOffsets(roundOffsetsStr);
+      await saveEndOffset(endOffsetStr);
+    } catch (e) {
+      console.error("autoSaveTimeConfigBeforeStart error:", e);
+    }
+  };
+
+
+    const startOrNextRound = async () => {
     const actives = (Array.isArray(roundOffsetsSec) ? roundOffsetsSec : [])
       .filter((t) => typeof t === "number")
       .sort((a, b) => a - b);
@@ -1965,12 +1977,18 @@ function AdminInner() {
     setMainBtnBusy(true);
     setTimeout(() => setMainBtnBusy(false), 350);
 
+    const isColdStart = !isRunning || !quizStartMs;
+
     if (!actives.length) {
+      if (isColdStart) {
+        await autoSaveTimeConfigBeforeStart();
+      }
       await startQuiz();
       return;
     }
 
-    if (!isRunning || !quizStartMs) {
+    if (isColdStart) {
+      await autoSaveTimeConfigBeforeStart();
       await startQuiz();
       return;
     }
@@ -2002,6 +2020,7 @@ function AdminInner() {
       return;
     }
   };
+
 
   async function awardCurrentQuestionIfNeeded() {
     try {

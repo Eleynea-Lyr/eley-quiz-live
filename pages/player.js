@@ -1073,7 +1073,7 @@ export default function Player() {
       ? roundIndexOfTime(Math.max(0, nextRoundStart - 0.001), roundOffsetsSec)
       : null;
 
-    let effectiveNextTimeSec = null;
+  let effectiveNextTimeSec = null;
 
   // On re-considère la frontière de manche (nextRoundBoundary) comme un
   // "événement" à part entière pour retrouver le compte à rebours
@@ -1159,7 +1159,7 @@ export default function Player() {
     : null;
   const roundNumberForIntro = roundIdxForCurrentQuestion != null ? roundIdxForCurrentQuestion + 1 : null;
 
-    // Fin de manche (pause posée par l’Admin)
+  // Fin de manche (pause posée par l’Admin)
   const endedRoundIndex = Number.isInteger(lastAutoPausedRoundIndex) ? lastAutoPausedRoundIndex : null;
 
   // On ne considère "Fin de manche" que si :
@@ -1421,8 +1421,18 @@ export default function Player() {
     if (!qid) return false;
     const gotNow = (result === "correct" && lastAnswerQidRef.current === qid);
     const noBackSince = backInfoRef.current.lastBackQid !== qid;
-    return (gotNow && noBackSince) || justAnsweredAfterBack;
+
+    const tAnswer = answeredAtRef.current[qid];
+
+    // -1 → F5 après bonne réponse dans le “run” actuel → on garde "Bonne réponse !"
+    const isReloadedFreshCorrect = tAnswer === -1 && noBackSince;
+    // -2 → F5 après Back (bonne réponse d'un “run” précédent)
+    //      → on NE le compte PAS comme "Bonne réponse !" mais comme "déjà répondu".
+
+    return (gotNow && noBackSince) || justAnsweredAfterBack || isReloadedFreshCorrect;
   }, [qid, result, justAnsweredAfterBack, backTick]);
+
+
 
   // Splash : relâcher après boot initial
   const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
@@ -1442,6 +1452,80 @@ export default function Player() {
   const gainedPoints =
     instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
 
+  // 🔁 Recharger l'état "bonne réponse" après un F5
+  useEffect(() => {
+    const qid = currentQuestionId;
+    if (!qid || !playerId) return;
+
+    // Si on connaît déjà localement le fait que la question est correcte, ne rien faire
+    if (answeredAtRef.current[qid] != null) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        // answers/{qid}/submissions/{playerId}
+        const subRef = doc(db, "answers", qid, "submissions", playerId);
+        const snap = await getDoc(subRef);
+        if (cancelled || !snap.exists()) return;
+
+        const data = snap.data() || {};
+        if (!data.isCorrect) return;
+
+        // Par défaut : F5 après bonne réponse dans le “run” actuel
+        let sentinel = -1;
+
+        // Si on a les timings, on essaie de savoir si la bonne réponse
+        // appartenait à un “run” précédent (avant un Back).
+        const first = data.firstCorrectAt;
+        const qStart = getTimeSec(currentQuestion);
+        if (
+          first &&
+          typeof first.seconds === "number" &&
+          Number.isFinite(quizStartMs) &&
+          Number.isFinite(qStart)
+        ) {
+          const firstMs =
+            first.seconds * 1000 +
+            Math.floor((first.nanoseconds || first.nanos || 0) / 1e6);
+          const approxElapsedAtCorrect = (firstMs - quizStartMs) / 1000;
+
+          // Si, dans la timeline actuelle, la bonne réponse semble dater
+          // d'avant le début de la question, c'est qu'elle vient d'un “ancien run”.
+          if (approxElapsedAtCorrect < qStart - 0.5) {
+            sentinel = -2; // “déjà répondu” avant le Back
+          }
+        }
+
+        // 1) On marque le fait qu'on a déjà bien répondu
+        answeredAtRef.current[qid] = sentinel;
+
+        // 2) On restaure les points/rang si disponibles (peu importe le type de sentinel)
+        const predictedRank = Number.isFinite(data.predictedRank) ? data.predictedRank : null;
+        const predictedPoints = Number.isFinite(data.predictedPoints) ? data.predictedPoints : null;
+
+        if (Number.isFinite(predictedPoints) && predictedPoints > 0) {
+          lastInstantWinQidRef.current = qid;
+          setInstantWin({
+            qid,
+            rank: predictedRank,
+            points: predictedPoints,
+            at: Date.now(),
+          });
+        }
+
+        // 3) Tick pour forcer la mise à jour des dérivés (showGoodNow, etc.)
+        setBackTick((t) => t + 1);
+      } catch (e) {
+        console.error("[Player] reload previous correct state failed:", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentQuestionId, playerId, currentQuestion, quizStartMs]);
+
+
   // “Déjà correct” (persiste même après un Back)
   const alreadyCorrect = useMemo(() => {
     const qid = currentQuestionId;
@@ -1451,6 +1535,8 @@ export default function Player() {
     if (instantWin && instantWin.qid === qid) return true;
     return result === "correct";
   }, [currentQuestionId, instantWin, result]);
+
+
 
   // Ouverture/affichage input
   const answersOpen = Boolean(isQuestionPhase && !isLocked);

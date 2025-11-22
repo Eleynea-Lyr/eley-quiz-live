@@ -1730,14 +1730,28 @@ function ScreenInner() {
         }}
       >
 
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
-            Classement
-          </h3>
-          <div style={{ opacity: 0.7, fontSize: 12 }}>
-            Top {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
+        <div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
+              Classement
+            </h3>
+            <div style={{ opacity: 0.7, fontSize: 12 }}>
+              Top {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
+            </div>
           </div>
+
+          {/* Petit bandeau bleu sous le titre "Classement / Top N" */}
+          <div
+            style={{
+              marginTop: 6,
+              height: 3,
+              borderRadius: 9999,
+              background: "#0f172a",       // bleu nuit un peu plus clair que #0b0f1a
+              border: "1px solid #2a488fff", // même bleu que le cadre du QR
+            }}
+          />
         </div>
+
 
         <div
           role="list"
