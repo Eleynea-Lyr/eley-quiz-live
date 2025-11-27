@@ -1,9 +1,6 @@
 // ============================================================================
-// /pages/admin.js — Partie 1/6
-// Scope : Imports + couleurs & helpers joueurs + constantes globales +
-//         config Firestore par défaut + cache scoring + attribution TX +
-//         toggle Pause/Reprendre.
-// Règles : aucune modification fonctionnelle ; uniquement mise en forme/commentaires.
+// /pages/admin.js — Refactoré avec imports depuis /lib
+// Scope : Interface d'administration complète (questions, joueurs, contrôles)
 // ============================================================================
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -31,70 +28,34 @@ import {
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 
-// ============================================================================
-// [1.2] Couleurs & helpers joueurs
-// ============================================================================
+// Imports depuis les fichiers utilitaires
+import {
+  DEFAULT_SCORING_TABLE,
+  DEFAULT_REVEAL_DURATION_SEC,
+  DEFAULT_LEADERBOARD_TOP_N,
+  TIME_MUSIC_MIN_SEC,
+  DEFAULT_TIME_MUSIC_SEC,
+  PLAYER_COLORS,
+} from "../lib/constants";
 
-/* ========================= COULEURS & HELPERS JOUEURS ========================= */
+import {
+  parseHMS,
+  formatHMS,
+  formatHMSForInput,
+  parseCSV,
+  toCSV,
+  clampTimeMusicSec,
+  normKey,
+  pickColorDifferent,
+  normalizeNameAlpha,
+  getTimeSec,
+  roundIndexOfTime,
+} from "../lib/utils";
 
-const PLAYER_COLORS = [
-  "#f87171",
-  "#fb923c",
-  "#fbbf24",
-  "#a3e635",
-  "#34d399",
-  "#22d3ee",
-  "#60a5fa",
-  "#818cf8",
-  "#a78bfa",
-  "#f472b6",
-  "#fda4af",
-  "#f59e0b",
-  "#10b981",
-  "#06b6d4",
-  "#3b82f6",
-  "#8b5cf6",
-];
-
-// Normalisation alpha (casse/accents-insensible)
-function normKey(s) {
-  return (s || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .trim();
-}
-
-// Couleur de joueur, en évitant de répéter la précédente si possible
-function pickColorDifferent(prev) {
-  const pool = PLAYER_COLORS.filter((c) => c !== prev);
-  const bag = pool.length ? pool : PLAYER_COLORS;
-  return bag[Math.floor(Math.random() * bag.length)];
-}
-
-// ============================================================================
-// [1.3] Defaults & constantes globales
-// ============================================================================
-
-/* ========================= DEFAULTS & CONSTANTES GLOBALES ========================= */
-
-const DEFAULT_SCORING_TABLE = [
-  30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
-  1,
-];
-
-const DEFAULT_REVEAL_DURATION_SEC = 20; // 15s affichage + 5s décompte
-const DEFAULT_LEADERBOARD_TOP_N = 20;
-
-const TIME_MUSIC_MIN_SEC = 20; // reveal incompressible
-const DEFAULT_TIME_MUSIC_SEC = 35; // ex: 15s jeu + 20s reveal
-
-// Pour changer la durée par défaut de la musique, modifier DEFAULT_TIME_MUSIC_SEC.
-function clampTimeMusicSec(sec) {
-  const n = Number(sec);
-  if (!Number.isFinite(n)) return DEFAULT_TIME_MUSIC_SEC;
-  return Math.max(TIME_MUSIC_MIN_SEC, Math.floor(n));
-}
+import {
+  ensureAwardsForQuestionTx,
+  resetScoringCache,
+} from "../lib/firebase-helpers";
 
 // ============================================================================
 // [1.4] Config par défaut (idempotent)
@@ -203,157 +164,6 @@ async function backfillQuestionsQuizKey(defaultQuizKey) {
   }
 }
 
-// ============================================================================
-// [1.5] Scoring (cache)
-// ============================================================================
-
-/* ========== SCORING (CACHE) ========== */
-
-let _cachedScoringTable = null;
-
-/**
- * Récupère la table de points (scoringTable) depuis quiz/config,
- * avec un petit cache en mémoire côté Admin.
- */
-async function getScoringTableAdmin() {
-  if (_cachedScoringTable) return _cachedScoringTable;
-
-  try {
-    const cfgRef = doc(db, "quiz", "config");
-    const snap = await getDoc(cfgRef);
-
-    const tbl =
-      snap.exists() && Array.isArray(snap.data().scoringTable)
-        ? snap.data().scoringTable
-        : DEFAULT_SCORING_TABLE;
-
-    _cachedScoringTable = tbl;
-    return tbl;
-  } catch (e) {
-    console.error("[Admin/getScoringTableAdmin] fallback:", e);
-    _cachedScoringTable = DEFAULT_SCORING_TABLE;
-    return DEFAULT_SCORING_TABLE;
-  }
-}
-
-// ============================================================================
-// [1.6] Attribution transactionnelle (anti-doublons)
-// ============================================================================
-
-/* ========== ATTRIBUTION TRANSACTIONNELLE (ANTI-DOUBLONS) ========== */
-/**
- * Attribue les points pour une question donnée (qid) en se basant sur
- * les bonnes réponses (isCorrect = true) dans answers/{qid}/submissions.
- * - Trie localement par timestamp (plusieurs champs possibles).
- * - Aligne la logique sur Screen (TX robuste + idempotente).
- */
-async function ensureAwardsForQuestionTx(qid) {
-  if (!qid) return { ok: false, reason: "no-qid" };
-
-  // 1) Lire toutes les bonnes réponses (sans orderBy)
-  const subsCol = collection(db, "answers", qid, "submissions");
-  let subsSnap;
-
-  try {
-    subsSnap = await getDocs(query(subsCol, where("isCorrect", "==", true)));
-  } catch (e) {
-    console.error("[Admin] read submissions failed:", e);
-    return { ok: false, reason: "read-failed" };
-  }
-
-  // 2) Normaliser un "temps" en ms pour trier localement (plusieurs schémas possibles)
-  function toMs(obj) {
-    if (!obj) return Infinity;
-    if (typeof obj.toMillis === "function") return obj.toMillis();
-
-    if (typeof obj.seconds === "number") {
-      return (
-        obj.seconds * 1000 +
-        Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6)
-      );
-    }
-
-    if (typeof obj === "number" && Number.isFinite(obj)) {
-      return Math.floor(obj);
-    }
-
-    return Infinity;
-  }
-
-  const raw = subsSnap.docs.map((d) => ({
-    id: d.id,
-    data: d.data() || {},
-  }));
-
-  const ranked = raw
-    .map(({ id, data }) => {
-      const candidates = [
-        toMs(data.firstCorrectAt),
-        toMs(data.firstCorrectAtMs),
-        toMs(data.createdAt),
-        toMs(data.updatedAt),
-      ];
-      const t = Math.min(...candidates);
-      return { id, t };
-    })
-    .filter((x) => Number.isFinite(x.t))
-    .sort((a, b) => a.t - b.t);
-
-  if (ranked.length === 0) {
-    console.warn("[Admin] no correct submissions for qid=", qid);
-    return { ok: true, reason: "no-correct-submissions" };
-  }
-
-  const table = await getScoringTableAdmin();
-  const qDocRef = doc(db, "answers", qid);
-  const playersCol = collection(doc(db, "quiz", "state"), "players");
-
-  // 3) TX: idempotence + attributions
-  return await runTransaction(db, async (tx) => {
-    const snap = await tx.get(qDocRef);
-
-    if (snap.exists() && snap.data()?.awarded === true) {
-      return { ok: true, reason: "already-awarded" };
-    }
-
-    tx.set(
-      qDocRef,
-      {
-        awarded: true,
-        awardedAt: serverTimestamp(),
-        awardedCount: ranked.length,
-      },
-      { merge: true }
-    );
-
-    for (let i = 0; i < ranked.length; i++) {
-      const pid = ranked[i].id;
-      const points = table[i] ?? 0;
-
-      tx.set(
-        doc(db, "answers", qid, "awards", pid),
-        {
-          points,
-          rank: i + 1,
-          awardedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      tx.set(
-        doc(playersCol, pid),
-        {
-          score: increment(points),
-          lastDelta: points,
-          lastDeltaForQuestionId: qid,
-        },
-        { merge: true }
-      );
-    }
-
-    return { ok: true, reason: "awarded", count: ranked.length };
-  });
-}
 
 // ============================================================================
 // [1.7] Toggle Pause / Reprendre — même logique que Back/Next/Start
@@ -472,65 +282,9 @@ function AdminInner() {
   // [2.2] Garde locale pour l’attribution auto (anti multi-déclenchements UI)
   const awardGuardRef = useRef({});
 
-  /* [2.3] Helpers internes (déclarés ici pour usage dans tout le composant) */
+  /* [2.3] Helpers internes spécifiques à Admin */
 
-  function parseCSV(input = "") {
-    return String(input)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-  }
-
-  function toCSV(list = []) {
-    return (list || []).join(", ");
-  }
-
-  function parseHMS(input) {
-    if (input == null) return null;
-    const s = String(input).trim();
-    if (!s) return null;
-
-    // hh:mm:ss | mm:ss | ss
-    if (s.includes(":")) {
-      const parts = s.split(":").map((p) => p.trim());
-      if (parts.length > 3) return null;
-
-      const [hStr, mStr, sStr] =
-        parts.length === 3 ? parts : ["0", parts[0] || "0", parts[1] || "0"];
-
-      const h = Number(hStr),
-        m = Number(mStr),
-        sec = Number(sStr);
-
-      if (![h, m, sec].every((n) => Number.isFinite(n) && n >= 0)) return null;
-      if (m >= 60 || sec >= 60) return null;
-      return h * 3600 + m * 60 + sec;
-    }
-
-    // nombre simple → minutes décimales (legacy)
-    const num = Number(s);
-    if (!Number.isFinite(num) || num < 0) return null;
-    return Math.round(num * 60);
-  }
-
-  function formatHMS(totalSeconds) {
-    if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "";
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = Math.floor(totalSeconds % 60);
-    return [h, m, s]
-      .map((n) => String(n).padStart(2, "0"))
-      .join(":");
-  }
-
-  function getTimeSec(q) {
-    if (!q || typeof q !== "object") return Infinity;
-    if (typeof q.timecodeSec === "number") return q.timecodeSec; // secondes (nouveau)
-    if (typeof q.timecode === "number")
-      return Math.round(q.timecode * 60); // minutes (legacy)
-    return Infinity;
-  }
-
+  // Helper pour convertir les offsets de manches (utilisé dans la config)
   function coerceOffsetsToNumbers(arr) {
     const out = [];
     for (let i = 0; i < 8; i++) {
@@ -544,16 +298,6 @@ function AdminInner() {
       }
     }
     return out;
-  }
-
-  function roundIndexOfTime(t, offsets) {
-    if (!Array.isArray(offsets)) return 0;
-    let idx = -1;
-    for (let i = 0; i < offsets.length; i++) {
-      const v = offsets[i];
-      if (typeof v === "number" && t >= v) idx = i;
-    }
-    return Math.max(0, idx);
   }
 
   function withAlpha(hex, alpha = 0.35) {
@@ -1015,7 +759,7 @@ function AdminInner() {
         if (!p.color && !assignedColorRef.current.has(p.id)) {
           assignedColorRef.current.add(p.id);
           const prev = lastAssignedColorRef.current;
-          const color = pickColorDifferent(prev);
+          const color = pickColorDifferent(prev, PLAYER_COLORS);
           lastAssignedColorRef.current = color;
           updateDoc(pref, { color }).catch(() => { });
         }
@@ -1282,7 +1026,7 @@ function AdminInner() {
 
     awardGuardRef.current[qid] = "pending";
 
-    ensureAwardsForQuestionTx(qid).catch((e) => {
+    ensureAwardsForQuestionTx(db, qid).catch((e) => {
       console.error("[Admin/ensureAwardsForQuestionTx] error:", e);
       delete awardGuardRef.current[qid];
     });
@@ -2026,7 +1770,7 @@ function AdminInner() {
     try {
       const qid = currentQuestion?.id || null;
       if (!qid) return { ok: false, reason: "no-active-question" };
-      const res = await ensureAwardsForQuestionTx(qid);
+      const res = await ensureAwardsForQuestionTx(db, qid);
       if (res?.reason)
         console.log("[Admin] awardCurrentQuestionIfNeeded:", res.reason);
       return res;
@@ -2472,6 +2216,29 @@ function AdminInner() {
     return new Map(rows.map((r) => [r.id, r._rank]));
   }, [players]);
 
+  // Tri des joueurs : OK → Refusé → Kické, puis alphabétique dans chaque groupe
+  const sortedPlayers = useMemo(() => {
+    const getStatusPriority = (p) => {
+      if (p.isKicked) return 2; // Kické en dernier
+      if (p.nameStatus === "rejected") return 1; // Refusé au milieu
+      return 0; // OK en premier
+    };
+
+    return [...players].sort((a, b) => {
+      // D'abord par statut
+      const statusA = getStatusPriority(a);
+      const statusB = getStatusPriority(b);
+      if (statusA !== statusB) {
+        return statusA - statusB;
+      }
+
+      // Puis par ordre alphabétique (nom normalisé)
+      const nameA = normalizeNameAlpha(a.name || "");
+      const nameB = normalizeNameAlpha(b.name || "");
+      return nameA.localeCompare(nameB, "fr", { sensitivity: "base" });
+    });
+  }, [players]);
+
   // === Actions Quiz (créer / activer / dupliquer / supprimer) ===
   const handleCreateQuiz = async () => {
     try {
@@ -2524,6 +2291,13 @@ function AdminInner() {
   const handleDuplicateQuiz = async (sourceKey) => {
     try {
       if (!sourceKey) return;
+      
+      // Empêcher la duplication du quiz actif pendant qu'il est en cours
+      if (sourceKey === activeQuizKey && isRunning) {
+        alert("Impossible de dupliquer le quiz actif pendant qu'il est en cours. Arrête d'abord le quiz.");
+        return;
+      }
+      
       const src = (quizzes || []).find((q) => q.key === sourceKey);
       const baseName = src?.name || "Quiz sans nom";
       const name = window.prompt("Nom du nouveau quiz :", `${baseName} (copie)`);
@@ -2571,6 +2345,44 @@ function AdminInner() {
     }
   };
 
+  const handleEditQuizName = async (quizKey) => {
+    try {
+      if (!quizKey) return;
+      const all = quizzes || [];
+      const src = all.find((q) => q.key === quizKey);
+      if (!src) {
+        alert("Quiz introuvable.");
+        return;
+      }
+
+      const currentName = src.name || "Quiz sans nom";
+      const newName = window.prompt("Nouveau nom du quiz :", currentName);
+      if (!newName || newName.trim() === "") {
+        return; // Annulation ou nom vide
+      }
+
+      const trimmedName = newName.trim();
+      if (trimmedName === currentName) {
+        return; // Pas de changement
+      }
+
+      // Mettre à jour le nom dans le tableau des quiz
+      const nextQuizzes = all.map((q) =>
+        q.key === quizKey ? { ...q, name: trimmedName } : q
+      );
+      await setDoc(
+        doc(db, "quiz", "config"),
+        { quizzes: nextQuizzes },
+        { merge: true }
+      );
+
+      setNotice(`Nom du quiz modifié : « ${trimmedName} »`);
+    } catch (e) {
+      console.error("handleEditQuizName error:", e);
+      alert("Échec de la modification du nom : " + (e?.message || e));
+    }
+  };
+
   const handleDeleteQuiz = async (quizKey) => {
     try {
       if (!quizKey) return;
@@ -2579,8 +2391,12 @@ function AdminInner() {
         alert("Impossible de supprimer le dernier quiz restant.");
         return;
       }
+      if (quizKey === activeQuizKey && isRunning) {
+        alert("Impossible de supprimer le quiz actif pendant qu'il est en cours. Arrête d'abord le quiz.");
+        return;
+      }
       if (quizKey === activeQuizKey) {
-        alert("Impossible de supprimer le quiz actif. Active d’abord un autre quiz.");
+        alert("Impossible de supprimer le quiz actif. Active d'abord un autre quiz.");
         return;
       }
 
@@ -3285,7 +3101,7 @@ function AdminInner() {
                 </tr>
               </thead>
               <tbody>
-                {players.map((p) => {
+                {sortedPlayers.map((p) => {
                   const status = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
                   const statusBg =
                     p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
@@ -3486,30 +3302,60 @@ function AdminInner() {
               <button
                 type="button"
                 onClick={() => handleDuplicateQuiz(currentQuiz.key)}
+                disabled={currentQuiz.key === activeQuizKey && isRunning}
                 style={{
                   padding: "6px 12px",
                   borderRadius: 8,
                   border: "1px solid #374151",
-                  background: "#111827",
-                  color: "#e5e7eb",
+                  background: currentQuiz.key === activeQuizKey && isRunning ? "#374151" : "#111827",
+                  color: currentQuiz.key === activeQuizKey && isRunning ? "#6b7280" : "#e5e7eb",
                   fontWeight: 600,
-                  cursor: "pointer",
+                  cursor: currentQuiz.key === activeQuizKey && isRunning ? "not-allowed" : "pointer",
+                  opacity: currentQuiz.key === activeQuizKey && isRunning ? 0.5 : 1,
                 }}
+                title={
+                  currentQuiz.key === activeQuizKey && isRunning
+                    ? "Impossible de dupliquer le quiz actif pendant qu'il est en cours"
+                    : "Dupliquer ce quiz"
+                }
               >
                 Dupliquer ce quiz
               </button>
               <button
                 type="button"
-                onClick={() => handleDeleteQuiz(currentQuiz.key)}
+                onClick={() => handleEditQuizName(currentQuiz.key)}
                 style={{
                   padding: "6px 12px",
                   borderRadius: 8,
-                  border: "1px solid #7f1d1d",
-                  background: "#b91c1c",
+                  border: "1px solid #2563eb",
+                  background: "#2563eb",
                   color: "#f9fafb",
                   fontWeight: 600,
                   cursor: "pointer",
                 }}
+                title="Modifier le nom de ce quiz"
+              >
+                Editer nom du quizz
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteQuiz(currentQuiz.key)}
+                disabled={currentQuiz.key === activeQuizKey && isRunning}
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: currentQuiz.key === activeQuizKey && isRunning ? "1px solid #4b5563" : "1px solid #7f1d1d",
+                  background: currentQuiz.key === activeQuizKey && isRunning ? "#4b5563" : "#b91c1c",
+                  color: currentQuiz.key === activeQuizKey && isRunning ? "#9ca3af" : "#f9fafb",
+                  fontWeight: 600,
+                  cursor: currentQuiz.key === activeQuizKey && isRunning ? "not-allowed" : "pointer",
+                  opacity: currentQuiz.key === activeQuizKey && isRunning ? 0.5 : 1,
+                }}
+                title={
+                  currentQuiz.key === activeQuizKey && isRunning
+                    ? "Impossible de supprimer le quiz actif pendant qu'il est en cours"
+                    : "Supprimer ce quiz"
+                }
               >
                 Supprimer ce quiz
               </button>

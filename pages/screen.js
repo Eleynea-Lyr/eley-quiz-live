@@ -1,67 +1,56 @@
 // ============================================================================
-// /pages/screen.js — Partie 1/5
-// Scope : Imports, hook mobile VH, constantes, helpers utilitaires,
-// panneaux "Rejoindre", scoring & attribution transactionnelle (hors composant).
+// /pages/screen.js — Refactoré avec imports depuis /lib
+// Scope : Écran de scène/projection avec leaderboard temps réel
 // ============================================================================
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { db } from "../lib/firebase";
 import {
-  collection, doc, getDocs, getDoc, onSnapshot, orderBy, query, limit,
-  where, runTransaction, serverTimestamp, increment
+  collection, doc, getDocs, onSnapshot, query,
+  where
 } from "firebase/firestore";
 
+// Imports depuis les fichiers utilitaires
+import {
+  REVEAL_DURATION_SEC,
+  COUNTDOWN_START_SEC,
+  ROUND_START_INTRO_SEC,
+  UI_MASK_MS,
+  BAR_H,
+  BAR_BLUE,
+  BAR_RED,
+  HANDLE_COLOR,
+  SCREEN_IMG_MAX,
+  DEFAULT_LEADERBOARD_TOP_N,
+  DEFAULT_SCORING_TABLE,
+} from "../lib/constants";
 
-// Fix viewport height on mobile browsers (100vh bug)
-const useMobileVH = () => {
-  useEffect(() => {
-    const setVh = () => {
-      const vh = window.innerHeight * 0.01;
-      document.documentElement.style.setProperty("--vh", `${vh}px`);
-    };
-    setVh();
-    window.addEventListener("resize", setVh);
-    window.addEventListener("orientationchange", setVh);
-    return () => {
-      window.removeEventListener("resize", setVh);
-      window.removeEventListener("orientationchange", setVh);
-    };
-  }, []);
-};
+import {
+  getTimeSec,
+  formatHMS,
+  pickRevealPhrase,
+  roundIndexOfTime,
+  nextRoundStartAfter,
+  normalizeNameAlpha,
+  addSmartLineBreaks,
+} from "../lib/utils";
 
-/* ============================ CONSTANTES & HELPERS ============================ */
+import {
+  useMobileVH,
+  ensureAwardsForQuestionTx,
+} from "../lib/firebase-helpers";
 
-const UI_MASK_MS = 220; // durée du voile anti-flicker (ms)
+// ====== Constantes spécifiques à screen.js ======
 
-// Phrases de révélation par défaut
-const DEFAULT_REVEAL_PHRASES = [
-  "La réponse était :",
-  "Il fallait trouver :",
-  "C'était :",
-  "La bonne réponse :",
-  "Réponse :",
-];
-
-// Phases / timings
-const REVEAL_DURATION_SEC = 20; // 15s avec la réponse + 5s de décompte
-const COUNTDOWN_START_SEC = 5;
-const ROUND_START_INTRO_SEC = 5; // mange 5s sur la 1ʳᵉ question de la manche
-
-// ====== JOIN (DEV) ======
+// JOIN (DEV)
 //const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-//const JOIN_QR_SRC = "/qr-join-dev.png"; // fichier placé dans /public
+//const JOIN_QR_SRC = "/qr-join-dev.png";
 
-// ====== JOIN (PUBLIC OK) ======
+// JOIN (PUBLIC OK)
 const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
 const JOIN_QR_SRC = "/qr-code-public-OK.png";
 
-// Barre de temps
-const BAR_H = 6;
-const BAR_BLUE = "#3b82f6";
-const BAR_RED = "#ef4444";
-const HANDLE_COLOR = "#f8fafc";
-
-// Colonne gauche (largeur fixe et image générique)
+// Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
 
 
@@ -122,53 +111,6 @@ function JoinPanelFixedBottom() {
 }
 
 
-const SCREEN_IMG_MAX = 300; // px (image de révélation, côté public)
-
-// Time helpers
-function getTimeSec(q) {
-  if (!q || typeof q !== "object") return Infinity;
-  if (typeof q.timecodeSec === "number") return q.timecodeSec;           // secondes (nouveau)
-  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
-  return Infinity;
-}
-function formatHMS(sec) {
-  if (!Number.isFinite(sec) || sec < 0) return "00:00:00";
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
-}
-function pickRevealPhrase(q) {
-  const custom = Array.isArray(q?.revealPhrases)
-    ? q.revealPhrases.filter((p) => typeof p === "string" && p.trim() !== "")
-    : [];
-  const pool = custom.length ? custom : DEFAULT_REVEAL_PHRASES;
-  if (!pool.length) return "Réponse :";
-  const seedStr = String(q?.id || "");
-  let hash = 0;
-  for (let i = 0; i < seedStr.length; i++) hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
-  return pool[hash % pool.length];
-}
-
-// Manches
-function roundIndexOfTime(t, offsets) {
-  if (!Array.isArray(offsets)) return 0;
-  let idx = -1;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && t >= v) idx = i;
-  }
-  return Math.max(0, idx);
-}
-function nextRoundStartAfter(t, offsets) {
-  if (!Array.isArray(offsets)) return null;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && v > t) return v;
-  }
-  return null;
-}
-
 // Splash (plein bleu foncé au boot)
 function Splash() {
   return (
@@ -180,113 +122,6 @@ function Splash() {
       aria-hidden="true"
     />
   );
-}
-
-// leaderboard
-const DEFAULT_LEADERBOARD_TOP_N = 20;
-
-function normalizeNameAlpha(s) {
-  return String(s || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// ===== Scoring (défaut) + helpers attribution TX =====
-const DEFAULT_SCORING_TABLE = [30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-
-async function getScoringTableScreen() {
-  try {
-    const snap = await getDoc(doc(db, "quiz", "config"));
-    return (snap.exists() && Array.isArray(snap.data()?.scoringTable))
-      ? snap.data().scoringTable
-      : DEFAULT_SCORING_TABLE;
-  } catch {
-    return DEFAULT_SCORING_TABLE;
-  }
-}
-
-// Attribution transactionnelle et idempotente (robuste aux différents schémas de timestamps)
-async function ensureAwardsForQuestionTx(qid) {
-  if (!qid) return { ok: false, reason: "no-qid" };
-
-  // 1) Lire toutes les bonnes réponses (pas d'ordre imposé)
-  const subsCol = collection(db, "answers", qid, "submissions");
-  let subsSnap;
-  try {
-    subsSnap = await getDocs(query(subsCol, where("isCorrect", "==", true)));
-  } catch (e) {
-    console.error("[Screen] read submissions failed:", e);
-    return { ok: false, reason: "read-failed" };
-  }
-
-  // 2) Normaliser un "temps" en ms pour trier localement
-  function toMs(obj) {
-    if (!obj) return Infinity;
-    if (typeof obj.toMillis === "function") return obj.toMillis(); // Timestamp Firestore
-    if (typeof obj.seconds === "number") {
-      return obj.seconds * 1000 + Math.floor((obj.nanoseconds || obj.nanos || 0) / 1e6);
-    }
-    if (typeof obj === "number" && Number.isFinite(obj)) return Math.floor(obj);
-    return Infinity;
-  }
-
-  const raw = subsSnap.docs.map(d => ({ id: d.id, data: d.data() || {} }));
-  const ranked = raw
-    .map(({ id, data }) => {
-      const candidates = [
-        toMs(data.firstCorrectAt),
-        toMs(data.firstCorrectAtMs),
-        toMs(data.createdAt),
-        toMs(data.updatedAt),
-      ];
-      const t = Math.min(...candidates);
-      return { id, t };
-    })
-    .filter(x => Number.isFinite(x.t))
-    .sort((a, b) => a.t - b.t); // plus rapide d’abord
-
-  if (ranked.length === 0) {
-    console.warn("[Screen] no correct submissions for qid=", qid);
-    return { ok: true, reason: "no-correct-submissions" };
-  }
-
-  const table = await getScoringTableScreen();
-  const qDocRef = doc(db, "answers", qid);
-  const playersCol = collection(doc(db, "quiz", "state"), "players");
-
-  // 3) Transaction : idempotence + écritures atomiques
-  return await runTransaction(db, async (tx) => {
-    const snap = await tx.get(qDocRef);
-    if (snap.exists() && snap.data()?.awarded === true) {
-      return { ok: true, reason: "already-awarded" };
-    }
-
-    tx.set(qDocRef, {
-      awarded: true,
-      awardedAt: serverTimestamp(),
-      awardedCount: ranked.length,
-    }, { merge: true });
-
-    for (let i = 0; i < ranked.length; i++) {
-      const pid = ranked[i].id;
-      const points = table[i] ?? 0;
-
-      tx.set(doc(db, "answers", qid, "awards", pid), {
-        points, rank: i + 1, awardedAt: serverTimestamp()
-      }, { merge: true });
-
-      tx.set(doc(playersCol, pid), {
-        score: increment(points),
-        lastDelta: points,
-        lastDeltaForQuestionId: qid,
-      }, { merge: true });
-    }
-
-    return { ok: true, reason: "awarded", count: ranked.length };
-  });
 }
 
 // ============================================================================
@@ -984,7 +819,7 @@ function ScreenInner() {
     if (awardGuardRef.current[qid]) return;
     awardGuardRef.current[qid] = "pending";
 
-    ensureAwardsForQuestionTx(qid).catch((e) => {
+    ensureAwardsForQuestionTx(db, qid).catch((e) => {
       console.error("[Screen] awards TX error:", e);
       delete awardGuardRef.current[qid]; // autorise un retry si la TX échoue
     });
@@ -1024,6 +859,15 @@ function ScreenInner() {
     const a = currentQuestion?.answers;
     return Array.isArray(a) && a.length ? String(a[0]) : "";
   }, [currentQuestionId]);
+
+  // Détecter si la réponse est courte (moins de 30 caractères) pour forcer une seule ligne
+  // Exception : si elle contient ! ou ?, on permet les retours à la ligne après ces ponctuations
+  const isShortAnswer = useMemo(() => {
+    if (!primaryAnswer) return false;
+    // Si la réponse contient ! ou ?, on ne force pas nowrap même si elle est courte
+    if (/[!?]/.test(primaryAnswer)) return false;
+    return primaryAnswer.length < 30;
+  }, [primaryAnswer]);
 
   // URLs images (question / réponse) avec fallbacks :
   // - questionImgUrl : seulement les champs dédiés "image question" (jamais l'ancien 'image')
@@ -1212,14 +1056,20 @@ function ScreenInner() {
   }, [uiMasked]);
 
   // Largeur bornée + retours à la ligne + descente légère
+  // Aligné avec Player pour cohérence
   const screenQuestionStyle = {
-    maxWidth: "min(760px, 92%)",
-    margin: "0 auto",
+    fontSize: "clamp(1.1rem, 4.2vw, 1.45rem)", // Même taille que Player
+    lineHeight: 1.5,
+    margin: 0,
     marginTop: 6,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
+    maxWidth: "min(600px, 95%)", // Même largeur que Player
+    marginLeft: "auto",
+    marginRight: "auto",
+    overflowWrap: "break-word", // Moins agressif que "anywhere"
+    wordBreak: "normal", // Évite de couper les mots au milieu
     hyphens: "auto",
-    lineHeight: 1.22,
+    textAlign: "center", // Centré comme demandé
+    letterSpacing: "0.01em", // Légère augmentation pour meilleure lisibilité
   };
 
 
@@ -1515,15 +1365,44 @@ function ScreenInner() {
                 </div>
               </div>
             ) : isQuestionPhase ? (
-              <h1 style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}>
-                {currentQuestion.text}
-              </h1>
+              <h1 
+                style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}
+                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+              />
             ) : isRevealAnswerPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 8 }}>
+                <div style={{ 
+                  opacity: 0.85, 
+                  fontSize: 18, 
+                  marginBottom: 8,
+                  lineHeight: 1.4,
+                  maxWidth: "min(800px, 95%)",
+                  marginLeft: "auto",
+                  marginRight: "auto",
+                  textAlign: "center",
+                  whiteSpace: "nowrap", // Force une seule ligne pour les phrases de révélation
+                  overflowWrap: "normal", // Ne coupe jamais les mots
+                  wordBreak: "normal", // Ne coupe pas les mots au milieu
+                }}>
                   {revealPhrase}
                 </div>
-                <h1 style={{ fontSize: "2.2rem", margin: 0 }}>{primaryAnswer}</h1>
+                <h1 
+                  style={{ 
+                    fontSize: "clamp(1.2rem, 5vw, 1.6rem)", // Même taille que Player
+                    margin: 0,
+                    lineHeight: 1.5,
+                    whiteSpace: isShortAnswer ? "nowrap" : "normal", // Force une seule ligne pour les réponses courtes (sans ponctuation)
+                    maxWidth: isShortAnswer ? "none" : "min(1600px, 95%)", // Pas de limite pour les réponses courtes
+                    marginLeft: "auto",
+                    marginRight: "auto",
+                    overflowWrap: isShortAnswer ? "normal" : "break-word", // Ne coupe jamais pour les réponses courtes
+                    wordBreak: "normal", // Ne coupe pas les mots au milieu
+                    hyphens: "none", // Pas de césure automatique
+                    textAlign: "center",
+                    letterSpacing: "0.01em",
+                  }}
+                  dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(primaryAnswer) }}
+                />
               </div>
             ) : isCountdownPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
@@ -1535,9 +1414,10 @@ function ScreenInner() {
                 </div>
               </div>
             ) : (
-              <h1 style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}>
-                {currentQuestion.text}
-              </h1>
+              <h1 
+                style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}
+                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+              />
             )}
 
             {/* Image pendant la PHASE QUESTION (champs dédiés) */}

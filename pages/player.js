@@ -1,11 +1,8 @@
 // ============================================================================
-// /pages/player.js — Partie 1/6
-// Scope : Imports, hook mobile VH, constantes, helpers (scoring, normalisation,
-//         modération & validation de nom), composant Splash, reset runtime.
-// Règles : aucune modification fonctionnelle ; seulement commentaires/sections.
+// /pages/player.js — Refactoré avec imports depuis /lib
+// Scope : Vue joueur avec inscription, réponses temps réel, scoring instantané
 // ============================================================================
 
-/*Partie 1/4 (imports, constantes, helpers) */
 import { useEffect, useMemo, useRef, useState, startTransition } from "react";
 import { db } from "../lib/firebase";
 import {
@@ -15,423 +12,64 @@ import {
   getDoc,
   setDoc,
   onSnapshot,
-  orderBy,
   query,
   addDoc,
   updateDoc,
   where,
   serverTimestamp,
   deleteDoc,
-  runTransaction,
 } from "firebase/firestore";
 
-// ---------------------------------------------------------------------------
-// Hook: Fix viewport height on mobile browsers (100vh bug)
-// ---------------------------------------------------------------------------
-const useMobileVH = () => {
-  useEffect(() => {
-    const setVh = () => {
-      const vh = window.innerHeight * 0.01;
-      document.documentElement.style.setProperty("--vh", `${vh}px`);
-    };
-    setVh();
-    window.addEventListener("resize", setVh);
-    window.addEventListener("orientationchange", setVh);
-    return () => {
-      window.removeEventListener("resize", setVh);
-      window.removeEventListener("orientationchange", setVh);
-    };
-  }, []);
-};
+// Imports depuis les fichiers utilitaires
+import {
+  REVEAL_DURATION_SEC,
+  COUNTDOWN_START_SEC,
+  ROUND_START_INTRO_SEC,
+  UI_MASK_MS,
+  RATE_LIMIT_ENABLED,
+  MAX_WRONG_ATTEMPTS,
+  RATE_LIMIT_WINDOW_MS,
+  COOLDOWN_MS,
+  LOCK_PHRASES,
+  BAR_H,
+  BAR_BLUE,
+  BAR_RED,
+  HANDLE_COLOR,
+  PLAYER_IMG_MAX,
+  SAFE_TOP,
+  TOP_GUTTER_RUNNING,
+  TOP_GUTTER_IDLE,
+} from "../lib/constants";
 
+import {
+  getTimeSec,
+  formatHMS,
+  normalize,
+  normalizeBasic,
+  normalizeName,
+  normalizeNameAlpha,
+  pickRevealPhrase,
+  roundIndexOfTime,
+  nextRoundStartAfter,
+  matchesWithMode,
+  getAnswerMode,
+  isAliasName,
+  validateName,
+  messageForRank,
+  medalForRank,
+  IS_IOS,
+  addSmartLineBreaks,
+} from "../lib/utils";
 
-/* ============================== CONSTANTES ============================== */
-
-/* ===== Instant Win (helpers) ===== */
-const FALLBACK_SCORING_TABLE = [
-  30, 25, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
-];
-
-let _cachedScoring = null;
-async function getScoringTable(db) {
-  if (_cachedScoring) return _cachedScoring;
-  try {
-    const cfgRef = doc(db, "quiz", "config");
-    const snap = await getDoc(cfgRef);
-    const table = (snap.exists() && Array.isArray(snap.data().scoringTable))
-      ? snap.data().scoringTable
-      : FALLBACK_SCORING_TABLE;
-    _cachedScoring = table;
-    return table;
-  } catch (e) {
-    console.error("[getScoringTable] fallback due to error:", e);
-    _cachedScoring = FALLBACK_SCORING_TABLE;
-    return FALLBACK_SCORING_TABLE;
-  }
-}
-
-/**
- * Marque la première bonne réponse du joueur et calcule rang/points prédits.
- * Écrit/merge dans:
- *   - answers/{qid}             → { correctCount: N }
- *   - answers/{qid}/submissions/{playerId}
- *       → { isCorrect, firstCorrectAt, predictedRank, predictedPoints }
- * Retourne { predictedRank, predictedPoints }.
- * Idempotent: si déjà correct, ne double-compte pas.
- */
-async function recordFirstCorrectAndPredict({ db, qid, playerId }) {
-  if (!qid || !playerId) {
-    throw new Error("[recordFirstCorrectAndPredict] Missing qid or playerId");
-  }
-  const table = await getScoringTable(db);
-  const qRef = doc(db, "answers", qid);
-  const subRef = doc(db, "answers", qid, "submissions", playerId);
-
-  return await runTransaction(db, async (tx) => {
-    const subSnap = await tx.get(subRef);
-
-    // Si déjà marqué correct, retourner ce qu'on a (évite double incrément).
-    if (subSnap.exists() && subSnap.data().isCorrect) {
-      const d = subSnap.data() || {};
-      const predictedRank = d.predictedRank ?? null;
-      const predictedPoints = d.predictedPoints ?? null;
-      if (predictedRank != null && predictedPoints != null) {
-        return { predictedRank, predictedPoints };
-      }
-      return { predictedRank: 0, predictedPoints: 0 };
-    }
-
-    // Lire compteur de corrects pour cette question
-    const qSnap = await tx.get(qRef);
-    const cur = qSnap.exists() ? (qSnap.data().correctCount || 0) : 0;
-    const next = cur + 1;
-
-    // Mettre à jour le compteur
-    tx.set(qRef, { correctCount: next }, { merge: true });
-
-    const predictedRank = next;
-    const predictedPoints = table[predictedRank - 1] ?? 0;
-
-    // Marquer la submission du joueur
-    tx.set(subRef, {
-      isCorrect: true,
-      firstCorrectAt: serverTimestamp(),
-      predictedRank,
-      predictedPoints,
-    }, { merge: true });
-
-    return { predictedRank, predictedPoints };
-  });
-}
+import {
+  useMobileVH,
+  recordFirstCorrectAndPredict,
+} from "../lib/firebase-helpers";
 
 // ---------------------------------------------------------------------------
-// Transitions : masque et “cooldown” frontière
+// Constante locale spécifique au player
 // ---------------------------------------------------------------------------
-const UI_MASK_MS = 220;         // durée du voile anti-flicker
 const BOUNDARY_HYST_MS = 120;   // marge autour des frontières de manche
-
-// ---------------------------------------------------------------------------
-// Anti-spam
-// ---------------------------------------------------------------------------
-const RATE_LIMIT_ENABLED = true;
-const MAX_WRONG_ATTEMPTS = 6;        // nb de tentatives avant blocage
-const RATE_LIMIT_WINDOW_MS = 15_000; // fenêtre glissante: 15 s
-const COOLDOWN_MS = 5_000;          // durée du blocage (5 s)
-
-// Phrases anti-spam
-const LOCK_PHRASES = [
-  "Eh, arrête de spammer ! Ecoute et réfléchis plutôt !",
-  "Le spam c'est mal, m'voyez !",
-  "Tu penses vraiment y arriver de cette façon ?",
-  "Tu veux faire exploser l'appli ou quoi ?",
-  "Calme toi, tout doux..."
-];
-
-// Phrases de révélation (fallback)
-const DEFAULT_REVEAL_PHRASES = [
-  "La réponse était :",
-  "Il fallait trouver :",
-  "C'était :",
-  "La bonne réponse :",
-  "Réponse :",
-];
-
-// Phases
-const REVEAL_DURATION_SEC = 20; // 15s réponse + 5s compte à rebours
-const COUNTDOWN_START_SEC = 5;
-// Intro au début de chaque manche (mange ce temps sur la 1ʳᵉ question de la manche)
-const ROUND_START_INTRO_SEC = 5;
-
-// Barre de temps
-const BAR_H = 6;
-const BAR_BLUE = "#3b82f6";
-const BAR_RED = "#ef4444";
-const HANDLE_COLOR = "#f8fafc";
-
-// Image
-const PLAYER_IMG_MAX = 220; // px
-
-// Espace haut (safe-area iOS + marge supérieure uniforme)
-const SAFE_TOP = "env(safe-area-inset-top, 0px)";
-const TOP_GUTTER_RUNNING = "clamp(40px, 8vh, 72px)"; // quand le quiz tourne
-const TOP_GUTTER_IDLE = "clamp(28px, 6vh, 56px)"; // états hors “running”
-
-/* ================================ HELPERS =============================== */
-function normalize(str) {
-  return str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
-}
-function levenshteinDistance(a, b) {
-  const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
-  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      dp[i][j] =
-        a[i - 1] === b[j - 1]
-          ? dp[i - 1][j - 1]
-          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-    }
-  }
-  return dp[a.length][b.length];
-}
-function isCloseEnough(input, expected, tolerance = 2) {
-  return levenshteinDistance(input, expected) <= tolerance;
-}
-// ===== Tolérance de réponse — modes =====
-function normalizeBasic(s) {
-  return String(s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-function isNumericString(s) {
-  return /^[0-9]+$/.test(String(s || ""));
-}
-// Détection iOS (inclut iPadOS "desktop-class" avec écran tactile)
-const IS_IOS = (() => {
-  try {
-    const ua = navigator.userAgent || "";
-    const isIOSDevice = /iPad|iPhone|iPod/.test(ua);
-    const isTouchMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
-    return isIOSDevice || isTouchMac;
-  } catch {
-    return false;
-  }
-})();
-
-// Récupère le mode choisi côté Admin (fallback: "relaxed")
-function getAnswerMode(q) {
-  return q?.answerMode || q?.matchMode || "relaxed";
-}
-
-/**
- * Modes supportés:
- * - "strict": égalité exacte après normalisation de base
- * - "relaxed": égalité OU Levenshtein <= ⌊len/3⌋ (min 1), mais
- *              désactivé pour réponses très courtes (≤4) et pour le 100% numérique
- * - "numeric": comparaison par valeur numérique :
- *      • si l’attendu est numérique → Number(input) === Number(attendu) (zéros en tête autorisés)
- *      • si l’attendu n’est pas numérique → égalité stricte normalisée (permet "quatre" si présent dans answers)
- */
-function matchesWithMode(inputRaw, expectedRaw, mode = "relaxed") {
-  const inNorm = normalizeBasic(inputRaw);
-  const exNorm = normalizeBasic(expectedRaw);
-
-  if (mode === "numeric") {
-    const inDigits = String(inputRaw ?? "").replace(/\s+/g, "");
-    const exDigits = String(expectedRaw ?? "").replace(/\s+/g, "");
-
-    const exIsNum = isNumericString(exDigits);
-    const inIsNum = isNumericString(inDigits);
-
-    if (exIsNum && inIsNum) {
-      // Comparaison par valeur : "04" == "4", "040" != "4"
-      return Number(inDigits) === Number(exDigits);
-    }
-    if (!exIsNum) {
-      // L’attendu est une forme non-numérique explicitement listée ("quatre", "IV", etc.)
-      return inNorm === exNorm;
-    }
-    // Attendu numérique mais saisie non-numérique -> faux
-    return false;
-  }
-
-  if (mode === "strict") {
-    return inNorm === exNorm;
-  }
-
-  // "relaxed" (par défaut)
-  if (inNorm === exNorm) return true;
-
-  // Pas de flou si les deux sont purement numériques
-  const bothNumeric = isNumericString(inNorm) && isNumericString(exNorm);
-  if (bothNumeric) return false;
-
-  // Pas de flou pour les réponses très courtes (≤ 4)
-  if (exNorm.length <= 4) return false;
-
-  const tol = Math.max(1, Math.floor(exNorm.length / 3));
-  return isCloseEnough(inNorm, exNorm, tol);
-}
-
-
-function getTimeSec(q) {
-  if (!q || typeof q !== "object") return Infinity;
-  if (typeof q.timecodeSec === "number") return q.timecodeSec;           // secondes (nouveau)
-  if (typeof q.timecode === "number") return Math.round(q.timecode * 60); // minutes (legacy)
-  return Infinity;
-}
-function pickRevealPhrase(q) {
-  const custom = Array.isArray(q?.revealPhrases)
-    ? q.revealPhrases.filter((p) => typeof p === "string" && p.trim() !== "")
-    : [];
-  const pool = custom.length ? custom : DEFAULT_REVEAL_PHRASES;
-  if (!pool.length) return "Réponse :";
-  const seedStr = String(q?.id || "");
-  let hash = 0;
-  for (let i = 0; i < seedStr.length; i++) hash = (hash * 31 + seedStr.charCodeAt(i)) >>> 0;
-  return pool[hash % pool.length];
-}
-function formatHMS(sec) {
-  if (!Number.isFinite(sec) || sec < 0) return "00:00:00";
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = Math.floor(sec % 60);
-  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
-}
-
-// Manches
-function roundIndexOfTime(t, offsets) {
-  if (!Array.isArray(offsets)) return 0;
-  let idx = -1;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && t >= v) idx = i;
-  }
-  return Math.max(0, idx);
-}
-function nextRoundStartAfter(t, offsets) {
-  if (!Array.isArray(offsets)) return null;
-  for (let i = 0; i < offsets.length; i++) {
-    const v = offsets[i];
-    if (typeof v === "number" && v > t) return v;
-  }
-  return null;
-}
-
-/* ===== Helpers nom joueur (validation + modération forte) ===== */
-
-// 1) Règles d'entrée : lettres FR + chiffres + espace + apostrophe + tirets, 1..30
-const NAME_ALLOWED_RE = /^[A-Za-zÀ-ÖØ-öø-ÿ0-9'’\-–\s]{1,30}$/u;
-
-// Helper : détecte "Player N" (N = entier)
-function isAliasName(raw) {
-  return /^player\s*\d+$/i.test(String(raw || "").trim());
-}
-
-// 2) Normalisation “unicité/tri”
-function normalizeName(s) {
-  return (s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // supprime les accents
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// 3) Normalisation “modération” (durcit : leet + ponctuation + répétitions)
-function normalizeForModeration(s) {
-  let t = (s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // accents
-    .toLowerCase();
-
-  // leetspeak courant
-  t = t
-    .replace(/[@]/g, "a")
-    .replace(/[$]/g, "s")
-    .replace(/[€]/g, "e")
-    .replace(/[0]/g, "o")
-    .replace(/[1l]/g, "i")
-    .replace(/[3]/g, "e")
-    .replace(/[4]/g, "a")
-    .replace(/[5]/g, "s")
-    .replace(/[7]/g, "t")
-    .replace(/[+]/g, "t");
-
-  // tout ce qui n'est pas alphanum devient espace
-  t = t.replace(/[^a-z0-9]+/g, " ");
-
-  // compressions de répétitions (biiiiiite -> biite -> bite)
-  t = t.replace(/([a-z0-9])\1{2,}/g, "$1$1");
-
-  // espaces propres
-  return t.replace(/\s+/g, " ").trim();
-}
-
-// 4) Dictionnaires — listes ciblées (peuvent être étendues)
-const PROFANITY = new Set([
-  "fuck", "shit", "merde", "pute", "putain", "salope", "connard", "connasse",
-  "encule", "enculé", "enculee", "enculee", "ntm", "fdp", "nique", "niquer",
-  "biatch", "bite", "couille", "couilles", "pd", "tapette", "tafiole",
-  // racisme / haine
-  "nazi", "hitler", "negro", "negre", "bougnoule", "youpin", "antisemite", "raciste"
-]);
-
-// Mots/organisations/lieux politiques & conflits
-const POLITICS_TOKENS = new Set([
-  "palestine", "israel", "gaza", "hamas", "hezbollah",
-  "ukraine", "russie", "russia", "poutine",
-  "front", "national", "rn", "reconquete", "zemmour", "sarkozy",
-  "lfi", "insoumise", "melenchon", "bardella",
-  "macron", "lepen", "trump", "biden", "FN"
-]);
-// Phrases exactes multi-mots à repérer (avec espaces normaux)
-const POLITICS_PHRASES = [
-  "front national", "la france insoumise", "le pen"
-];
-const POLITICS_PREFIX = new Set(["vive", "viva", "free", "support", "go"]);
-
-// 5) Vérification modération
-function moderationReason(raw) {
-  const norm = normalizeForModeration(raw);
-  if (!norm) return null;
-  const tokens = norm.split(" ");               // tokens sans accents, propres
-  const joined = ` ${tokens.join(" ")} `;       // pour les phrases
-
-  // Profanités (par token entier)
-  for (const t of tokens) {
-    if (PROFANITY.has(t)) return "moderation";  // insultes/haine/sexuel
-  }
-
-  // Phrases politiques connues
-  for (const phrase of POLITICS_PHRASES) {
-    if (joined.includes(` ${phrase} `)) return "politics";
-  }
-
-  // Mots politiques
-  const hasPoliticalWord = tokens.some((t) => POLITICS_TOKENS.has(t));
-  if (hasPoliticalWord) return "politics";
-
-  // Combinaisons du type "vive/viva/free" + mot politique
-  const hasPrefix = tokens.some((t) => POLITICS_PREFIX.has(t));
-  if (hasPrefix && hasPoliticalWord) return "politics";
-
-  return null;
-}
-
-// 6) Validation globale — renvoie {ok, value?, reason?}
-function validateName(raw) {
-  if (!raw || typeof raw !== "string") return { ok: false, reason: "empty" };
-
-  const cleaned = raw.replace(/\s+/g, " ").trim();
-  if (cleaned.length < 1 || cleaned.length > 30) return { ok: false, reason: "length" };
-  if (!NAME_ALLOWED_RE.test(cleaned)) return { ok: false, reason: "charset" };
-
-  const mod = moderationReason(cleaned);
-  if (mod) return { ok: false, reason: mod };
-
-  return { ok: true, value: cleaned };
-}
 
 // ---------------------------------------------------------------------------
 // Splash (écran neutre, plein écran, fond homogène)
@@ -446,31 +84,6 @@ function Splash() {
       aria-hidden="true"
     />
   );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers alpha/tri pour le classement & messages finaux
-// ---------------------------------------------------------------------------
-function normalizeNameAlpha(s) {
-  return String(s || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function messageForRank(rank) {
-  if (rank === 1) return "Quel talent, tu es premier !";
-  if (rank === 2) return "Félicitations, tu termines second !";
-  if (rank === 3) return "Bravo, tu es 3e avec un très beau score !";
-  if (rank === 4) return "Bravo, tu finis quatrième, si proche du podium !";
-  if (Number.isInteger(rank))
-    return `C'était le Quiz d'Eley. Tu finis à la ${rank}ᵉ place. Merci pour ta participation !`;
-  return "Merci pour ta participation !";
-}
-function medalForRank(rank) {
-  return rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "";
 }
 
 // ---------------------------------------------------------------------------
@@ -698,18 +311,31 @@ export default function Player() {
 
       const d = snap.data() || {};
 
+      // Si le nom est refusé, réinitialiser complètement pour forcer une nouvelle inscription
+      if (d.nameStatus === "rejected") {
+        startTransition(() => {
+          setIsKicked(false);
+          setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
+          setInputName("");
+          setPlayerName("");
+          setPlayerId(null);
+        });
+        localStorage.removeItem("playerId");
+        localStorage.removeItem("playerName");
+        // Le useEffect se désabonnera automatiquement car playerId devient null
+        return; // Sortir tôt pour éviter de mettre à jour playerName
+      }
+
       startTransition(() => {
         setIsKicked(!!d.isKicked);
         if (d.isKicked) {
           setError("Vous avez été retiré de la partie.");
-        } else if (d.nameStatus === "rejected") {
-          setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
-          setInputName("");
         } else {
           setError("");
         }
       });
 
+      // Ne mettre à jour playerName que si le nom est accepté (pas refusé)
       if (typeof d.name === "string") {
         startTransition(() => {
           setPlayerName(d.name);
@@ -1823,10 +1449,11 @@ export default function Player() {
     const v = validateName(inputName);
     if (!v.ok) {
       if (v.reason === "length") setError("Le nom doit faire entre 1 et 30 caractères.");
-      else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (’ ') et tirets.");
+      else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (' ') et tirets.");
       else if (v.reason === "politics") setError("Évite les noms à caractère politique. Merci !");
       else if (v.reason === "moderation") setError("Nom inadapté au tout public.");
       else setError("Nom invalide.");
+      setInputName(""); // Vider le champ pour permettre une nouvelle saisie
       return;
     }
 
@@ -1922,12 +1549,18 @@ export default function Player() {
   // Style compact pour la question (évite le chevauchement en haut)
   const questionH2Style = {
     fontSize: "clamp(1.1rem, 4.2vw, 1.45rem)",
-    lineHeight: 1.25,
+    lineHeight: 1.5, // Augmenté pour plus d'espacement entre les lignes
     margin: 0,
     marginTop: 6,
-    overflowWrap: "anywhere",
-    wordBreak: "break-word",
+    maxWidth: "min(600px, 95%)", // Limite la largeur pour forcer des retours naturels
+    marginLeft: "auto",
+    marginRight: "auto",
+    overflowWrap: "break-word", // Moins agressif que "anywhere"
+    wordBreak: "normal", // Évite de couper les mots au milieu
     hyphens: "auto",
+    lineBreak: "loose", // Permet des retours à la ligne plus souples
+    textAlign: "center", // Centré comme demandé
+    letterSpacing: "0.01em", // Légère augmentation pour meilleure lisibilité
   };
 
   // Flags d’état pour le bouton d’inscription
@@ -2313,14 +1946,17 @@ export default function Player() {
           ) : isQuestionPhase ? (
             <>
               {/* Phase question */}
-              <h2 style={questionH2Style}>{currentQuestion.text}</h2>
+              <h2 
+                style={questionH2Style}
+                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+              />
 
-              {/* Image question (optionnelle) */}
+              {/* Image question (optionnelle) - Taille réduite de moitié pour éviter que le clavier cache le champ input */}
               {currentQuestion?.imageQuestionUrl ? (
                 <div
                   style={{
-                    width: PLAYER_IMG_MAX,
-                    height: PLAYER_IMG_MAX,
+                    width: PLAYER_IMG_MAX / 2,
+                    height: PLAYER_IMG_MAX / 2,
                     maxWidth: "100%",
                     margin: "16px auto",
                     display: "flex",
@@ -2350,20 +1986,34 @@ export default function Player() {
 
             // Révélation de la réponse
             <div style={{ marginTop: 8, marginBottom: 4 }}>
-              <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
+              <div style={{ 
+                opacity: 0.85, 
+                fontSize: 16, 
+                marginBottom: 6,
+                lineHeight: 1.4,
+                maxWidth: "min(600px, 95%)",
+                marginLeft: "auto",
+                marginRight: "auto",
+                textAlign: "center",
+              }}>
                 {revealPhrase}
               </div>
               <h2
                 style={{
                   fontSize: "clamp(1.2rem, 5vw, 1.6rem)",
                   margin: 0,
-                  overflowWrap: "anywhere",
-                  wordBreak: "break-word",
+                  lineHeight: 1.5,
+                  maxWidth: "min(600px, 95%)",
+                  marginLeft: "auto",
+                  marginRight: "auto",
+                  overflowWrap: "break-word", // Ne coupe que si nécessaire, préfère couper entre les mots
+                  wordBreak: "normal", // Ne coupe pas les mots au milieu
                   hyphens: "auto",
+                  textAlign: "center",
+                  letterSpacing: "0.01em",
                 }}
-              >
-                {primaryAnswer}
-              </h2>
+                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(primaryAnswer) }}
+              />
             </div>
           ) : isCountdownPhase ? (
             // Décompte avant prochaine échéance
@@ -2377,9 +2027,10 @@ export default function Player() {
             </div>
           ) : (
             // Fallback conservateur
-            <h2 style={questionH2Style}>
-              {currentQuestion.text}
-            </h2>
+            <h2 
+              style={questionH2Style}
+              dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+            />
           )}
 
           {/* -------------------------- Barre de temps -------------------------- */}
@@ -2516,9 +2167,9 @@ export default function Player() {
             ) : null}
           </form>
 
-          {/* Bouton "Valider" — visible sur toutes plateformes quand l’input est visible */}
+          {/* Bouton "Valider" — visible sur toutes plateformes quand l'input est visible */}
           {showInput && (
-            <div style={{ marginTop: 10 }}>
+            <div style={{ marginTop: 10, textAlign: "center" }}>
               <button
                 type="button"
                 onMouseDown={keepInputFocus}
@@ -2526,11 +2177,11 @@ export default function Player() {
                 onClick={handleAnswerSubmit}
                 disabled={isLocked || !((answer ?? "").trim().length > 0)}
                 style={{
-                  width: "min(520px, 100%)",
-                  maxWidth: "92vw",
+                  width: "auto",
+                  minWidth: "120px",
+                  padding: "clamp(10px, 2.8vw, 12px) 24px",
                   boxSizing: "border-box",
                   display: "inline-block",
-                  padding: "clamp(10px, 2.8vw, 12px) 12px",
                   borderRadius: 10,
                   border: "1px solid #2a2a2a",
                   background: isLocked ? "#64748b" : "#3b82f6",
@@ -2553,21 +2204,27 @@ export default function Player() {
 
 
 
-          {/* Bannière “bonne réponse” persistante pendant la phase question */}
+          {/* Bannière "bonne réponse" persistante pendant la phase question */}
           {isQuestionPhase && (hadCorrectEver || showGoodNow) && (
-            <div
-              style={{
-                marginTop: 8,
-                padding: "8px 10px",
-                borderRadius: 10,
-                border: "1px solid #2a2a2a",
-                background: "#0b3a1e",
-                fontWeight: 700,
-              }}
-            >
-              {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
-              {Number.isFinite(gainedPoints) ? ` +${gainedPoints} pts` : ""}{" "}
-              {instantWin?.rank ? medalForRank(instantWin.rank) : ""}
+            <div style={{ marginTop: 8, textAlign: "center" }}>
+              <div
+                style={{
+                  display: "inline-block",
+                  padding: "8px 16px",
+                  borderRadius: 10,
+                  border: "1px solid #2a2a2a",
+                  background: "#0b3a1e",
+                  fontWeight: 700,
+                }}
+              >
+                {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
+              </div>
+              {Number.isFinite(gainedPoints) && (
+                <div style={{ marginTop: 6, fontSize: "0.95rem", opacity: 0.9 }}>
+                  Tu as marqué {gainedPoints} point{gainedPoints > 1 ? "s" : ""}
+                  {instantWin?.rank ? ` ${medalForRank(instantWin.rank)}` : ""}
+                </div>
+              )}
             </div>
           )}
         </>
