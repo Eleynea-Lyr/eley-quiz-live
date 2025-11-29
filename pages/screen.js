@@ -23,6 +23,9 @@ import {
   SCREEN_IMG_MAX,
   DEFAULT_LEADERBOARD_TOP_N,
   DEFAULT_SCORING_TABLE,
+  BUZZER_STATES,
+  BUZZER_CORRECT_MESSAGE_DURATION_MS,
+  BUZZER_WRONG_MESSAGE_DURATION_MS,
 } from "../lib/constants";
 
 import {
@@ -188,6 +191,14 @@ function ScreenInner() {
   // Format: [{ playerId }]
   const [liveFirsts, setLiveFirsts] = useState([]);
 
+  // EleyBuzz state
+  const [isBuzzerMode, setIsBuzzerMode] = useState(false);
+  const [buzzerState, setBuzzerState] = useState("idle");
+  const [firstPlayerId, setFirstPlayerId] = useState(null);
+  const [firstPlayerName, setFirstPlayerName] = useState(null);
+  const [buzzerMessage, setBuzzerMessage] = useState(null);
+  const [buzzerMessageType, setBuzzerMessageType] = useState(null);
+
   // Accès rapide aux noms des joueurs par id
   const playersById = useMemo(() => {
     const map = Object.create(null);
@@ -261,6 +272,7 @@ function ScreenInner() {
           id: d.id,
           name: v.name || "",
           score: Number(v.score || 0),
+          buzzScore: Number(v.buzzScore || 0),
           color: v.color || null,
           isKicked: !!v.isKicked,
           lastDelta: Number(v.lastDelta || 0),
@@ -381,6 +393,14 @@ function ScreenInner() {
 
       setIsRunning(!!d.isRunning);
       setIsPaused(!!d.isPaused);
+
+      // EleyBuzz state
+      setIsBuzzerMode(!!d.isBuzzerMode);
+      setBuzzerState(typeof d.buzzerState === "string" ? d.buzzerState : "idle");
+      setFirstPlayerId(typeof d.firstPlayerId === "string" ? d.firstPlayerId : null);
+      setFirstPlayerName(typeof d.firstPlayerName === "string" ? d.firstPlayerName : null);
+      setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
+      setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
 
       if (!startMs) {
         setQuizStartMs(null);
@@ -506,26 +526,34 @@ function ScreenInner() {
   }, [playersLB, leaderboardTopN]);
 
   // Podium (fin de quiz) : basé sur les RANGS (1, 2, 3) comme dans le classement
+  // Score final = score quiz + buzzScore (EleyBuzz)
   const podium = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
-      .map((p) => ({
-        id: p.id,
-        name: p.name || "",
-        score: Number(p.score || 0),
-        _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
-      }))
+      .map((p) => {
+        const scoreQuiz = Number(p.score || 0);
+        const buzzScore = Number(p.buzzScore || 0);
+        const scoreFinal = scoreQuiz + buzzScore;
+        return {
+          id: p.id,
+          name: p.name || "",
+          score: scoreQuiz,
+          buzzScore: buzzScore,
+          scoreFinal: scoreFinal,
+          _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+        };
+      })
       .sort((a, b) => {
-        // Tri identique au leaderboard : score desc, puis nom
-        if (a.score !== b.score) return b.score - a.score;
+        // Tri par score final (quiz + EleyBuzz), puis nom
+        if (a.scoreFinal !== b.scoreFinal) return b.scoreFinal - a.scoreFinal;
         return a._nameKey.localeCompare(b._nameKey);
       });
 
-    // Calcul des rangs "compétition" : 1,1,3,4…
+    // Calcul des rangs "compétition" : 1,1,3,4… (basé sur scoreFinal)
     let lastScore = null;
     let lastRank = 0;
     rows.forEach((p, i) => {
-      const sc = Number(p.score || 0);
+      const sc = p.scoreFinal;
       if (i === 0) {
         p._rank = 1;
         lastScore = sc;
@@ -539,10 +567,10 @@ function ScreenInner() {
       }
     });
 
-    // Groupes de médailles alignés sur le classement
-    const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
-    const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
-    const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
+    // Groupes de médailles alignés sur le classement (basé sur scoreFinal)
+    const gold = rows.filter((p) => p.scoreFinal > 0 && p._rank === 1);
+    const silver = rows.filter((p) => p.scoreFinal > 0 && p._rank === 2);
+    const bronze = rows.filter((p) => p.scoreFinal > 0 && p._rank === 3);
 
     return { gold, silver, bronze };
   }, [playersLB]);
@@ -1055,6 +1083,74 @@ function ScreenInner() {
     return () => { tag.remove(); };
   }, [uiMasked]);
 
+  // ============================================================================
+  // EleyBuzz Mode — Gestion des messages temporaires et leaderboard
+  // IMPORTANT: Ces hooks doivent être AVANT tous les early returns conditionnels
+  // ============================================================================
+  
+  // Gestion des messages temporaires avec auto-dismiss
+  useEffect(() => {
+    if (!isBuzzerMode || !buzzerMessage || !buzzerMessageType) return;
+
+    const duration = buzzerMessageType === "correct"
+      ? BUZZER_CORRECT_MESSAGE_DURATION_MS
+      : BUZZER_WRONG_MESSAGE_DURATION_MS;
+
+    const timer = setTimeout(() => {
+      setBuzzerMessage(null);
+      setBuzzerMessageType(null);
+    }, duration);
+
+    return () => clearTimeout(timer);
+  }, [isBuzzerMode, buzzerMessage, buzzerMessageType]);
+
+  // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
+  useEffect(() => {
+    if (!isBuzzerMode) {
+      // Quand EleyBuzz est désactivé, réinitialiser tous les états locaux
+      setBuzzerMessage(null);
+      setBuzzerMessageType(null);
+    }
+  }, [isBuzzerMode]);
+
+  // Leaderboard EleyBuzz (trié par buzzScore)
+  const buzzerLeaderboard = useMemo(() => {
+    if (!isBuzzerMode) return [];
+    
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .map((p) => ({
+        id: p.id,
+        name: p.name || "",
+        buzzScore: Number(p.buzzScore || 0),
+        _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+      }))
+      .sort((a, b) => {
+        if (a.buzzScore !== b.buzzScore) return b.buzzScore - a.buzzScore;
+        return a._nameKey.localeCompare(b._nameKey);
+      });
+
+    // Calcul des rangs avec égalités
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = p.buzzScore;
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;
+      } else {
+        p._rank = i + 1;
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+
+    return rows;
+  }, [isBuzzerMode, playersLB]);
+
   // Largeur bornée + retours à la ligne + descente légère
   // Aligné avec Player pour cohérence
   const screenQuestionStyle = {
@@ -1076,8 +1172,8 @@ function ScreenInner() {
   // ============================================================================
   // /pages/screen.js — Partie 4/5
   // Scope : RENDER — écrans pré-start / quiz (question, reveal, countdown),
-  // pauses & fins de manche/quiz, colonne classement et panneaux “Rejoindre”.
-  // (⚠️ Ne PAS fermer la fonction ici — l’accolade finale arrive en partie 5.)
+  // pauses & fins de manche/quiz, colonne classement et panneaux "Rejoindre".
+  // (⚠️ Ne PAS fermer la fonction ici — l'accolade finale arrive en partie 5.)
   // ============================================================================
 
   /* ============================ RENDER (PARTIE 4/4) ============================ */
@@ -1110,6 +1206,136 @@ function ScreenInner() {
           </p>
           <JoinPanelInline size="lg" />
         </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
+  // EleyBuzz Mode — Early return si mode buzzer actif
+  // ============================================================================
+  if (isBuzzerMode) {
+
+    return (
+      <div
+        style={{
+          background: "#000814",
+          color: "#fff",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "40px 24px",
+          textAlign: "center",
+        }}
+      >
+        <h1 style={{ fontSize: "3rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
+          ⚡ EleyBuzz ⚡
+        </h1>
+
+        {/* État du buzzer */}
+        {buzzerState === BUZZER_STATES.IDLE && !buzzerMessage && (
+          <div 
+            style={{ fontSize: "1.5rem", opacity: 0.85, marginBottom: 24 }}
+            dangerouslySetInnerHTML={{ 
+              __html: addSmartLineBreaks("Écoute attentivement la question et appuie vite sur le buzzer de ton téléphone si tu connais la réponse.")
+                .replace(/\.\s+/g, ".<br>")
+            }}
+          />
+        )}
+
+        {buzzerState === BUZZER_STATES.OPEN && (
+          <div style={{ fontSize: "1.5rem", opacity: 0.85, marginBottom: 24, color: "#22c55e" }}>
+            Le buzzer est OUVERT ! Préparez-vous à buzzer !
+          </div>
+        )}
+
+        {buzzerState === BUZZER_STATES.LOCKED && firstPlayerName && !buzzerMessage && (
+          <div style={{ marginBottom: 24 }}>
+            <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
+              {firstPlayerName} a buzzé !
+            </div>
+            <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
+              On attend sa réponse...
+            </div>
+          </div>
+        )}
+
+        {/* Messages temporaires */}
+        {buzzerMessage && buzzerMessageType && (
+          <div
+            style={{
+              fontSize: "2.5rem",
+              fontWeight: 800,
+              marginBottom: 24,
+              padding: "20px 40px",
+              borderRadius: 12,
+              background: buzzerMessageType === "correct" ? "#0b3a1e" : "#7f1d1d",
+              border: `2px solid ${buzzerMessageType === "correct" ? "#22c55e" : "#dc2626"}`,
+              color: buzzerMessageType === "correct" ? "#86efac" : "#fecaca",
+              animation: "fadeIn 200ms ease-in",
+            }}
+          >
+            {buzzerMessage}
+          </div>
+        )}
+
+        {/* Classement EleyBuzz */}
+        {buzzerLeaderboard.length > 0 && (
+          <div
+            style={{
+              marginTop: 32,
+              width: "min(600px, 90vw)",
+              background: "#0b0f1a",
+              border: "1px solid #1f2a44",
+              borderRadius: 12,
+              padding: "20px",
+            }}
+          >
+            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, margin: 0, marginBottom: 16 }}>
+              Classement ⚡ EleyBuzz ⚡
+            </h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {buzzerLeaderboard.slice(0, 10).map((p, idx) => {
+                const rank = p._rank;
+                const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "";
+                return (
+                  <div
+                    key={p.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      padding: "12px 16px",
+                      background: rank <= 3 ? "#1f2937" : "transparent",
+                      borderRadius: 8,
+                      border: rank <= 3 ? "1px solid #374151" : "none",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <span style={{ fontSize: "1.2rem", fontWeight: 700, opacity: 0.85 }}>
+                        {rank}.
+                      </span>
+                      <span style={{ fontSize: "1.1rem", fontWeight: 700 }}>
+                        {p.name || "(sans nom)"}
+                      </span>
+                      {medal && <span style={{ fontSize: "1.5rem" }}>{medal}</span>}
+                    </div>
+                    <span
+                      style={{
+                        fontSize: "1.2rem",
+                        fontWeight: 800,
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      {p.buzzScore} pts
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -1238,7 +1464,9 @@ function ScreenInner() {
                       >
                         <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>{p.score}</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>
+                          {p.scoreFinal} {p.buzzScore > 0 ? `(Quiz: ${p.score} + EleyBuzz: ${p.buzzScore})` : ""}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -1252,7 +1480,9 @@ function ScreenInner() {
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -1266,7 +1496,9 @@ function ScreenInner() {
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -1313,7 +1545,9 @@ function ScreenInner() {
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -1327,7 +1561,9 @@ function ScreenInner() {
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>{p.score}</span>
+                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                        </span>
                       </div>
                     ))}
                   </div>

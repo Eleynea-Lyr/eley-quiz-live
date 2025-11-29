@@ -39,6 +39,9 @@ import {
   SAFE_TOP,
   TOP_GUTTER_RUNNING,
   TOP_GUTTER_IDLE,
+  BUZZER_COOLDOWN_MS,
+  BUZZER_STATES,
+  BUZZER_WRONG_MESSAGE_DURATION_MS,
 } from "../lib/constants";
 
 import {
@@ -64,6 +67,7 @@ import {
 import {
   useMobileVH,
   recordFirstCorrectAndPredict,
+  registerBuzzerPress,
 } from "../lib/firebase-helpers";
 
 // ---------------------------------------------------------------------------
@@ -224,6 +228,18 @@ export default function Player() {
   const [cooldownTick, setCooldownTick] = useState(0);
   const [lockPhraseIndex, setLockPhraseIndex] = useState(null);
 
+  // EleyBuzz state
+  const [isBuzzerMode, setIsBuzzerMode] = useState(false);
+  const [buzzerState, setBuzzerState] = useState("idle");
+  const [firstPlayerId, setFirstPlayerId] = useState(null);
+  const [canBuzz, setCanBuzz] = useState(true);
+  const [buzzerCooldownUntilMs, setBuzzerCooldownUntilMs] = useState(null);
+  const [buzzerMessage, setBuzzerMessage] = useState(null);
+  const [buzzerMessageType, setBuzzerMessageType] = useState(null);
+  // État optimiste pour le buzzer (affichage immédiat sans attendre Firestore)
+  const [optimisticBuzzerState, setOptimisticBuzzerState] = useState(null);
+  const [optimisticFirstPlayerId, setOptimisticFirstPlayerId] = useState(null);
+
 
   // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
@@ -344,6 +360,11 @@ export default function Player() {
       }
       startTransition(() => setNameLocked(!!d.nameLocked));
 
+      // EleyBuzz: canBuzz depuis le doc joueur
+      startTransition(() => {
+        setCanBuzz(d.canBuzz !== false); // true par défaut si absent
+      });
+
       let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
       const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
       serverRejected = serverRejected.filter((n) => !isAliasNameLocal(n));
@@ -424,6 +445,29 @@ export default function Player() {
       startTransition(() => {
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
+        
+        // EleyBuzz state
+        setIsBuzzerMode(!!d.isBuzzerMode);
+        const newBuzzerState = typeof d.buzzerState === "string" ? d.buzzerState : "idle";
+        const newFirstPlayerId = typeof d.firstPlayerId === "string" ? d.firstPlayerId : null;
+        
+        setBuzzerState(newBuzzerState);
+        setFirstPlayerId(newFirstPlayerId);
+        
+        // Si Firestore confirme l'état optimiste, réinitialiser l'optimiste (synchronisation)
+        // On vérifie si l'état Firestore correspond à l'état optimiste qu'on a mis
+        if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
+          setOptimisticBuzzerState(null);
+          setOptimisticFirstPlayerId(null);
+        }
+        // Si l'état Firestore change (par exemple, un autre joueur a buzzé), réinitialiser l'optimiste
+        else if (optimisticBuzzerState && (optimisticBuzzerState !== newBuzzerState || optimisticFirstPlayerId !== newFirstPlayerId)) {
+          setOptimisticBuzzerState(null);
+          setOptimisticFirstPlayerId(null);
+        }
+        
+        setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
+        setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
       });
 
       if (!startMs) {
@@ -572,6 +616,7 @@ export default function Player() {
           id: d.id,
           name: v.name || "",
           score: Number(v.score || 0),
+          buzzScore: Number(v.buzzScore || 0),
           isKicked: !!v.isKicked,
         };
       });
@@ -1215,6 +1260,48 @@ export default function Player() {
     return () => clearInterval(id);
   }, [cooldownUntilMs]);
 
+  // Détecter quand le joueur est bloqué après une mauvaise réponse et initialiser le cooldown
+  // Le cooldown démarre immédiatement quand le message "Mauvaise réponse" disparaît sur Screen
+  // (c'est-à-dire quand buzzerState passe à OPEN et que canBuzz est false)
+  useEffect(() => {
+    if (!isBuzzerMode || !playerId) return;
+    // Si canBuzz est false, que le buzzer est ouvert, et que le message "wrong" vient de disparaître
+    // (buzzerMessageType n'est plus "wrong"), démarrer immédiatement le cooldown de 20 secondes
+    if (!canBuzz && buzzerState === BUZZER_STATES.OPEN && !buzzerCooldownUntilMs && buzzerMessageType !== "wrong") {
+      // Démarrer immédiatement le cooldown de 20 secondes
+      const cooldownEndMs = Date.now() + BUZZER_COOLDOWN_MS;
+      setBuzzerCooldownUntilMs(cooldownEndMs);
+    }
+    // Si canBuzz redevient true, réinitialiser le cooldown
+    if (canBuzz && buzzerCooldownUntilMs) {
+      setBuzzerCooldownUntilMs(null);
+    }
+  }, [isBuzzerMode, playerId, canBuzz, buzzerState, buzzerCooldownUntilMs, buzzerMessageType]);
+
+  // Ticker cooldown EleyBuzz
+  useEffect(() => {
+    if (!buzzerCooldownUntilMs) return;
+    const id = setInterval(() => {
+      const now = Date.now();
+      if (now >= buzzerCooldownUntilMs) {
+        setBuzzerCooldownUntilMs(null);
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [buzzerCooldownUntilMs]);
+
+  // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
+  useEffect(() => {
+    if (!isBuzzerMode) {
+      // Quand EleyBuzz est désactivé, réinitialiser tous les états locaux
+      startTransition(() => {
+        setBuzzerCooldownUntilMs(null);
+        setOptimisticBuzzerState(null);
+        setOptimisticFirstPlayerId(null);
+      });
+    }
+  }, [isBuzzerMode]);
+
 
   /* ============================ Vérification & Handlers ============================ */
 
@@ -1313,6 +1400,37 @@ export default function Player() {
       }, 0);
 
       setTimeout(() => setResult(null), 400);
+    }
+  };
+
+  // Handler EleyBuzz - optimisé pour la réactivité
+  const handleBuzzerPress = async () => {
+    if (!playerId || !isBuzzerMode || buzzerState !== BUZZER_STATES.OPEN || !canBuzz) return;
+    if (buzzerCooldownUntilMs && Date.now() < buzzerCooldownUntilMs) return;
+
+    // Mise à jour optimiste immédiate (affichage instantané)
+    startTransition(() => {
+      setOptimisticBuzzerState(BUZZER_STATES.LOCKED);
+      setOptimisticFirstPlayerId(playerId);
+    });
+
+    // Appel Firestore en arrière-plan (non-bloquant)
+    try {
+      const result = await registerBuzzerPress(db, playerId);
+      // Si le buzz a échoué (déjà verrouillé par un autre joueur), réinitialiser l'état optimiste
+      if (!result.ok && result.reason === "already-locked") {
+        startTransition(() => {
+          setOptimisticBuzzerState(null);
+          setOptimisticFirstPlayerId(null);
+        });
+      }
+    } catch (e) {
+      console.error("[Player] handleBuzzerPress error:", e);
+      // En cas d'erreur, réinitialiser l'état optimiste
+      startTransition(() => {
+        setOptimisticBuzzerState(null);
+        setOptimisticFirstPlayerId(null);
+      });
     }
   };
 
@@ -1424,6 +1542,7 @@ export default function Player() {
 
   const myRank = useMemo(() => (meRow ? meRow._rank : null), [meRow]);
   const myScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
+  const myBuzzScore = useMemo(() => (meRow ? Number(meRow.buzzScore || 0) : 0), [meRow]);
   const myMedal = useMemo(
     () => (Number(myScore) > 0 ? medalForRank(myRank) : ""),
     [myRank, myScore]
@@ -1479,6 +1598,7 @@ export default function Player() {
           nameNorm,
           createdAt: serverTimestamp(),
           score: 0,
+          buzzScore: 0,
           isKicked: false,
           nameStatus: "ok",
           rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [],
@@ -1772,6 +1892,219 @@ export default function Player() {
   }
 
   // ============================================================================
+  // EleyBuzz Mode — Early return si mode buzzer actif
+  // ============================================================================
+  if (isBuzzerMode && playerId) {
+    // Utiliser l'état optimiste s'il existe, sinon l'état Firestore
+    const effectiveBuzzerState = optimisticBuzzerState || buzzerState;
+    const effectiveFirstPlayerId = optimisticFirstPlayerId !== null ? optimisticFirstPlayerId : firstPlayerId;
+    
+    const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz && (!buzzerCooldownUntilMs || Date.now() >= buzzerCooldownUntilMs);
+    // Calculer le temps restant pour le timer de punition
+    // Le timer affiche simplement le temps restant du cooldown de 20 secondes
+    const now = Date.now();
+    let buzzerCooldownRemainingSec = 0;
+    if (buzzerCooldownUntilMs && now < buzzerCooldownUntilMs) {
+      // Calculer simplement le temps restant en secondes (20, 19, 18... jusqu'à 1)
+      buzzerCooldownRemainingSec = Math.ceil((buzzerCooldownUntilMs - now) / 1000);
+      if (buzzerCooldownRemainingSec < 0) buzzerCooldownRemainingSec = 0;
+    }
+
+    return (
+      <div
+        style={{
+          background: "#0a0a1a",
+          color: "#fff",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "24px",
+          textAlign: "center",
+          position: "relative",
+        }}
+      >
+        {/* Badge nom joueur en haut-gauche (même ligne que le timer) */}
+        {playerName && (
+          <div
+            style={{
+              position: "absolute",
+              top: `calc(12px + ${SAFE_TOP})`,
+              left: 12,
+              zIndex: 20,
+              background: "#0b1e3d",
+              border: "1px solid #1f2a44",
+              borderRadius: 9999,
+              padding: "6px 10px",
+              fontSize: 14,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              color: "#fff",
+            }}
+            aria-label="Nom du joueur"
+            title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
+          >
+            <span>👤</span>
+            <b style={{ letterSpacing: 0.2 }}>{playerName}</b>
+            {(isRunning || isBuzzerMode) && myScore != null && (
+              <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums" }}>
+                • {myScore}
+              </span>
+            )}
+            {isBuzzerMode && (
+              <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15" }}>
+                • ⚡ {myBuzzScore}
+              </span>
+            )}
+            {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
+          </div>
+        )}
+
+        <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
+          ⚡ EleyBuzz ⚡
+        </h1>
+
+        {/* Message de punition : affiché après les 3 secondes du message Screen, pendant les 20 secondes de cooldown */}
+        {/* Ce message a la priorité et s'affiche indépendamment de l'état du buzzer */}
+        {/* Le message s'affiche si le cooldown est actif ET que le joueur ne peut pas buzzer (canBuzz === false) */}
+        {buzzerCooldownRemainingSec > 0 && !canBuzz ? (
+          <div style={{ marginBottom: 24, textAlign: "center" }}>
+            <div 
+              style={{ 
+                opacity: 0.9, 
+                fontSize: 18, 
+                color: "#f59e0b",
+                fontWeight: 700,
+                lineHeight: 1.6,
+                marginBottom: 16
+              }}
+              dangerouslySetInnerHTML={{ 
+                __html: addSmartLineBreaks("T'es puni ! Il fallait donner la bonne réponse !").replace(/\.\s+/g, ".<br>") + 
+                "<br><br>" + 
+                addSmartLineBreaks("Attends 20 secondes ou qu'un autre joueur se trompe également avant de rebuzzer.").replace(/\.\s+/g, ".<br>")
+              }}
+            />
+            <div 
+              style={{ 
+                fontSize: "2.5rem", 
+                fontWeight: 800, 
+                color: "#f59e0b",
+                fontFamily: "monospace",
+                letterSpacing: 2
+              }}
+            >
+              {buzzerCooldownRemainingSec}
+            </div>
+          </div>
+        ) : (
+          <>
+            {effectiveBuzzerState === BUZZER_STATES.IDLE && (
+          <div 
+            style={{ opacity: 0.85, fontSize: 16, lineHeight: 1.6 }}
+            dangerouslySetInnerHTML={{ 
+              __html: "Écoute attentivement la question de Eley.<br><br>Puis, dès que le Buzzer apparaît, appuie vite dessus si tu connais la réponse !<br><br>Attention, tu auras une pénalité si tu réponds faux !"
+            }}
+          />
+        )}
+
+        {effectiveBuzzerState === BUZZER_STATES.LOCKED && (
+          <div 
+            style={{ 
+              opacity: 0.85, 
+              fontSize: playerId === effectiveFirstPlayerId ? 20 : 16,
+              color: (playerId === effectiveFirstPlayerId && buzzerMessageType === "correct") ? "#10b981" : (playerId === effectiveFirstPlayerId && buzzerMessageType === "wrong") ? "#ef4444" : (playerId === effectiveFirstPlayerId ? "#facc15" : undefined),
+              fontWeight: playerId === effectiveFirstPlayerId ? 700 : undefined,
+            }}
+            dangerouslySetInnerHTML={{ 
+              __html: (playerId === effectiveFirstPlayerId && buzzerMessageType === "correct")
+                ? "Bonne réponse"
+                : (playerId === effectiveFirstPlayerId && buzzerMessageType === "wrong")
+                  ? "Mauvaise réponse"
+                  : (playerId === effectiveFirstPlayerId 
+                    ? "À toi de répondre !"
+                    : (buzzerMessageType === "correct")
+                      ? "Attends la prochaine question"
+                      : (buzzerMessageType === "wrong")
+                        ? "À toi de tenter ta chance !"
+                        : addSmartLineBreaks("Le buzzer est verrouillé. Un joueur a déjà buzzé !").replace(/\.\s+/g, ".<br>"))
+            }}
+          />
+        )}
+
+        {effectiveBuzzerState === BUZZER_STATES.OPEN && (
+          <>
+            {canPressBuzzer && (
+              <button
+                onTouchStart={(e) => {
+                  // Sur mobile, onTouchStart est plus rapide que onClick
+                  if (canPressBuzzer) {
+                    e.preventDefault(); // Empêcher le double-tap
+                    e.currentTarget.style.transform = "scale(0.95)";
+                    e.currentTarget.style.background = "#2563eb";
+                    handleBuzzerPress(); // Déclencher immédiatement
+                  }
+                }}
+                onClick={(e) => {
+                  // Fallback pour desktop (souris)
+                  if (canPressBuzzer) {
+                    e.preventDefault();
+                    handleBuzzerPress();
+                  }
+                }}
+                disabled={!canPressBuzzer}
+                style={{
+                  width: "min(280px, 80vw)",
+                  height: "min(280px, 80vw)",
+                  maxWidth: 300,
+                  maxHeight: 300,
+                  borderRadius: "50%",
+                  border: "4px solid #fff",
+                  background: "#3b82f6",
+                  color: "#fff",
+                  fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
+                  fontWeight: 800,
+                  cursor: canPressBuzzer ? "pointer" : "not-allowed",
+                  touchAction: "manipulation",
+                  WebkitTapHighlightColor: "transparent",
+                  userSelect: "none",
+                  transition: "transform 100ms ease, background 100ms ease",
+                  boxShadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
+                }}
+                onMouseDown={(e) => {
+                  if (canPressBuzzer) {
+                    e.currentTarget.style.transform = "scale(0.95)";
+                    e.currentTarget.style.background = "#2563eb";
+                  }
+                }}
+                onMouseUp={(e) => {
+                  e.currentTarget.style.transform = "scale(1)";
+                  e.currentTarget.style.background = "#3b82f6";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.transform = "scale(1)";
+                  e.currentTarget.style.background = "#3b82f6";
+                }}
+                onTouchEnd={(e) => {
+                  e.currentTarget.style.transform = "scale(1)";
+                  e.currentTarget.style.background = "#3b82f6";
+                }}
+                title="Appuie pour buzzer !"
+              >
+                BUZZER
+              </button>
+            )}
+          </>
+        )}
+          </>
+        )}
+
+      </div>
+    );
+  }
+
+  // ============================================================================
   // /pages/player.js — Partie 5/6
   // Scope : Écran principal pendant le quiz — overlay anti-flicker, timer,
   //         badge nom, fin de quiz / fin de manche / pause, phases (question /
@@ -1826,13 +2159,13 @@ export default function Player() {
         ⏱ {formatHMS(elapsedSec)}
       </div>
 
-      {/* Badge nom joueur en haut-gauche */}
-      {isRunning && playerName && (
+      {/* Badge nom joueur en haut-gauche (même ligne que le timer) */}
+      {(isRunning || isBuzzerMode) && playerName && (
         <div
           style={{
-            position: "fixed",
-            top: `calc(10px + ${SAFE_TOP})`,
-            left: 10,
+            position: "absolute",
+            top: `calc(12px + ${SAFE_TOP})`,
+            left: 12,
             zIndex: 20,
             background: "#0b1e3d",
             border: "1px solid #1f2a44",
@@ -1842,12 +2175,23 @@ export default function Player() {
             display: "inline-flex",
             alignItems: "center",
             gap: 6,
+            color: "#fff",
           }}
           aria-label="Nom du joueur"
           title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
         >
           <span>👤</span>
           <b style={{ letterSpacing: 0.2 }}>{playerName}</b>
+          {(isRunning || isBuzzerMode) && myScore != null && (
+            <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums" }}>
+              • {myScore}
+            </span>
+          )}
+          {(isRunning || isBuzzerMode) && (
+            <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15" }}>
+              • ⚡ {myBuzzScore}
+            </span>
+          )}
           {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
         </div>
       )}
