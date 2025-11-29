@@ -240,6 +240,9 @@ export default function Player() {
   const [optimisticBuzzerState, setOptimisticBuzzerState] = useState(null);
   const [optimisticFirstPlayerId, setOptimisticFirstPlayerId] = useState(null);
 
+  // Score Final state
+  const [showFinalScore, setShowFinalScore] = useState(false);
+
 
   // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
@@ -454,20 +457,28 @@ export default function Player() {
         setBuzzerState(newBuzzerState);
         setFirstPlayerId(newFirstPlayerId);
         
-        // Si Firestore confirme l'état optimiste, réinitialiser l'optimiste (synchronisation)
-        // On vérifie si l'état Firestore correspond à l'état optimiste qu'on a mis
-        if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
+        // Réinitialiser l'état optimiste dans plusieurs cas :
+        // 1. Si le buzzer revient à idle (nouvelle question) → réinitialiser
+        // 2. Si firstPlayerId devient null (réinitialisation) → réinitialiser
+        // 3. Si Firestore confirme l'état optimiste → réinitialiser (synchronisation)
+        // 4. Si l'état Firestore change (par exemple, un autre joueur a buzzé) → réinitialiser
+        if (newBuzzerState === BUZZER_STATES.IDLE || newFirstPlayerId === null) {
+          // Nouvelle question ou réinitialisation : toujours réinitialiser l'optimiste
           setOptimisticBuzzerState(null);
           setOptimisticFirstPlayerId(null);
-        }
-        // Si l'état Firestore change (par exemple, un autre joueur a buzzé), réinitialiser l'optimiste
-        else if (optimisticBuzzerState && (optimisticBuzzerState !== newBuzzerState || optimisticFirstPlayerId !== newFirstPlayerId)) {
+        } else if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
+          // Firestore confirme l'état optimiste : réinitialiser (synchronisation)
+          setOptimisticBuzzerState(null);
+          setOptimisticFirstPlayerId(null);
+        } else if (optimisticBuzzerState && (optimisticBuzzerState !== newBuzzerState || optimisticFirstPlayerId !== newFirstPlayerId)) {
+          // L'état Firestore change : réinitialiser l'optimiste
           setOptimisticBuzzerState(null);
           setOptimisticFirstPlayerId(null);
         }
         
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
+        setShowFinalScore(!!d.showFinalScore);
       });
 
       if (!startMs) {
@@ -1541,7 +1552,15 @@ export default function Player() {
   }, [ranking, playerId, playerName]);
 
   const myRank = useMemo(() => (meRow ? meRow._rank : null), [meRow]);
-  const myScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
+  // Score optimiste : ajouter les points gagnés immédiatement quand le message s'affiche
+  const baseScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
+  const myScore = useMemo(() => {
+    // Si on a des points gagnés pour la question actuelle, les ajouter au score de base
+    if (gainedPoints && Number.isFinite(gainedPoints) && instantWin && instantWin.qid === currentQuestionId) {
+      return baseScore + gainedPoints;
+    }
+    return baseScore;
+  }, [baseScore, gainedPoints, instantWin, currentQuestionId]);
   const myBuzzScore = useMemo(() => (meRow ? Number(meRow.buzzScore || 0) : 0), [meRow]);
   const myMedal = useMemo(
     () => (Number(myScore) > 0 ? medalForRank(myRank) : ""),
@@ -1552,6 +1571,70 @@ export default function Player() {
       ? messageForRank(myRank)
       : "Merci pour ta participation !";
   }, [myRank, myScore]);
+
+  // Classement final (Quiz + EleyBuzz) pour le Score Final
+  const finalRanking = useMemo(() => {
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .map((p) => {
+        const scoreQuiz = Number(p.score || 0);
+        const buzzScore = Number(p.buzzScore || 0);
+        const scoreFinal = scoreQuiz + buzzScore;
+        return {
+          ...p,
+          scoreQuiz,
+          buzzScore,
+          scoreFinal,
+          _nameKey: normalizeNameAlpha(p.name || ""),
+        };
+      });
+    rows.sort((a, b) => {
+      if (a.scoreFinal !== b.scoreFinal) return b.scoreFinal - a.scoreFinal;
+      return a._nameKey.localeCompare(b._nameKey);
+    });
+    // Rangs avec égalités
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = p.scoreFinal;
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;
+      } else {
+        p._rank = i + 1;
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+    return rows;
+  }, [playersLB]);
+
+  const myFinalRow = useMemo(() => {
+    if (playerId) {
+      const byId = finalRanking.find((p) => p.id === playerId);
+      if (byId) return byId;
+    }
+    if (myIdRef.current) {
+      const byRef = finalRanking.find((p) => p.id === myIdRef.current);
+      if (byRef) return byRef;
+    }
+    if (playerName) {
+      const key = normalizeNameAlpha(playerName);
+      const byName = finalRanking.find((p) => normalizeNameAlpha(p.name || "") === key);
+      if (byName) return byName;
+    }
+    return null;
+  }, [finalRanking, playerId, playerName]);
+
+  const myFinalScore = useMemo(() => (myFinalRow ? myFinalRow.scoreFinal : 0), [myFinalRow]);
+  const myFinalRank = useMemo(() => (myFinalRow ? myFinalRow._rank : null), [myFinalRow]);
+  const myFinalMedal = useMemo(
+    () => (Number(myFinalScore) > 0 ? medalForRank(myFinalRank) : ""),
+    [myFinalRank, myFinalScore]
+  );
 
   /* ===== Helpers Firestore pour le nom ===== */
   async function nameExists(nameNorm, excludeId = null) {
@@ -1827,72 +1910,19 @@ export default function Player() {
             ELEY&nbsp;Quiz — Accès retiré
           </h1>
           <p style={{ opacity: 0.85, marginTop: 12 }}>
-            Vous avez été retiré de la partie par l’animateur.
+            Vous avez été retiré de la partie par l'animateur.
           </p>
           <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
-            (Si c’est une erreur, rapprochez-vous de l’animateur.)
+            (Si c'est une erreur, rapprochez-vous de l'animateur.)
           </div>
         </div>
       </div>
     );
   }
 
-  // 3) Écran d’attente une fois inscrit (avant lancement par l’Admin)
-  if (showPreStart && playerId) {
-    return (
-      <div
-        style={{
-          background: "#0a0a1a",
-          color: "#fff",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          display: "grid",
-          placeItems: "center",
-          padding: "24px",
-          textAlign: "center",
-        }}
-      >
-        <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
-          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            ELEY&nbsp;Quiz — En attente du départ
-          </h1>
-        </div>
-
-        <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
-          <p style={{ opacity: 0.85 }}>
-            {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
-            L’Admin n’a pas encore lancé le quiz.
-          </p>
-
-          {(!nameLocked && !isRunning) ? (
-            <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-              Envie de changer de nom ?{" "}
-              <button
-                onClick={resetAndDeletePlayer}
-                style={{
-                  color: "#93c5fd",
-                  background: "transparent",
-                  border: "none",
-                  cursor: "pointer",
-                  textDecoration: "underline",
-                }}
-              >
-                Modifier mon nom
-              </button>
-            </div>
-          ) : (
-            nameLocked && (
-              <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                Ton nom a été fixé par l’animateur.
-              </div>
-            )
-          )}
-        </div>
-      </div>
-    );
-  }
-
   // ============================================================================
-  // EleyBuzz Mode — Early return si mode buzzer actif
+  // EleyBuzz Mode — Early return si mode buzzer actif (priorité sur showPreStart)
+  // Permet d'accéder à EleyBuzz même si le quiz n'a pas encore démarré
   // ============================================================================
   if (isBuzzerMode && playerId) {
     // Utiliser l'état optimiste s'il existe, sinon l'état Firestore
@@ -2105,11 +2135,115 @@ export default function Player() {
   }
 
   // ============================================================================
+  // Score Final Mode — Early return si mode score final actif (priorité sur tout)
+  // ============================================================================
+  if (showFinalScore && playerId) {
+    return (
+      <div
+        style={{
+          background: "#0a0a1a",
+          color: "#fff",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "24px",
+          textAlign: "center",
+        }}
+      >
+        <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
+          Score Final de la soirée
+        </h1>
+        <div
+          style={{
+            marginTop: 8,
+            padding: 20,
+            borderRadius: 12,
+            background: "#0b0f1a",
+            border: "1px solid #1f2a44",
+            textAlign: "center",
+            maxWidth: "min(500px, 95%)",
+          }}
+        >
+          <div style={{ fontSize: "clamp(1.5rem, 5vw, 2rem)", fontWeight: 800, marginBottom: 12 }}>
+            Fin de la soirée, ton score est de :
+          </div>
+          <div style={{ fontSize: "clamp(2rem, 8vw, 3rem)", fontWeight: 900, color: "#facc15", marginBottom: 16 }}>
+            {myFinalScore} pts
+          </div>
+          {myFinalRank != null && (
+            <div style={{ fontSize: "clamp(1.1rem, 4vw, 1.3rem)", opacity: 0.9 }}>
+              {myFinalMedal && <span style={{ fontSize: "1.5rem", marginRight: 8 }}>{myFinalMedal}</span>}
+              Tu es {Number(myFinalScore) > 0 ? (myFinalRank === 1 ? "1er" : myFinalRank === 2 ? "2ème" : myFinalRank === 3 ? "3ème" : `${myFinalRank}ème`) : "dernier"} dans le classement
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 3) Écran d'attente une fois inscrit (avant lancement par l'Admin)
+  // (Affiché seulement si EleyBuzz n'est pas actif)
+  if (showPreStart && playerId) {
+    return (
+      <div
+        style={{
+          background: "#0a0a1a",
+          color: "#fff",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          display: "grid",
+          placeItems: "center",
+          padding: "24px",
+          textAlign: "center",
+        }}
+      >
+        <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
+          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
+            ELEY&nbsp;Quiz — En attente du départ
+          </h1>
+        </div>
+
+        <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
+          <p style={{ opacity: 0.85 }}>
+            {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
+            L'Admin n'a pas encore lancé le quiz.
+          </p>
+
+          {(!nameLocked && !isRunning) ? (
+            <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+              Envie de changer de nom ?{" "}
+              <button
+                onClick={resetAndDeletePlayer}
+                style={{
+                  color: "#93c5fd",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  textDecoration: "underline",
+                }}
+              >
+                Modifier mon nom
+              </button>
+            </div>
+          ) : (
+            nameLocked && (
+              <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                Ton nom a été fixé par l'animateur.
+              </div>
+            )
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
   // /pages/player.js — Partie 5/6
   // Scope : Écran principal pendant le quiz — overlay anti-flicker, timer,
   //         badge nom, fin de quiz / fin de manche / pause, phases (question /
   //         reveal / décompte), barre de temps, image, score, saisie + anti-spam,
-  //         bannière de bonne réponse, styles d’animations.
+  //         bannière de bonne réponse, styles d'animations.
   // ============================================================================
 
   // 4) Écran principal pendant le quiz

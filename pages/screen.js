@@ -199,6 +199,9 @@ function ScreenInner() {
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
 
+  // Score Final state
+  const [showFinalScore, setShowFinalScore] = useState(false);
+
   // Accès rapide aux noms des joueurs par id
   const playersById = useMemo(() => {
     const map = Object.create(null);
@@ -401,6 +404,7 @@ function ScreenInner() {
       setFirstPlayerName(typeof d.firstPlayerName === "string" ? d.firstPlayerName : null);
       setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
       setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
+      setShowFinalScore(!!d.showFinalScore);
 
       if (!startMs) {
         setQuizStartMs(null);
@@ -526,8 +530,53 @@ function ScreenInner() {
   }, [playersLB, leaderboardTopN]);
 
   // Podium (fin de quiz) : basé sur les RANGS (1, 2, 3) comme dans le classement
-  // Score final = score quiz + buzzScore (EleyBuzz)
+  // Score final = score quiz uniquement (sans EleyBuzz pour la fin de quiz normale)
   const podium = useMemo(() => {
+    const rows = (playersLB || [])
+      .filter((p) => !p.isKicked)
+      .map((p) => {
+        const scoreQuiz = Number(p.score || 0);
+        return {
+          id: p.id,
+          name: p.name || "",
+          score: scoreQuiz,
+          _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+        };
+      })
+      .sort((a, b) => {
+        // Tri par score quiz uniquement, puis nom
+        if (a.score !== b.score) return b.score - a.score;
+        return a._nameKey.localeCompare(b._nameKey);
+      });
+
+    // Calcul des rangs "compétition" : 1,1,3,4… (basé sur score quiz)
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((p, i) => {
+      const sc = p.score;
+      if (i === 0) {
+        p._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        p._rank = lastRank;
+      } else {
+        p._rank = i + 1;
+        lastScore = sc;
+        lastRank = p._rank;
+      }
+    });
+
+    // Groupes de médailles alignés sur le classement (basé sur score quiz)
+    const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
+    const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
+    const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
+
+    return { gold, silver, bronze };
+  }, [playersLB]);
+
+  // Podium final (Score Final de la soirée) : Quiz + EleyBuzz
+  const finalPodium = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
       .map((p) => {
@@ -572,7 +621,7 @@ function ScreenInner() {
     const silver = rows.filter((p) => p.scoreFinal > 0 && p._rank === 2);
     const bronze = rows.filter((p) => p.scoreFinal > 0 && p._rank === 3);
 
-    return { gold, silver, bronze };
+    return { gold, silver, bronze, all: rows };
   }, [playersLB]);
 
 
@@ -1211,6 +1260,144 @@ function ScreenInner() {
   }
 
   // ============================================================================
+  // Score Final Mode — Early return si mode score final actif
+  // ============================================================================
+  if (showFinalScore) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "row",
+          background: "#000814",
+          color: "white",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          position: "relative",
+        }}
+      >
+        {/* Colonne gauche : image optionnelle + QR (conservée) */}
+        <aside
+          aria-label="Infos & QR"
+          style={{
+            position: "relative",
+            width: 360,
+            maxWidth: "35vw",
+            background: "#081224",
+            border: "1px solid #1f2a44",
+            borderRadius: 12,
+            padding: 12,
+            margin: 12,
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+            alignSelf: "flex-start",
+          }}
+        >
+          {leftImageUrl && (
+            <div
+              style={{
+                borderRadius: 10,
+                overflow: "hidden",
+                border: "1px solid #1f2a44",
+                background: "#0b0f1a",
+              }}
+            >
+              <img
+                src={leftImageUrl}
+                alt=""
+                style={{
+                  display: "block",
+                  width: "100%",
+                  height: "clamp(320px, 38vh, 500px)",
+                  objectFit: "cover",
+                }}
+                loading="lazy"
+                decoding="async"
+              />
+            </div>
+          )}
+          <div style={{ marginTop: "auto", paddingBottom: 0 }}>
+            <JoinPanelInline size="lg" />
+          </div>
+        </aside>
+
+        {/* Colonne principale : Podium Final */}
+        <div
+          style={{
+            flex: 1,
+            padding: "40px 24px",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 12,
+            textAlign: "center",
+          }}
+        >
+          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Score Final de la soirée</h1>
+
+          {finalPodium.gold.length + finalPodium.silver.length + finalPodium.bronze.length === 0 ? (
+            <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
+              Aucun point n'a été marqué. Merci à tous pour votre participation !
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
+              {/* 🥇 Or — 2× plus gros */}
+              {finalPodium.gold.length > 0 && (
+                <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                  {finalPodium.gold.map((p) => (
+                    <div
+                      key={p.id}
+                      style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
+                    >
+                      <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
+                      <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
+                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>
+                        {p.scoreFinal} pts
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 🥈 Argent */}
+              {finalPodium.silver.length > 0 && (
+                <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                  {finalPodium.silver.map((p) => (
+                    <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                      <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                      <span style={{ opacity: 0.85 }}>•</span>
+                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                        {p.scoreFinal} pts
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 🥉 Bronze */}
+              {finalPodium.bronze.length > 0 && (
+                <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                  {finalPodium.bronze.map((p) => (
+                    <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                      <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
+                      <span style={{ opacity: 0.85 }}>•</span>
+                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
+                        {p.scoreFinal} pts
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ============================================================================
   // EleyBuzz Mode — Early return si mode buzzer actif
   // ============================================================================
   if (isBuzzerMode) {
@@ -1465,7 +1652,7 @@ function ScreenInner() {
                         <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
                         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>
-                          {p.scoreFinal} {p.buzzScore > 0 ? `(Quiz: ${p.score} + EleyBuzz: ${p.buzzScore})` : ""}
+                          {p.score}
                         </span>
                       </div>
                     ))}
@@ -1481,7 +1668,7 @@ function ScreenInner() {
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
                         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                          {p.score}
                         </span>
                       </div>
                     ))}
@@ -1497,7 +1684,7 @@ function ScreenInner() {
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
                         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                          {p.score}
                         </span>
                       </div>
                     ))}
@@ -1546,7 +1733,7 @@ function ScreenInner() {
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
                         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                          {p.score}
                         </span>
                       </div>
                     ))}
@@ -1562,7 +1749,7 @@ function ScreenInner() {
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
                         <span style={{ opacity: 0.85 }}>•</span>
                         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.scoreFinal} {p.buzzScore > 0 ? `(${p.score}+${p.buzzScore})` : ""}
+                          {p.score}
                         </span>
                       </div>
                     ))}
@@ -1828,6 +2015,8 @@ function ScreenInner() {
       </div>
 
       {/* ===== Colonne scores (droite) ===== */}
+      {/* Cachée quand showFinalScore est actif */}
+      {!showFinalScore && (
       <aside
         aria-label="Classement"
         style={{
@@ -1972,6 +2161,7 @@ function ScreenInner() {
           )}
         </div>
       </aside>
+      )}
     </div>
   );
 }

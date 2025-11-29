@@ -36,6 +36,11 @@ import {
   TIME_MUSIC_MIN_SEC,
   DEFAULT_TIME_MUSIC_SEC,
   PLAYER_COLORS,
+  DEFAULT_BUZZER_POINTS,
+  BUZZER_CORRECT_MESSAGE_DURATION_MS,
+  BUZZER_WRONG_MESSAGE_DURATION_MS,
+  BUZZER_COOLDOWN_MS,
+  BUZZER_STATES,
 } from "../lib/constants";
 
 import {
@@ -55,6 +60,12 @@ import {
 import {
   ensureAwardsForQuestionTx,
   resetScoringCache,
+  registerBuzzerPress,
+  awardBuzzerPoints,
+  resetBuzzerState,
+  lockPlayerBuzz,
+  resetPlayerBuzzLock,
+  resetAllPlayerBuzzLocks,
 } from "../lib/firebase-helpers";
 
 // ============================================================================
@@ -122,6 +133,45 @@ async function ensureConfigDefaults() {
 
   // Backfill des questions existantes : leur attribuer quizKey = defaultQuizKey si manquant
   await backfillQuestionsQuizKey(defaultQuizKey);
+
+  // Initialiser les valeurs EleyBuzz dans quiz/state si absentes
+  try {
+    const stateRef = doc(db, "quiz", "state");
+    const stateSnap = await getDoc(stateRef);
+    const stateData = stateSnap.exists() ? stateSnap.data() : {};
+    const statePatch = {};
+
+    // Initialiser isBuzzerMode si absent
+    if (!("isBuzzerMode" in stateData)) {
+      statePatch.isBuzzerMode = false;
+    }
+
+    // Initialiser buzzerState si absent
+    if (!("buzzerState" in stateData)) {
+      statePatch.buzzerState = "idle";
+    }
+
+    // Initialiser buzzerPoints si absent (configurable dans admin)
+    if (!("buzzerPoints" in stateData)) {
+      statePatch.buzzerPoints = DEFAULT_BUZZER_POINTS;
+    }
+
+    // Initialiser firstPlayerId et firstPlayerName à null si absents
+    if (!("firstPlayerId" in stateData)) {
+      statePatch.firstPlayerId = null;
+    }
+    if (!("firstPlayerName" in stateData)) {
+      statePatch.firstPlayerName = null;
+    }
+
+    // Appliquer les patches si nécessaire
+    if (Object.keys(statePatch).length > 0) {
+      await setDoc(stateRef, statePatch, { merge: true });
+    }
+  } catch (e) {
+    console.error("[ensureConfigDefaults] EleyBuzz init failed:", e);
+    // Ne pas bloquer le reste de l'initialisation
+  }
 }
 
 /**
@@ -161,6 +211,44 @@ async function backfillQuestionsQuizKey(defaultQuizKey) {
     }
   } catch (e) {
     console.error("backfillQuestionsQuizKey error:", e);
+  }
+}
+
+/**
+ * Backfill : ajoute buzzScore = 0 aux joueurs existants qui n'ont pas ce champ
+ * (Optionnel, peut être appelé une fois au besoin)
+ */
+async function backfillPlayersBuzzScore() {
+  try {
+    const playersCol = collection(doc(db, "quiz", "state"), "players");
+    const snap = await getDocs(playersCol);
+
+    const docsToFix = snap.docs.filter((d) => {
+      const data = d.data() || {};
+      return !("buzzScore" in data);
+    });
+
+    if (!docsToFix.length) return;
+
+    console.log(
+      "[Admin] backfill buzzScore on",
+      docsToFix.length,
+      "players"
+    );
+
+    // Batch par blocs de 400
+    while (docsToFix.length) {
+      const chunk = docsToFix.splice(0, 400);
+      const batch = writeBatch(db);
+
+      chunk.forEach((docSnap) => {
+        batch.update(doc(playersCol, docSnap.id), { buzzScore: 0 });
+      });
+
+      await batch.commit();
+    }
+  } catch (e) {
+    console.error("backfillPlayersBuzzScore error:", e);
   }
 }
 
@@ -392,6 +480,15 @@ function AdminInner() {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [pauseAtMs, setPauseAtMs] = useState(null);
+
+  // EleyBuzz state
+  const [isBuzzerMode, setIsBuzzerMode] = useState(false);
+  const [buzzerState, setBuzzerState] = useState("idle");
+  const [firstPlayerId, setFirstPlayerId] = useState(null);
+  const [firstPlayerName, setFirstPlayerName] = useState(null);
+  const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
+  const [buzzerMessage, setBuzzerMessage] = useState(null);
+  const [buzzerMessageType, setBuzzerMessageType] = useState(null);
 
   // Refs pour connaître la phase courante sans dépendance d'ordre
   const isCountdownRef = useRef(false);
@@ -642,6 +739,15 @@ function AdminInner() {
             ? d.lastAutoPausedRoundIndex
             : null
         );
+
+        // EleyBuzz state
+        setIsBuzzerMode(!!d.isBuzzerMode);
+        setBuzzerState(typeof d.buzzerState === "string" ? d.buzzerState : "idle");
+        setFirstPlayerId(typeof d.firstPlayerId === "string" ? d.firstPlayerId : null);
+        setFirstPlayerName(typeof d.firstPlayerName === "string" ? d.firstPlayerName : null);
+        setBuzzerPoints(Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS);
+        setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
+        setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
       },
       (e) => console.error("onSnapshot state error:", e)
     );
@@ -1016,6 +1122,32 @@ function AdminInner() {
   useEffect(() => {
     isRevealRef.current = !!isRevealAnswerPhase;
   }, [isRevealAnswerPhase]);
+
+  /* === Contrôle clavier EleyBuzz (touches 1, 2, 3) === */
+  useEffect(() => {
+    if (!isBuzzerMode) return;
+
+    const handleKeyDown = (e) => {
+      // Touche 1 : toggle buzzer state (idle ↔ open)
+      if (e.key === "1" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        toggleBuzzerState();
+      }
+      // Touche 2 : bonne réponse
+      else if (e.key === "2" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        handleBuzzerCorrect();
+      }
+      // Touche 3 : mauvaise réponse
+      else if (e.key === "3" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        handleBuzzerWrong();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isBuzzerMode, buzzerState, firstPlayerId, firstPlayerName, buzzerPoints]);
 
   /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
   useEffect(() => {
@@ -2068,6 +2200,7 @@ function AdminInner() {
           introEndsAtMs: null,
           introRoundIndex: null,
           lastAutoPausedRoundIndex: null,
+          showFinalScore: false,
         },
         { merge: true }
       );
@@ -2090,6 +2223,198 @@ function AdminInner() {
     } catch (e) {
       console.error("resetQuizAndPlayers error:", e);
       setNotice("Échec de la réinitialisation");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // ============================================================================
+  // [5.8] EleyBuzz — Fonctions de contrôle
+  // ============================================================================
+
+  // Calculer isQuizEnded avant de l'utiliser
+  const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
+
+  // Conditions d'activation EleyBuzz
+  const canActivateEleyBuzz = (!isRunning || isPaused || isQuizEnded) && !isBuzzerMode;
+  const canDeactivateEleyBuzz = isBuzzerMode === true;
+
+  // Condition pour remettre tous les scores à zéro (même règle que EleyBuzz, sans la condition isBuzzerMode)
+  const canResetScores = !isRunning || isPaused || isQuizEnded;
+
+  // Toggle EleyBuzz mode
+  async function toggleEleyBuzzMode() {
+    try {
+      const stateRef = doc(db, "quiz", "state");
+      if (!isBuzzerMode) {
+        // Activation : réinitialiser tous les états EleyBuzz
+        await updateDoc(stateRef, {
+          isBuzzerMode: true,
+          buzzerState: "idle",
+          firstPlayerId: null,
+          firstPlayerName: null,
+        });
+        // Réinitialiser tous les canBuzz des joueurs à true (pour débloquer ceux qui étaient en punition)
+        await resetAllPlayerBuzzLocks(db, []);
+        setNotice("EleyBuzz activé");
+      } else {
+        // Désactivation
+        await updateDoc(stateRef, {
+          isBuzzerMode: false,
+          buzzerState: "idle",
+          firstPlayerId: null,
+          firstPlayerName: null,
+        });
+        setNotice("EleyBuzz désactivé");
+      }
+      setTimeout(() => setNotice(null), 1500);
+    } catch (e) {
+      console.error("toggleEleyBuzzMode error:", e);
+      setNotice("Erreur lors du changement de mode EleyBuzz");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Toggle buzzer state (idle ↔ open)
+  async function toggleBuzzerState() {
+    if (!isBuzzerMode) return;
+    try {
+      const stateRef = doc(db, "quiz", "state");
+      const nextState = buzzerState === "idle" ? "open" : "idle";
+      await resetBuzzerState(db, nextState);
+    } catch (e) {
+      console.error("toggleBuzzerState error:", e);
+      setNotice("Erreur lors du changement d'état du buzzer");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Gérer bonne réponse (touche 2)
+  async function handleBuzzerCorrect() {
+    if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
+    try {
+      // Attribuer les points
+      await awardBuzzerPoints(db, firstPlayerId, buzzerPoints);
+      
+      // Afficher message temporaire (géré côté Screen via Firestore)
+      const stateRef = doc(db, "quiz", "state");
+      await updateDoc(stateRef, {
+        buzzerMessage: `Bravo ${firstPlayerName || "Joueur"}, tu gagnes ${buzzerPoints} pts !`,
+        buzzerMessageType: "correct",
+      });
+
+      // Reset après 5 secondes
+      setTimeout(async () => {
+        await resetBuzzerState(db, "idle");
+        await updateDoc(stateRef, {
+          buzzerMessage: null,
+          buzzerMessageType: null,
+        });
+      }, BUZZER_CORRECT_MESSAGE_DURATION_MS);
+    } catch (e) {
+      console.error("handleBuzzerCorrect error:", e);
+      setNotice("Erreur lors de l'attribution des points");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Gérer mauvaise réponse (touche 3)
+  async function handleBuzzerWrong() {
+    if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
+    try {
+      const wrongPlayerId = firstPlayerId;
+      
+      // Lock le joueur qui s'est trompé
+      await lockPlayerBuzz(db, wrongPlayerId);
+
+      // Afficher message temporaire
+      const stateRef = doc(db, "quiz", "state");
+      await updateDoc(stateRef, {
+        buzzerMessage: "Mauvaise réponse !",
+        buzzerMessageType: "wrong",
+      });
+
+      // Reset après 3 secondes et réouvrir le buzzer
+      // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
+      // (il sera débloqué après 20 secondes si personne ne rebuzz, ou dès qu'un autre buzz)
+      setTimeout(async () => {
+        try {
+          await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
+          await resetBuzzerState(db, "open");
+          await updateDoc(stateRef, {
+            buzzerMessage: null,
+            buzzerMessageType: null,
+          });
+        } catch (e) {
+          console.error("[handleBuzzerWrong] Reset error:", e);
+        }
+      }, BUZZER_WRONG_MESSAGE_DURATION_MS);
+
+      // Cooldown de 20 secondes : si personne ne rebuzz, débloquer le joueur après 20s
+      setTimeout(async () => {
+        try {
+          // Vérifier que le buzzer est toujours ouvert et qu'aucun autre joueur n'a buzzé
+          const stateSnap = await getDoc(stateRef);
+          if (stateSnap.exists()) {
+            const data = stateSnap.data() || {};
+            // Si le buzzer est toujours ouvert et qu'aucun autre joueur n'a buzzé, débloquer
+            if (data.buzzerState === BUZZER_STATES.OPEN && !data.firstPlayerId) {
+              await resetPlayerBuzzLock(db, wrongPlayerId);
+            }
+          }
+        } catch (e) {
+          console.error("[handleBuzzerWrong] Cooldown unlock error:", e);
+        }
+      }, BUZZER_WRONG_MESSAGE_DURATION_MS + BUZZER_COOLDOWN_MS);
+    } catch (e) {
+      console.error("handleBuzzerWrong error:", e);
+      setNotice("Erreur lors du traitement de la mauvaise réponse");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Remettre tous les scores à 0 (onglet Joueurs)
+  async function resetAllScores() {
+    const ok = window.confirm(
+      "Remettre tous les scores (quiz + EleyBuzz) à 0 pour tous les joueurs ?"
+    );
+    if (!ok) return;
+
+    try {
+      const playersCol = collection(db, "quiz", "state", "players");
+      const snap = await getDocs(playersCol);
+      const ids = snap.docs.map((d) => d.id);
+
+      while (ids.length) {
+        const chunk = ids.splice(0, 400);
+        const batch = writeBatch(db);
+        chunk.forEach((id) => {
+          batch.update(doc(playersCol, id), {
+            score: 0,
+            buzzScore: 0,
+          });
+        });
+        await batch.commit();
+      }
+
+      setNotice("Tous les scores ont été remis à 0 ✔");
+      setTimeout(() => setNotice(null), 1800);
+    } catch (e) {
+      console.error("resetAllScores error:", e);
+      setNotice("Échec de la remise à zéro des scores");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Afficher le score final (podium combiné)
+  async function showFinalScore() {
+    try {
+      const stateRef = doc(db, "quiz", "state");
+      await updateDoc(stateRef, { showFinalScore: true });
+      setNotice("Score final affiché sur Screen et Player");
+      setTimeout(() => setNotice(null), 2000);
+    } catch (e) {
+      console.error("showFinalScore error:", e);
+      setNotice("Erreur lors de l'affichage du score final");
       setTimeout(() => setNotice(null), 2000);
     }
   }
@@ -2118,7 +2443,7 @@ function AdminInner() {
   ];
   const ROUND_BG_ALPHA = 0.70;
 
-  const isQuizEnded = Number.isFinite(quizEndSec) && elapsedSec >= quizEndSec;
+  // isQuizEnded déjà défini plus haut (avant les fonctions EleyBuzz)
   const currentRoundNumber = currentRoundIndex + 1;
 
   const mainButtonLabel = isQuizEnded
@@ -2142,8 +2467,8 @@ function AdminInner() {
       ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
       : "#e5e7eb";
 
-  // Quand un quiz est en cours, on verrouille la config de temps (manches + fin de quiz)
-  const timeConfigLocked = isRunning && !!activeQuizKey;
+  // Quand un quiz est en cours ou en mode EleyBuzz, on verrouille la config de temps (manches + fin de quiz)
+  const timeConfigLocked = (isRunning && !!activeQuizKey) || isBuzzerMode;
 
   // Quiz : ordre des onglets (quiz actif en premier, puis autres par ordre alphabétique)
   const quizTabsOrdered = useMemo(() => {
@@ -2709,7 +3034,7 @@ function AdminInner() {
       >
         <button
           onClick={startOrNextRound}
-          disabled={(isRunning && !isPaused) || isQuizEnded || mainBtnBusy}
+          disabled={(isRunning && !isPaused) || isQuizEnded || mainBtnBusy || isBuzzerMode}
           style={{
             display: "inline-flex",
             alignItems: "center",
@@ -2722,22 +3047,23 @@ function AdminInner() {
             color: "#000",
             fontWeight: 600,
             cursor:
-              (isRunning && !isPaused) || isIntro || isQuizEnded
+              (isRunning && !isPaused) || isIntro || isQuizEnded || isBuzzerMode
                 ? "not-allowed"
                 : "pointer",
             transition: "background 160ms ease",
             textAlign: "center",
             whiteSpace: "nowrap",
+            opacity: isBuzzerMode ? 0.6 : 1,
           }}
-          title={mainButtonLabel}
+          title={isBuzzerMode ? "Indisponible en mode EleyBuzz" : mainButtonLabel}
         >
           {mainButtonLabel}
         </button>
 
         <button
-          onClick={() => (canPauseResume ? togglePauseResume(db) : null)}
-          disabled={!canPauseResume}
-          aria-disabled={!canPauseResume ? "true" : "false"}
+          onClick={() => (canPauseResume && !isBuzzerMode ? togglePauseResume(db) : null)}
+          disabled={!canPauseResume || isBuzzerMode}
+          aria-disabled={(!canPauseResume || isBuzzerMode) ? "true" : "false"}
           style={{
             display: "inline-flex",
             alignItems: "center",
@@ -2749,20 +3075,20 @@ function AdminInner() {
             background: pauseBtnBg,          // couleur pastel différente en "Reprendre"
             color: "#000",
             fontWeight: 600,
-            cursor: pauseCursor,
-            opacity: !canPauseResume ? 0.6 : 1,
+            cursor: (canPauseResume && !isBuzzerMode) ? pauseCursor : "not-allowed",
+            opacity: (!canPauseResume || isBuzzerMode) ? 0.6 : 1,
             whiteSpace: "nowrap",
             textAlign: "center",
             transition: "background 160ms ease",
           }}
-          title={pauseBtnTitle}
+          title={isBuzzerMode ? "Indisponible en mode EleyBuzz" : pauseBtnTitle}
         >
           {pauseBtnLabel}
         </button>
 
         <button
           onClick={handleBack}
-          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary}
+          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
@@ -2771,15 +3097,18 @@ function AdminInner() {
             color: "#000",
             fontWeight: 600,
             cursor:
-              !isPaused || plannedTimes.length === 0 || atRoundBoundary
+              !isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode
                 ? "not-allowed"
                 : "pointer",
             transition: "background 160ms ease",
+            opacity: isBuzzerMode ? 0.6 : 1,
           }}
           title={
-            atRoundBoundary
-              ? "Fin de manche atteinte : utilisez « Manche suivante »"
-              : "Revenir au début de la question en cours (ou au début de la manche)"
+            isBuzzerMode
+              ? "Indisponible en mode EleyBuzz"
+              : atRoundBoundary
+                ? "Fin de manche atteinte : utilisez « Manche suivante »"
+                : "Revenir au début de la question en cours (ou au début de la manche)"
           }
         >
           Back
@@ -2787,7 +3116,7 @@ function AdminInner() {
 
         <button
           onClick={handleNext}
-          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary}
+          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
@@ -2796,15 +3125,18 @@ function AdminInner() {
             color: "#000",
             fontWeight: 600,
             cursor:
-              !isPaused || plannedTimes.length === 0 || atRoundBoundary
+              !isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode
                 ? "not-allowed"
                 : "pointer",
             transition: "background 160ms ease",
+            opacity: isBuzzerMode ? 0.6 : 1,
           }}
           title={
-            atRoundBoundary
-              ? "Fin de manche atteinte : utilisez « Manche suivante »"
-              : "Aller au début de la prochaine question (si disponible dans cette manche)"
+            isBuzzerMode
+              ? "Indisponible en mode EleyBuzz"
+              : atRoundBoundary
+                ? "Fin de manche atteinte : utilisez « Manche suivante »"
+                : "Aller au début de la prochaine question (si disponible dans cette manche)"
           }
         >
           Next
@@ -2819,11 +3151,172 @@ function AdminInner() {
             background: "#e5e7eb",
             color: "#000",
             fontWeight: 600,
+            cursor: "pointer",
           }}
           title="Réinitialiser le quiz"
         >
           Réinitialiser
         </button>
+
+        {/* EleyBuzz Controls */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: isBuzzerMode ? "#1f2937" : "#111", borderRadius: 8, border: "1px solid #2a2a2a" }}>
+          <button
+            onClick={toggleEleyBuzzMode}
+            disabled={!canActivateEleyBuzz && !canDeactivateEleyBuzz}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 6,
+              border: "1px solid #2a2a2a",
+              background: isBuzzerMode ? "#dc2626" : "#16a34a",
+              color: "#fff",
+              fontWeight: 600,
+              cursor: (!canActivateEleyBuzz && !canDeactivateEleyBuzz) ? "not-allowed" : "pointer",
+              opacity: (!canActivateEleyBuzz && !canDeactivateEleyBuzz) ? 0.6 : 1,
+            }}
+            title={isBuzzerMode ? "Désactiver EleyBuzz" : "Activer EleyBuzz"}
+          >
+            {isBuzzerMode ? "STOP EleyBuzz" : "Go EleyBuzz"}
+          </button>
+
+          {isBuzzerMode && (
+            <>
+              <button
+                onClick={toggleBuzzerState}
+                disabled={buzzerState === "locked"}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: "1px solid #2a2a2a",
+                  background: buzzerState === "open" ? "#facc15" : "#6b7280",
+                  color: "#000",
+                  fontWeight: 600,
+                  cursor: buzzerState === "locked" ? "not-allowed" : "pointer",
+                  opacity: buzzerState === "locked" ? 0.6 : 1,
+                }}
+                title="Touche 1 : Ouvrir/Fermer le buzzer"
+              >
+                {buzzerState === "open" ? "Buzzer OUVERT" : buzzerState === "locked" ? "Buzzer VERROUILLÉ" : "Buzzer FERMÉ"}
+              </button>
+
+              {buzzerState === "locked" && firstPlayerName && (
+                <span style={{ color: "#facc15", fontWeight: 700 }}>
+                  {firstPlayerName} a buzzé !
+                </span>
+              )}
+
+              {buzzerState === "locked" && firstPlayerId && (
+                <>
+                  <button
+                    onClick={handleBuzzerCorrect}
+                    disabled={!!buzzerMessage}
+                    onMouseDown={(e) => {
+                      e.currentTarget.style.transform = "scale(0.95)";
+                      e.currentTarget.style.boxShadow = "inset 0 2px 4px rgba(0,0,0,0.2)";
+                    }}
+                    onMouseUp={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    onTouchStart={(e) => {
+                      e.currentTarget.style.transform = "scale(0.95)";
+                      e.currentTarget.style.boxShadow = "inset 0 2px 4px rgba(0,0,0,0.2)";
+                    }}
+                    onTouchEnd={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid #2a2a2a",
+                      background: "#16a34a",
+                      color: "#fff",
+                      fontWeight: 600,
+                      cursor: buzzerMessage ? "not-allowed" : "pointer",
+                      opacity: buzzerMessage ? 0.6 : 1,
+                      transition: "transform 100ms ease, box-shadow 100ms ease",
+                      userSelect: "none",
+                    }}
+                    title={buzzerMessage ? "En attente de la fin du message" : "Touche 2 : Bonne réponse (+15 pts)"}
+                  >
+                    ✓ Correct (2)
+                  </button>
+                  <button
+                    onClick={handleBuzzerWrong}
+                    disabled={!!buzzerMessage}
+                    onMouseDown={(e) => {
+                      e.currentTarget.style.transform = "scale(0.95)";
+                      e.currentTarget.style.boxShadow = "inset 0 2px 4px rgba(0,0,0,0.2)";
+                    }}
+                    onMouseUp={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    onTouchStart={(e) => {
+                      e.currentTarget.style.transform = "scale(0.95)";
+                      e.currentTarget.style.boxShadow = "inset 0 2px 4px rgba(0,0,0,0.2)";
+                    }}
+                    onTouchEnd={(e) => {
+                      e.currentTarget.style.transform = "scale(1)";
+                      e.currentTarget.style.boxShadow = "none";
+                    }}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid #2a2a2a",
+                      background: "#dc2626",
+                      color: "#fff",
+                      fontWeight: 600,
+                      cursor: buzzerMessage ? "not-allowed" : "pointer",
+                      opacity: buzzerMessage ? 0.6 : 1,
+                      transition: "transform 100ms ease, box-shadow 100ms ease",
+                      userSelect: "none",
+                    }}
+                    title={buzzerMessage ? "En attente de la fin du message" : "Touche 3 : Mauvaise réponse"}
+                  >
+                    ✗ Faux (3)
+                  </button>
+                </>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Points EleyBuzz configurables */}
+        {isBuzzerMode && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 12, fontWeight: 600 }}>Points EleyBuzz:</label>
+            <input
+              type="number"
+              value={buzzerPoints}
+              onChange={(e) => {
+                const val = parseInt(e.target.value, 10);
+                if (!isNaN(val) && val >= 0) {
+                  setBuzzerPoints(val);
+                  updateDoc(doc(db, "quiz", "state"), { buzzerPoints: val }).catch(console.error);
+                }
+              }}
+              min="0"
+              style={{
+                width: 60,
+                padding: "4px 6px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: "#111",
+                color: "#fff",
+                fontFamily: "monospace",
+              }}
+            />
+          </div>
+        )}
 
         <div
           style={{
@@ -3077,9 +3570,43 @@ function AdminInner() {
       {adminTab === "players" && (
         <div style={{ marginTop: 16 }}>
           <h2 style={{ margin: 0 }}>Joueurs</h2>
-          <div style={{ opacity: 0.9, marginTop: 6 }}>
-            Joueurs connectés : <b>{connectedCount}</b>
-            {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
+          <div style={{ opacity: 0.9, marginTop: 6, display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <div>
+              Joueurs connectés : <b>{connectedCount}</b>
+              {playersLoading && <span style={{ marginLeft: 8, opacity: 0.7 }}>(chargement…)</span>}
+            </div>
+            <button
+              onClick={resetAllScores}
+              disabled={!canResetScores}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: "#fde68a",
+                color: "#111827",
+                fontWeight: 600,
+                cursor: canResetScores ? "pointer" : "not-allowed",
+                opacity: canResetScores ? 1 : 0.6,
+              }}
+              title={canResetScores ? "Remettre tous les scores (quiz + EleyBuzz) à 0" : "Indisponible pendant qu'un quiz est en cours"}
+            >
+              Remettre tous les scores à 0
+            </button>
+            <button
+              onClick={showFinalScore}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: "#22c55e",
+                color: "#fff",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title="Afficher le podium final (score quiz + EleyBuzz)"
+            >
+              Score final
+            </button>
           </div>
 
           {/* Tableau joueurs */}
@@ -3095,7 +3622,8 @@ function AdminInner() {
               <thead>
                 <tr style={{ background: "#2c5d8bff" }}>
                   <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueurs</th>
-                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score</th>
+                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score Quiz</th>
+                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score Bonus<br/><span style={{ fontSize: "0.85em", opacity: 0.9 }}>EleyBuzz</span></th>
                   <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>Statut</th>
                   <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>Actions</th>
                 </tr>
@@ -3157,6 +3685,19 @@ function AdminInner() {
                           {Number(p.score || 0)}
                         </span>
                         {medal && <span style={{ marginLeft: 6 }}>{medal}</span>}
+                      </td>
+
+                      <td style={{ padding: "8px", textAlign: "center" }}>
+                        <span
+                          style={{
+                            fontVariantNumeric: "tabular-nums",
+                            fontWeight: 800,
+                            letterSpacing: 0.2,
+                            color: "#facc15",
+                          }}
+                        >
+                          {Number(p.buzzScore || 0)}
+                        </span>
                       </td>
 
                       <td style={{ padding: "8px", textAlign: "center" }}>
@@ -3244,8 +3785,8 @@ function AdminInner() {
 
                 {players.length === 0 && !playersLoading && (
                   <tr>
-                    <td colSpan={3} style={{ padding: 12, opacity: 0.7 }}>
-                      Aucun joueur pour l’instant.
+                    <td colSpan={5} style={{ padding: 12, opacity: 0.7 }}>
+                      Aucun joueur pour l'instant.
                     </td>
                   </tr>
                 )}

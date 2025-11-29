@@ -1,0 +1,136 @@
+🌩️ EleyBuzz — Le résumé simple
+
+EleyBuzz, c’est un mode buzzer que tu peux activer quand le timecode du quiz n'est pas en marche.
+Il permet de poser des questions orales rapides et de récompenser les joueurs au buzz le plus rapide, exactement comme dans un jeu télé.
+ON NE CHANGE RIEN DU TOUT AU QUIZ QU'ON A CREE. LE MODE ELEYBUZZ EST UNE FONCTIONALITE AJOUTEE !!
+
+EleyBuzz est un mode spécial qu'on peut activer :
+
+avant le début du quiz,
+entre deux manches (quand tu es en pause),
+après la fin du quiz,
+mais jamais pendant qu’une manche tourne (timecode en marche).
+
+Côté Admin :
+
+Un bouton “EleyBuzz” à côté de Next et Réinitialiser.
+Ce bouton est cliquable seulement quand le quiz est en pause (ou pas encore démarré / terminé).
+Quand il est actif → Player et Screen basculent en mode buzzer.
+Quand il est désactivé → retour au fonctionnement normal (écran de pause / fin / pré-start).
+
+Boutons Admin :
+
+Dans la barre Live (Start / Pause / Back / Next / Reset), on ajoute :
+Quand EleyBuzz est OFF :
+👉 Bouton “Go EleyBuzz” : isBuzzerMode = true.
+Quand EleyBuzz est ON :
+👉 Bouton “STOP EleyBuzz” : isBuzzerMode = false.
+
+Quand EleyBuzz est actif (isBuzzerMode === true) :
+Start, Next, Back sont désactivés (pour éviter les bêtises).
+
+Pour reprendre le quiz classique :
+tu cliques sur “STOP EleyBuzz”,
+puis tu peux utiliser Start/Next/Back normalement.
+
+Quand tu cliques sur “Go EleyBuzz” :
+Player & Screen basculent en mode buzzer.
+
+
+Côté scoring :
+
+Pour chaque joueur, on aura deux compteurs :
+scoreQuiz → les points gagnés avec le quiz live (questions timecodées) → ce qu'on a actuellement
+buzzScore → les points gagnés via EleyBuzz.
+
+Et un bouton “Score final" qui, à la toute fin de la soirée :
+calcule le score final = scoreQuiz + buzzScore
+et affiche un podium final.
+
+Ca permet :
+- la possibilité de faire une soirée 100 % EleyBuzz (pas de quiz du tout), ou l'inverse (pas de EleyBuzz du tout).
+
+Dans l’onglet Joueurs de admin, il faudra aussi rajouter :
+Un bouton “Remettre tous les scores à 0” qui :
+met score = 0 pour tous les joueurs,
+ne supprime aucun joueur,
+ne réinitialise pas le quiz, ni les manches, ni rien d’autre.
+
+
+Côté Player :
+
+Quand isBuzzerMode === false :
+Rien ne change → flux Player actuel (quiz, pause, fin).
+
+Quand isBuzzerMode === true :
+Early return avec écran EleyBuzz :
+
+Image de buzzer / bouton EleyBuzz avec deux états (repos / pressé),
+
+Texte selon buzzerState :
+idle → “En attente de la prochaine question EleyBuzz…”
+open → “Appuie pour buzzer !”
+locked :
+si firstPlayerId === moi → “Tu as buzzé en premier !”
+sinon → “Trop tard, quelqu’un a déjà buzzé.”
+
+Clic sur le buzzer :
+On lance la transaction Firestore :
+si pas encore de firstPlayerId → on s’enregistre comme premier + status = "locked",
+sinon → on affiche “Trop tard”.
+
+
+Côté Screen :
+
+Quand isBuzzerMode === false :
+Screen = ton comportement actuel (quiz / fin / pause).
+
+Quand isBuzzerMode === true :
+Early return EleyBuzz :
+
+Bandeau “EleyBuzz”.
+Classement à droite qui prend en compte les points EleyBuzz et pas les points du quizz !
+
+Au centre :
+idle → “Préparez-vous pour la prochaine question…”
+open → “Le EleyBuzz est ouvert !”
+locked + firstPlayerName → “👉 Jean-Michel a buzzé en premier !”
+
+S'il me dit la bonne réponse : écran 5s avec bravo "Jean-Michel, tu gagnes 15 pts !" puis on revient à idle  → “Préparez-vous pour la prochaine question…”
+S'il me dit la mauvaise réponse : écran 3s avec "Mauvaise réponse !" puis on revient à open “Le EleyBuzz est ouvert !”
+
+Si Jean-Michel se trompe → il ne peut pas rebuzzer tant que quelqu’un d’autre n’a pas, lui aussi, buzzé (et donné sa chance).
+Dès qu’un autre joueur a buzzé (correct ou incorrect), Jean-Michel retrouve le droit de buzzer.
+
+Pseudo Stream Deck : touches 1 / 2 / 3 sur l’Admin
+
+On ajoute un écouteur de clavier côté /admin (uniquement quand la fonction EleyBuzz est active) pour intercepter :
+
+Touche "1" → gère l’ouverture/fermeture du buzzer.
+Touche "2" → “Bonne réponse”.
+Touche "3" → “Mauvaise réponse”.
+
+Ça simule ton mini boîtier de contrôle / stream deck, sans matériel pour l’instant.
+
+
+
+
+
+
+Résumé “règles de jeu”  EleyBuzz pour toi, en mode présentatrice TV :
+
+Personne ne peut buzz pendant que tu poses la question.
+Tu décides exactement quand tu ouvres le buzzer (touche 1).
+
+Dès qu’une personne est affichée en grand sur Screen :
+personne ne peut buzzer,
+tu peux prendre ton temps avec elle.
+
+Si elle se trompe :
+elle ne pourra pas rebuzzer tout de suite, mais elle pourra retenter une fois qu’un autre joueur aura tenté aussi.
+
+Le rythme du jeu reste dynamique, personne n’est banni de la question, juste pas de “Jean-Michel qui spam 3 fois d’affilée”.
+
+
+
+
