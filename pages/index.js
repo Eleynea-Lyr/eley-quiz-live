@@ -57,6 +57,26 @@ export default function Home() {
             Écran de Scène
           </a>
         </li>
+        <li style={{ marginBottom: "0.75rem" }}>
+          <a
+            href="/config"
+            style={linkStyle}
+            onMouseEnter={(e) => Object.assign(e.target.style, linkStyleHover)}
+            onMouseLeave={(e) => Object.assign(e.target.style, linkStyle)}
+          >
+            ⚙️ Configuration
+          </a>
+        </li>
+        <li style={{ marginBottom: "0.75rem" }}>
+          <a
+            href="/messages"
+            style={linkStyle}
+            onMouseEnter={(e) => Object.assign(e.target.style, linkStyleHover)}
+            onMouseLeave={(e) => Object.assign(e.target.style, linkStyle)}
+          >
+            💬 Messages
+          </a>
+        </li>
       </ul>
     </div>
   );

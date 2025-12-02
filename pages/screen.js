@@ -157,6 +157,8 @@ function ScreenInner() {
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [roundOffsetsSec, setRoundOffsetsSec] = useState([]);
   const [revealDurationSec, setRevealDurationSec] = useState(REVEAL_DURATION_SEC);
+  const [countdownStartSec, setCountdownStartSec] = useState(COUNTDOWN_START_SEC);
+  const [roundStartIntroSec, setRoundStartIntroSec] = useState(ROUND_START_INTRO_SEC);
   const [activeQuizKey, setActiveQuizKey] = useState(null);
 
   // Image optionnelle au-dessus du QR (config: screenLeftImageUrl)
@@ -313,6 +315,10 @@ function ScreenInner() {
       );
       const rv = Number.isFinite(d?.revealDurationSec) ? d.revealDurationSec : REVEAL_DURATION_SEC;
       setRevealDurationSec(rv);
+      const cs = Number.isFinite(d?.countdownStartSec) ? d.countdownStartSec : COUNTDOWN_START_SEC;
+      setCountdownStartSec(cs);
+      const ris = Number.isFinite(d?.roundStartIntroSec) ? d.roundStartIntroSec : ROUND_START_INTRO_SEC;
+      setRoundStartIntroSec(ris);
 
       // Image optionnelle au-dessus du QR (fallback sur LEFT_GENERIC_IMG_SRC si absent)
       setLeftImageUrl(
@@ -734,13 +740,13 @@ function ScreenInner() {
 
   const introStart = isFirstQuestionOfRound ? qStart : null;
   const introEnd = isFirstQuestionOfRound && Number.isFinite(qStart)
-    ? qStart + ROUND_START_INTRO_SEC
+    ? qStart + roundStartIntroSec
     : null;
 
-  // Le temps “jouable” commence après l’intro
+  // Le temps "jouable" commence après l'intro
   const qStartEffective =
     isFirstQuestionOfRound && Number.isFinite(qStart)
-      ? qStart + ROUND_START_INTRO_SEC
+      ? qStart + roundStartIntroSec
       : qStart;
 
   // Compte à rebours affiché 5..1
@@ -806,8 +812,8 @@ function ScreenInner() {
   let countdownStart = null;
 
   if (nextEvent != null) {
-    // Le décompte reste toujours sur les dernières COUNTDOWN_START_SEC secondes.
-    countdownStart = nextEvent - COUNTDOWN_START_SEC;
+    // Le décompte reste toujours sur les dernières countdownStartSec secondes.
+    countdownStart = nextEvent - countdownStartSec;
 
     const hasQStart = Number.isFinite(qStartEffective);
 
@@ -906,7 +912,7 @@ function ScreenInner() {
   // Décompte (jamais 0s)
   const secondsToNext = nextEvent != null ? nextEvent - elapsedSec : null;
   const countdownSec = isCountdownPhase
-    ? Math.max(1, Math.min(COUNTDOWN_START_SEC, Math.ceil(secondsToNext)))
+    ? Math.max(1, Math.min(countdownStartSec, Math.ceil(secondsToNext)))
     : null;
 
   let countdownLabel = "Prochaine question dans :";
@@ -1054,9 +1060,9 @@ function ScreenInner() {
       return;
     }
 
-    // Si ça dure plus de 4s → reload automatique
+    // Si ça dure plus de 5s → reload automatique
     const elapsedMs = Date.now() - syncHoleSince;
-    if (elapsedMs > 2000) {
+    if (elapsedMs > 5000) {
       try {
         window.location.reload();
       } catch {
@@ -1231,30 +1237,242 @@ function ScreenInner() {
     return <Splash />; // plein écran de boot
   }
 
-  if (showPreStart) {
+  // ============================================================================
+  // EleyBuzz Mode — Early return si mode buzzer actif (priorité sur showPreStart)
+  // ============================================================================
+  if (isBuzzerMode) {
     return (
-      <div style={{
-        background: "#000814", color: "#fff", minHeight: "calc(var(--vh, 1vh) * 100)",
-        display: "grid", placeItems: "center", padding: "24px", textAlign: "center"
-      }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "row",
+          background: "#000814",
+          color: "white",
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          position: "relative",
+        }}
+      >
+        {/* Colonne gauche : image optionnelle + QR */}
+        <aside
+          aria-label="Infos & QR"
+          style={{
+            position: "relative",
+            width: 360,
+            maxWidth: "clamp(280px, 30vw, 400px)",
+            maxHeight: "calc(100vh - 24px)",
+            background: "#081224",
+            border: "1px solid #1f2a44",
+            borderRadius: 12,
+            padding: 12,
+            margin: 12,
+            display: "flex",
+            flexDirection: "column",
+            gap: 10,
+            alignSelf: "flex-start",
+            overflowY: "auto",
+            overflowX: "hidden",
+          }}
+        >
+          {leftImageUrl && (
+            <div
+              style={{
+                borderRadius: 10,
+                overflow: "hidden",
+                border: "1px solid #1f2a44",
+                background: "#0b0f1a",
+                flexShrink: 0,
+              }}
+            >
+              <img
+                src={leftImageUrl}
+                alt=""
+                style={{
+                  display: "block",
+                  width: "100%",
+                  height: "clamp(200px, 25vh, 300px)",
+                  objectFit: "cover",
+                }}
+                loading="lazy"
+                decoding="async"
+              />
+            </div>
+          )}
+          <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
+            <JoinPanelInline size="lg" />
+          </div>
+        </aside>
+
+        {/* Colonne centrale : Contenu EleyBuzz */}
         <div
           style={{
-            width: 360,
-            maxWidth: "90vw",
+            flex: 1,
+            padding: "40px 24px",
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
+            justifyContent: "center",
+            gap: 24,
             textAlign: "center",
           }}
         >
-          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            EleyBox<br />Écran en attente
+          <h1 style={{ fontSize: "3rem", fontWeight: 800, margin: 0 }}>
+            ⚡ EleyBuzz ⚡
           </h1>
-          <p style={{ opacity: 0.8, marginTop: 12 }}>
-            Le quiz n'a pas encore commencé.<br />Préparez-vous…
-          </p>
-          <JoinPanelInline size="lg" />
+
+          {/* État du buzzer */}
+          {buzzerState === BUZZER_STATES.IDLE && !buzzerMessage && (
+            <div 
+              style={{ fontSize: "1.5rem", opacity: 0.85, maxWidth: "min(800px, 90%)" }}
+              dangerouslySetInnerHTML={{ 
+                __html: addSmartLineBreaks("Écoute attentivement la question et appuie vite sur le buzzer de ton téléphone si tu connais la réponse.")
+                  .replace(/\.\s+/g, ".<br>")
+              }}
+            />
+          )}
+
+          {buzzerState === BUZZER_STATES.OPEN && (
+            <div style={{ fontSize: "1.5rem", opacity: 0.85, color: "#22c55e", fontWeight: 700 }}>
+              Le buzzer est OUVERT ! Préparez-vous à buzzer !
+            </div>
+          )}
+
+          {buzzerState === BUZZER_STATES.LOCKED && firstPlayerName && !buzzerMessage && (
+            <div>
+              <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
+                {firstPlayerName} a buzzé !
+              </div>
+              <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
+                On attend sa réponse...
+              </div>
+            </div>
+          )}
+
+          {/* Messages temporaires */}
+          {buzzerMessage && buzzerMessageType && (
+            <div
+              style={{
+                fontSize: "2.5rem",
+                fontWeight: 800,
+                padding: "20px 40px",
+                borderRadius: 12,
+                background: buzzerMessageType === "correct" ? "#0b3a1e" : "#7f1d1d",
+                border: `2px solid ${buzzerMessageType === "correct" ? "#22c55e" : "#dc2626"}`,
+                color: buzzerMessageType === "correct" ? "#86efac" : "#fecaca",
+                animation: "fadeIn 200ms ease-in",
+              }}
+            >
+              {buzzerMessage}
+            </div>
+          )}
         </div>
+
+        {/* Colonne droite : Classement EleyBuzz */}
+        <aside
+          aria-label="Classement EleyBuzz"
+          style={{
+            width: 320,
+            maxWidth: "clamp(280px, 30vw, 400px)",
+            maxHeight: "calc(100vh - 24px)",
+            background: "#0b0f1a",
+            border: "1px solid #1f2a44",
+            borderRadius: 12,
+            padding: "12px 12px 8px 12px",
+            margin: 12,
+            overflow: "hidden",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+            alignSelf: "flex-start",
+          }}
+        >
+          <div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
+                ⚡ EleyBuzz ⚡
+              </h3>
+            </div>
+
+            {/* Petit bandeau bleu sous le titre */}
+            <div
+              style={{
+                marginTop: 6,
+                height: 3,
+                borderRadius: 9999,
+                background: "#0f172a",
+                border: "1px solid #2a488fff",
+              }}
+            />
+          </div>
+
+          <div
+            role="list"
+            style={{
+              marginTop: 4,
+              overflowY: "auto",
+              paddingRight: 4,
+            }}
+          >
+            {buzzerLeaderboard.length > 0 ? (
+              buzzerLeaderboard.map((p) => {
+                const rank = p._rank;
+                const s = Number(p.buzzScore || 0);
+                const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+                return (
+                  <div
+                    key={p.id}
+                    role="listitem"
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "28px 1fr auto",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "8px 10px",
+                      borderBottom: "1px solid #16233b",
+                      background: rank <= 3 ? "#1f2937" : "transparent",
+                    }}
+                  >
+                    <div style={{ textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
+                      {rank}.
+                    </div>
+
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                        <span
+                          title={p.name}
+                          style={{
+                            fontWeight: 700,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {p.name || "(sans nom)"} {medal}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        fontWeight: 800,
+                        fontVariantNumeric: "tabular-nums",
+                        letterSpacing: 0.2,
+                        color: "#facc15",
+                      }}
+                      aria-label="score"
+                      title={`${p.buzzScore} points`}
+                    >
+                      {p.buzzScore}
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <div style={{ opacity: 0.7, padding: 12, textAlign: "center" }}>
+                Aucun joueur.
+              </div>
+            )}
+          </div>
+        </aside>
       </div>
     );
   }
@@ -1280,7 +1498,8 @@ function ScreenInner() {
           style={{
             position: "relative",
             width: 360,
-            maxWidth: "35vw",
+            maxWidth: "clamp(280px, 30vw, 400px)",
+            maxHeight: "calc(100vh - 24px)",
             background: "#081224",
             border: "1px solid #1f2a44",
             borderRadius: 12,
@@ -1290,6 +1509,8 @@ function ScreenInner() {
             flexDirection: "column",
             gap: 10,
             alignSelf: "flex-start",
+            overflowY: "auto",
+            overflowX: "hidden",
           }}
         >
           {leftImageUrl && (
@@ -1299,6 +1520,7 @@ function ScreenInner() {
                 overflow: "hidden",
                 border: "1px solid #1f2a44",
                 background: "#0b0f1a",
+                flexShrink: 0,
               }}
             >
               <img
@@ -1307,7 +1529,7 @@ function ScreenInner() {
                 style={{
                   display: "block",
                   width: "100%",
-                  height: "clamp(320px, 38vh, 500px)",
+                  height: "clamp(200px, 25vh, 300px)",
                   objectFit: "cover",
                 }}
                 loading="lazy"
@@ -1315,7 +1537,7 @@ function ScreenInner() {
               />
             </div>
           )}
-          <div style={{ marginTop: "auto", paddingBottom: 0 }}>
+          <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
             <JoinPanelInline size="lg" />
           </div>
         </aside>
@@ -1398,131 +1620,32 @@ function ScreenInner() {
   }
 
   // ============================================================================
-  // EleyBuzz Mode — Early return si mode buzzer actif
+  // Écran d'attente (showPreStart) — affiché seulement si EleyBuzz n'est pas actif
   // ============================================================================
-  if (isBuzzerMode) {
-
+  if (showPreStart) {
     return (
-      <div
-        style={{
-          background: "#000814",
-          color: "#fff",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "40px 24px",
-          textAlign: "center",
-        }}
-      >
-        <h1 style={{ fontSize: "3rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
-          ⚡ EleyBuzz ⚡
-        </h1>
-
-        {/* État du buzzer */}
-        {buzzerState === BUZZER_STATES.IDLE && !buzzerMessage && (
-          <div 
-            style={{ fontSize: "1.5rem", opacity: 0.85, marginBottom: 24 }}
-            dangerouslySetInnerHTML={{ 
-              __html: addSmartLineBreaks("Écoute attentivement la question et appuie vite sur le buzzer de ton téléphone si tu connais la réponse.")
-                .replace(/\.\s+/g, ".<br>")
-            }}
-          />
-        )}
-
-        {buzzerState === BUZZER_STATES.OPEN && (
-          <div style={{ fontSize: "1.5rem", opacity: 0.85, marginBottom: 24, color: "#22c55e" }}>
-            Le buzzer est OUVERT ! Préparez-vous à buzzer !
-          </div>
-        )}
-
-        {buzzerState === BUZZER_STATES.LOCKED && firstPlayerName && !buzzerMessage && (
-          <div style={{ marginBottom: 24 }}>
-            <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
-              {firstPlayerName} a buzzé !
-            </div>
-            <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
-              On attend sa réponse...
-            </div>
-          </div>
-        )}
-
-        {/* Messages temporaires */}
-        {buzzerMessage && buzzerMessageType && (
-          <div
-            style={{
-              fontSize: "2.5rem",
-              fontWeight: 800,
-              marginBottom: 24,
-              padding: "20px 40px",
-              borderRadius: 12,
-              background: buzzerMessageType === "correct" ? "#0b3a1e" : "#7f1d1d",
-              border: `2px solid ${buzzerMessageType === "correct" ? "#22c55e" : "#dc2626"}`,
-              color: buzzerMessageType === "correct" ? "#86efac" : "#fecaca",
-              animation: "fadeIn 200ms ease-in",
-            }}
-          >
-            {buzzerMessage}
-          </div>
-        )}
-
-        {/* Classement EleyBuzz */}
-        {buzzerLeaderboard.length > 0 && (
-          <div
-            style={{
-              marginTop: 32,
-              width: "min(600px, 90vw)",
-              background: "#0b0f1a",
-              border: "1px solid #1f2a44",
-              borderRadius: 12,
-              padding: "20px",
-            }}
-          >
-            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, margin: 0, marginBottom: 16 }}>
-              Classement ⚡ EleyBuzz ⚡
-            </h2>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {buzzerLeaderboard.slice(0, 10).map((p, idx) => {
-                const rank = p._rank;
-                const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "";
-                return (
-                  <div
-                    key={p.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      padding: "12px 16px",
-                      background: rank <= 3 ? "#1f2937" : "transparent",
-                      borderRadius: 8,
-                      border: rank <= 3 ? "1px solid #374151" : "none",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                      <span style={{ fontSize: "1.2rem", fontWeight: 700, opacity: 0.85 }}>
-                        {rank}.
-                      </span>
-                      <span style={{ fontSize: "1.1rem", fontWeight: 700 }}>
-                        {p.name || "(sans nom)"}
-                      </span>
-                      {medal && <span style={{ fontSize: "1.5rem" }}>{medal}</span>}
-                    </div>
-                    <span
-                      style={{
-                        fontSize: "1.2rem",
-                        fontWeight: 800,
-                        fontVariantNumeric: "tabular-nums",
-                      }}
-                    >
-                      {p.buzzScore} pts
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
+      <div style={{
+        background: "#000814", color: "#fff", minHeight: "calc(var(--vh, 1vh) * 100)",
+        display: "grid", placeItems: "center", padding: "24px", textAlign: "center"
+      }}>
+        <div
+          style={{
+            width: 360,
+            maxWidth: "90vw",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            textAlign: "center",
+          }}
+        >
+          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
+            EleyBox<br />Écran en attente
+          </h1>
+          <p style={{ opacity: 0.8, marginTop: 12 }}>
+            Le quiz n'a pas encore commencé.<br />Préparez-vous…
+          </p>
+          <JoinPanelInline size="lg" />
+        </div>
       </div>
     );
   }
@@ -1558,7 +1681,8 @@ function ScreenInner() {
         style={{
           position: "relative",
           width: 360,
-          maxWidth: "35vw",
+          maxWidth: "clamp(280px, 30vw, 400px)",
+          maxHeight: "calc(100vh - 24px)",
           background: "#081224",
           border: "1px solid #1f2a44",
           borderRadius: 12,
@@ -1568,6 +1692,8 @@ function ScreenInner() {
           flexDirection: "column",
           gap: 10,
           alignSelf: "flex-start",
+          overflowY: "auto",
+          overflowX: "hidden",
         }}
 
       >
@@ -1596,6 +1722,7 @@ function ScreenInner() {
               overflow: "hidden",
               border: "1px solid #1f2a44",
               background: "#0b0f1a",
+              flexShrink: 0,
             }}
           >
             <img
@@ -1604,8 +1731,7 @@ function ScreenInner() {
               style={{
                 display: "block",
                 width: "100%",
-                // min 320px, s’adapte à la hauteur de l’écran, max 500px
-                height: "clamp(320px, 38vh, 500px)",
+                height: "clamp(200px, 25vh, 300px)",
                 objectFit: "cover",
               }}
               loading="lazy"
@@ -1614,7 +1740,7 @@ function ScreenInner() {
 
           </div>
         )}
-        <div style={{ marginTop: "auto", paddingBottom: 0 }}>
+        <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
           <JoinPanelInline size="lg" />
         </div>
       </aside>
@@ -2021,7 +2147,8 @@ function ScreenInner() {
         aria-label="Classement"
         style={{
           width: 320,
-          maxWidth: "35vw",
+          maxWidth: "clamp(280px, 30vw, 400px)",
+          maxHeight: "calc(100vh - 24px)",
           background: "#0b0f1a",
           border: "1px solid #1f2a44",
           borderRadius: 12,

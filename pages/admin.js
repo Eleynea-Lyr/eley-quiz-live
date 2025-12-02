@@ -42,6 +42,7 @@ import {
   BUZZER_COOLDOWN_MS,
   BUZZER_STATES,
 } from "../lib/constants";
+import { DEFAULT_REVEAL_PHRASES } from "../lib/messages";
 
 import {
   parseHMS,
@@ -63,6 +64,7 @@ import {
   registerBuzzerPress,
   awardBuzzerPoints,
   resetBuzzerState,
+  clearBuzzerAttempts,
   lockPlayerBuzz,
   resetPlayerBuzzLock,
   resetAllPlayerBuzzLocks,
@@ -489,6 +491,10 @@ function AdminInner() {
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
+  const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
+  const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
+  const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
+  const [defaultTimeMusicSec, setDefaultTimeMusicSec] = useState(DEFAULT_TIME_MUSIC_SEC);
 
   // Refs pour connaître la phase courante sans dépendance d'ordre
   const isCountdownRef = useRef(false);
@@ -498,7 +504,7 @@ function AdminInner() {
   const [newQ, setNewQ] = useState({
     text: "",
     answersCsv: "",
-    timeMusicStr: "",
+    timeMusicStr: formatHMS(DEFAULT_TIME_MUSIC_SEC), // Initialiser avec la valeur par défaut formatée
     imageQuestionFile: null, // image affichée pendant la phase "question"
     imageReponseFile: null, // image affichée pendant la "révélation"
   });
@@ -507,20 +513,8 @@ function AdminInner() {
   // matchingMode: "strict" | "relaxed" | "numeric"
   const [newMatchingMode, setNewMatchingMode] = useState("strict");
 
-  const DEFAULT_REVEAL_PHRASES = [
-    "La réponse était :",
-    "Il fallait trouver :",
-    "C'était :",
-    "La bonne réponse :",
-    "Réponse :",
-  ];
-  const [newRevealPhrases, setNewRevealPhrases] = useState([
-    "",
-    "",
-    "",
-    "",
-    "",
-  ]);
+  // Phrases de révélation (chargées depuis Firestore)
+  const [revealPhrases, setRevealPhrases] = useState([...DEFAULT_REVEAL_PHRASES]);
 
   /* [2.5] Effect — 1) Charger questions du quiz sélectionné (ordre ascendant) */
   useEffect(() => {
@@ -583,7 +577,26 @@ function AdminInner() {
         setQuizzes(cfgQuizzes);
         setActiveQuizKey(cfgActiveQuizKey);
 
-        // Quiz sélectionné dans l’UI : si absent, basculer sur le quiz actif
+        // Timing EleyBuzz
+        const bcmd = Number.isFinite(d?.buzzerCorrectMessageDurationMs) ? d.buzzerCorrectMessageDurationMs : BUZZER_CORRECT_MESSAGE_DURATION_MS;
+        setBuzzerCorrectMessageDurationMs(bcmd);
+        const bwmd = Number.isFinite(d?.buzzerWrongMessageDurationMs) ? d.buzzerWrongMessageDurationMs : BUZZER_WRONG_MESSAGE_DURATION_MS;
+        setBuzzerWrongMessageDurationMs(bwmd);
+        const bcm = Number.isFinite(d?.buzzerCooldownMs) ? d.buzzerCooldownMs : BUZZER_COOLDOWN_MS;
+        setBuzzerCooldownMs(bcm);
+
+        // Default TimeMusic
+        const dtms = Number.isFinite(d?.defaultTimeMusicSec) ? d.defaultTimeMusicSec : DEFAULT_TIME_MUSIC_SEC;
+        setDefaultTimeMusicSec(dtms);
+
+        // Phrases de révélation
+        if (Array.isArray(d?.revealPhrases) && d.revealPhrases.length > 0) {
+          setRevealPhrases(d.revealPhrases);
+        } else {
+          setRevealPhrases([...DEFAULT_REVEAL_PHRASES]);
+        }
+
+        // Quiz sélectionné dans l'UI : si absent, basculer sur le quiz actif
         setSelectedQuizKey((prev) => {
           if (!prev) return cfgActiveQuizKey;
           const exists = cfgQuizzes.some((q) => q.key === prev);
@@ -595,6 +608,28 @@ function AdminInner() {
 
     return () => unsub();
   }, []);
+
+  // Ref pour suivre la valeur par défaut précédente
+  const prevDefaultTimeMusicSecRef = useRef(defaultTimeMusicSec);
+
+  // Mettre à jour timeMusicStr quand defaultTimeMusicSec change
+  // (seulement si le champ est vide ou correspond à l'ancienne valeur par défaut)
+  useEffect(() => {
+    const prevDefault = prevDefaultTimeMusicSecRef.current;
+    const currentFormatted = formatHMS(defaultTimeMusicSec);
+    const prevFormatted = formatHMS(prevDefault);
+    
+    // Mettre à jour si le champ est vide ou s'il correspond à l'ancienne valeur par défaut
+    if (!newQ.timeMusicStr || newQ.timeMusicStr.trim() === "" || newQ.timeMusicStr === prevFormatted) {
+      setNewQ((prev) => ({
+        ...prev,
+        timeMusicStr: currentFormatted,
+      }));
+    }
+    
+    // Mettre à jour la référence
+    prevDefaultTimeMusicSecRef.current = defaultTimeMusicSec;
+  }, [defaultTimeMusicSec]);
 
   /* [2.6bis] Effect — Dériver offsets/fin par quiz (selectedQuizKey ↔ configDoc) */
   useEffect(() => {
@@ -1581,7 +1616,8 @@ function AdminInner() {
         items.length > 0
           ? Math.max(...items.map((x) => x.order || 0)) + 1000
           : 1000;
-      const cleanedRevealPhrases = (newRevealPhrases ?? [])
+      // Utiliser les phrases depuis Firestore (ou valeurs par défaut)
+      const cleanedRevealPhrases = (revealPhrases ?? [])
         .map((s) => (s ?? "").trim())
         .filter(Boolean)
         .slice(0, 5);
@@ -1611,12 +1647,11 @@ function AdminInner() {
       setNewQ({
         text: "",
         answersCsv: "",
-        timeMusicStr: "",
+        timeMusicStr: formatHMS(defaultTimeMusicSec), // Utiliser la valeur par défaut configurée
         imageQuestionFile: null,
         imageReponseFile: null,
       });
       setNewMatchingMode("strict");
-      setNewRevealPhrases(["", "", "", "", ""]);
     } catch (err) {
       console.error("createOne error:", err);
       alert("Échec de la création : " + (err?.message || err));
@@ -2188,6 +2223,10 @@ function AdminInner() {
 
     setNotice("Réinitialisation…");
     try {
+      // Réinitialiser l'état EleyBuzz en premier
+      await resetBuzzerState(db, "idle");
+      await clearBuzzerAttempts(db);
+
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -2201,6 +2240,13 @@ function AdminInner() {
           introRoundIndex: null,
           lastAutoPausedRoundIndex: null,
           showFinalScore: false,
+          // Réinitialiser complètement EleyBuzz
+          isBuzzerMode: false,
+          buzzerState: "idle",
+          firstPlayerId: null,
+          firstPlayerName: null,
+          buzzerMessage: null,
+          buzzerMessageType: null,
         },
         { merge: true }
       );
@@ -2223,6 +2269,57 @@ function AdminInner() {
     } catch (e) {
       console.error("resetQuizAndPlayers error:", e);
       setNotice("Échec de la réinitialisation");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // [5.7bis] Reset du quiz uniquement (garde les joueurs et leurs scores)
+  async function resetQuizOnly() {
+    const ok = window.confirm(
+      "Réinitialiser le quiz ? (quiz/state, answers/*) - Les joueurs et leurs scores seront conservés."
+    );
+    if (!ok) return;
+
+    setNotice("Réinitialisation du quiz…");
+    try {
+      // Réinitialiser l'état EleyBuzz
+      await resetBuzzerState(db, "idle");
+      await clearBuzzerAttempts(db);
+      
+      await setDoc(
+        doc(db, "quiz", "state"),
+        {
+          isRunning: false,
+          isPaused: false,
+          startAt: null,
+          startEpochMs: null,
+          pauseAt: null,
+          isIntro: false,
+          introEndsAtMs: null,
+          introRoundIndex: null,
+          lastAutoPausedRoundIndex: null,
+          showFinalScore: false,
+          // Réinitialiser complètement EleyBuzz
+          isBuzzerMode: false,
+          buzzerState: "idle",
+          firstPlayerId: null,
+          firstPlayerName: null,
+          buzzerMessage: null,
+          buzzerMessageType: null,
+        },
+        { merge: true }
+      );
+
+      await purgeAnswersTree();
+      
+      // Débloquer tous les joueurs (au cas où certains seraient bloqués)
+      await resetAllPlayerBuzzLocks(db, []);
+
+      setNotice("Quiz réinitialisé ✔");
+      setTimeout(() => setNotice(null), 1800);
+    } catch (e) {
+      console.error("resetQuizOnly error:", e);
+      setNotice("Échec de la réinitialisation du quiz");
       setTimeout(() => setNotice(null), 2000);
     }
   }
@@ -2255,14 +2352,15 @@ function AdminInner() {
         });
         // Réinitialiser tous les canBuzz des joueurs à true (pour débloquer ceux qui étaient en punition)
         await resetAllPlayerBuzzLocks(db, []);
+        // Nettoyer la collection temporaire des tentatives (au cas où)
+        await clearBuzzerAttempts(db);
         setNotice("EleyBuzz activé");
       } else {
-        // Désactivation
+        // Désactivation : débloquer tous les joueurs et nettoyer la collection temporaire
+        await resetAllPlayerBuzzLocks(db, []);
+        await resetBuzzerState(db, "idle");
         await updateDoc(stateRef, {
           isBuzzerMode: false,
-          buzzerState: "idle",
-          firstPlayerId: null,
-          firstPlayerName: null,
         });
         setNotice("EleyBuzz désactivé");
       }
@@ -2281,6 +2379,12 @@ function AdminInner() {
       const stateRef = doc(db, "quiz", "state");
       const nextState = buzzerState === "idle" ? "open" : "idle";
       await resetBuzzerState(db, nextState);
+      
+      // Quand on ouvre le buzzer, débloquer tous les joueurs (sauf ceux en cooldown de punition)
+      // Cela permet de s'assurer que tous les joueurs peuvent buzzer
+      if (nextState === "open") {
+        await resetAllPlayerBuzzLocks(db, []);
+      }
     } catch (e) {
       console.error("toggleBuzzerState error:", e);
       setNotice("Erreur lors du changement d'état du buzzer");
@@ -2292,8 +2396,13 @@ function AdminInner() {
   async function handleBuzzerCorrect() {
     if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
     try {
+      const correctPlayerId = firstPlayerId; // Sauvegarder l'ID avant le reset
+      
       // Attribuer les points
-      await awardBuzzerPoints(db, firstPlayerId, buzzerPoints);
+      await awardBuzzerPoints(db, correctPlayerId, buzzerPoints);
+      
+      // Débloquer le joueur qui a donné la bonne réponse (pour qu'il puisse rebuzzer)
+      await resetPlayerBuzzLock(db, correctPlayerId);
       
       // Afficher message temporaire (géré côté Screen via Firestore)
       const stateRef = doc(db, "quiz", "state");
@@ -2309,7 +2418,7 @@ function AdminInner() {
           buzzerMessage: null,
           buzzerMessageType: null,
         });
-      }, BUZZER_CORRECT_MESSAGE_DURATION_MS);
+      }, buzzerCorrectMessageDurationMs);
     } catch (e) {
       console.error("handleBuzzerCorrect error:", e);
       setNotice("Erreur lors de l'attribution des points");
@@ -2323,8 +2432,9 @@ function AdminInner() {
     try {
       const wrongPlayerId = firstPlayerId;
       
-      // Lock le joueur qui s'est trompé
-      await lockPlayerBuzz(db, wrongPlayerId);
+      // Lock le joueur qui s'est trompé avec un cooldown de 20 secondes
+      // Le cooldown commence APRÈS le message "Mauvaise réponse" (3s)
+      await lockPlayerBuzz(db, wrongPlayerId, buzzerCooldownMs);
 
       // Afficher message temporaire
       const stateRef = doc(db, "quiz", "state");
@@ -2347,7 +2457,7 @@ function AdminInner() {
         } catch (e) {
           console.error("[handleBuzzerWrong] Reset error:", e);
         }
-      }, BUZZER_WRONG_MESSAGE_DURATION_MS);
+      }, buzzerWrongMessageDurationMs);
 
       // Cooldown de 20 secondes : si personne ne rebuzz, débloquer le joueur après 20s
       setTimeout(async () => {
@@ -2364,7 +2474,7 @@ function AdminInner() {
         } catch (e) {
           console.error("[handleBuzzerWrong] Cooldown unlock error:", e);
         }
-      }, BUZZER_WRONG_MESSAGE_DURATION_MS + BUZZER_COOLDOWN_MS);
+      }, buzzerWrongMessageDurationMs + buzzerCooldownMs);
     } catch (e) {
       console.error("handleBuzzerWrong error:", e);
       setNotice("Erreur lors du traitement de la mauvaise réponse");
@@ -2415,6 +2525,24 @@ function AdminInner() {
     } catch (e) {
       console.error("showFinalScore error:", e);
       setNotice("Erreur lors de l'affichage du score final");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // Débloquer manuellement tous les joueurs EleyBuzz (en cas d'erreur)
+  async function manualUnlockAllPlayers() {
+    try {
+      setNotice("Déblocage des joueurs...");
+      const result = await resetAllPlayerBuzzLocks(db, []);
+      if (result.ok) {
+        setNotice(`Tous les joueurs débloqués ✔ ${result.retries > 0 ? `(${result.retries + 1} tentative(s))` : ""}`);
+      } else {
+        setNotice("⚠️ Échec du déblocage - Réessayez");
+      }
+      setTimeout(() => setNotice(null), 3000);
+    } catch (e) {
+      console.error("manualUnlockAllPlayers error:", e);
+      setNotice("Erreur lors du déblocage");
       setTimeout(() => setNotice(null), 2000);
     }
   }
@@ -2934,7 +3062,7 @@ function AdminInner() {
                     />
                     {!it.timeMusicStr && typeof it.timeMusicSec !== "number" && (
                       <div style={{ fontSize: 12, opacity: 0.7 }}>
-                        Défaut {DEFAULT_TIME_MUSIC_SEC}s (min {TIME_MUSIC_MIN_SEC}s)
+                        Défaut {defaultTimeMusicSec}s (min {TIME_MUSIC_MIN_SEC}s)
                       </div>
                     )}
                   </td>
@@ -3143,7 +3271,7 @@ function AdminInner() {
         </button>
 
         <button
-          onClick={resetQuizAndPlayers}
+          onClick={resetQuizOnly}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
@@ -3153,9 +3281,9 @@ function AdminInner() {
             fontWeight: 600,
             cursor: "pointer",
           }}
-          title="Réinitialiser le quiz"
+          title="Réinitialiser le quiz (garde les joueurs et leurs scores)"
         >
-          Réinitialiser
+          Reset Quiz
         </button>
 
         {/* EleyBuzz Controls */}
@@ -3460,6 +3588,24 @@ function AdminInner() {
             {notice}
           </div>
         )}
+
+        {/* Bouton Réinitialiser tout à droite */}
+        <button
+          onClick={resetQuizAndPlayers}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #2a2a2a",
+            background: "#e5e7eb",
+            color: "#000",
+            fontWeight: 600,
+            cursor: "pointer",
+            marginLeft: "auto",
+          }}
+          title="Tout remettre à zéro (quiz/state, joueurs, answers/*)"
+        >
+          Réinitialiser
+        </button>
       </div>
 
       {needsOrderInit && (
@@ -3607,6 +3753,23 @@ function AdminInner() {
             >
               Score final
             </button>
+            {isBuzzerMode && (
+              <button
+                onClick={manualUnlockAllPlayers}
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 6,
+                  border: "1px solid #2a2a2a",
+                  background: "#a78bfa",
+                  color: "#fff",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+                title="Débloquer manuellement tous les joueurs (en cas de problème)"
+              >
+                🔓 Débloquer joueurs
+              </button>
+            )}
           </div>
 
           {/* Tableau joueurs */}
@@ -3920,142 +4083,94 @@ function AdminInner() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "minmax(0, 1fr) 360px",
-                gap: 16,
-                alignItems: "start",
-                maxWidth: 1100,
+                gap: 8,
+                maxWidth: 800,
                 marginTop: 12,
                 marginBottom: 16,
               }}
             >
-              {/* Colonne gauche */}
-              <div style={{ display: "grid", gap: 8 }}>
-                <label>
-                  Question
-                  <textarea
-                    rows={2}
-                    value={newQ.text}
-                    onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
-                    style={{ width: "100%", boxSizing: "border-box" }}
-                  />
-                </label>
+              <label>
+                Question
+                <textarea
+                  rows={2}
+                  value={newQ.text}
+                  onChange={(e) => setNewQ((p) => ({ ...p, text: e.target.value }))}
+                  style={{ width: "100%", boxSizing: "border-box" }}
+                />
+              </label>
 
-                <label>
-                  Image question (optionnelle)
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) =>
-                      setNewQ((p) => ({
-                        ...p,
-                        imageQuestionFile: e.target.files?.[0] || null,
-                      }))
-                    }
-                  />
-                </label>
+              <label>
+                Image question (optionnelle)
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) =>
+                    setNewQ((p) => ({
+                      ...p,
+                      imageQuestionFile: e.target.files?.[0] || null,
+                    }))
+                  }
+                />
+              </label>
 
-                <label>
-                  Réponses acceptées (séparées par des virgules)
-                  <input
-                    type="text"
-                    value={newQ.answersCsv}
-                    onChange={(e) =>
-                      setNewQ((p) => ({ ...p, answersCsv: e.target.value }))
-                    }
-                    placeholder="ex: Mario, Super Mario"
-                    style={{ width: "100%", boxSizing: "border-box" }}
-                  />
-                </label>
-                {/* 🔎 Patch Matching — options de tolérance par question */}
-                <label>
-                  Mode d’appariement (tolérance)
-                  <select
-                    value={newMatchingMode}
-                    onChange={(e) => setNewMatchingMode(e.target.value)}
-                    style={{ width: "100%", boxSizing: "border-box" }}
-                  >
-                    <option value="strict">strict (exact après normalisation)</option>
-                    <option value="relaxed">relaxed (tolérance relative)</option>
-                    <option value="numeric">numeric (strict numérique)</option>
-                  </select>
-                </label>
+              <label>
+                Réponses acceptées (séparées par des virgules)
+                <input
+                  type="text"
+                  value={newQ.answersCsv}
+                  onChange={(e) =>
+                    setNewQ((p) => ({ ...p, answersCsv: e.target.value }))
+                  }
+                  placeholder="ex: Mario, Super Mario"
+                  style={{ width: "100%", boxSizing: "border-box" }}
+                />
+              </label>
+              {/* 🔎 Patch Matching — options de tolérance par question */}
+              <label>
+                Mode d'appariement (tolérance)
+                <select
+                  value={newMatchingMode}
+                  onChange={(e) => setNewMatchingMode(e.target.value)}
+                  style={{ width: "100%", boxSizing: "border-box" }}
+                >
+                  <option value="strict">strict (exact après normalisation)</option>
+                  <option value="relaxed">relaxed (tolérance relative)</option>
+                  <option value="numeric">numeric (strict numérique)</option>
+                </select>
+              </label>
 
-                <label>
-                  TimeMusic (hh:mm:ss)
-                  <input
-                    type="text"
-                    value={newQ.timeMusicStr}
-                    onChange={(e) =>
-                      setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))
-                    }
-                    placeholder="ex: 00:00:35"
-                    style={{ width: "100%", boxSizing: "border-box" }}
-                  />
-                </label>
+              <label>
+                TimeMusic (hh:mm:ss)
+                <input
+                  type="text"
+                  value={newQ.timeMusicStr}
+                  onChange={(e) =>
+                    setNewQ((p) => ({ ...p, timeMusicStr: e.target.value }))
+                  }
+                  placeholder={`Défaut: ${formatHMS(defaultTimeMusicSec)}`}
+                  style={{ width: "100%", boxSizing: "border-box" }}
+                />
+              </label>
 
-                <label>
-                  Image réponse (optionnelle)
-                  <input
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) =>
-                      setNewQ((p) => ({
-                        ...p,
-                        imageReponseFile: e.target.files?.[0] || null,
-                      }))
-                    }
-                  />
-                </label>
+              <label>
+                Image réponse (optionnelle)
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) =>
+                    setNewQ((p) => ({
+                      ...p,
+                      imageReponseFile: e.target.files?.[0] || null,
+                    }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <button onClick={createOne} disabled={creating}>
-                    {creating ? "Création…" : "Créer la question"}
-                  </button>
-                </div>
+              <div>
+                <button onClick={createOne} disabled={creating}>
+                  {creating ? "Création…" : "Créer la question"}
+                </button>
               </div>
-
-              {/* Colonne droite : phrases de révélation */}
-              <fieldset
-                style={{
-                  border: "1px solid #333",
-                  padding: 12,
-                  borderRadius: 8,
-                  background: "rgba(15, 23, 42, 0.65)",
-                }}
-              >
-                <legend style={{ padding: "0 6px" }}>
-                  Phrase de réponse aléatoire (max 5)
-                </legend>
-
-                {newRevealPhrases.map((val, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                      marginBottom: 8,
-                    }}
-                  >
-                    <label style={{ width: 120 }}>Phrase {i + 1}</label>
-                    <input
-                      type="text"
-                      value={val}
-                      onChange={(e) => {
-                        const next = [...newRevealPhrases];
-                        next[i] = e.target.value;
-                        setNewRevealPhrases(next);
-                      }}
-                      placeholder={DEFAULT_REVEAL_PHRASES[i] || "Ex: La réponse était :"}
-                      style={{ flex: 1, padding: 8 }}
-                    />
-                  </div>
-                ))}
-
-                <div style={{ fontSize: 12, opacity: 0.7 }}>
-                  Laisse vide pour utiliser la liste par défaut.
-                </div>
-              </fieldset>
             </div>
 
             {table}
