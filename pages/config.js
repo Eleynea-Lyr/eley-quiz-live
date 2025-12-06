@@ -16,6 +16,7 @@ import {
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
   DEFAULT_TIME_MUSIC_SEC,
+  DEFAULT_BUZZER_COLLECT_WINDOW_MS,
 } from "../lib/constants";
 
 // Composant pour un champ de configuration
@@ -89,6 +90,7 @@ export default function Config() {
     buzzerCooldownMs: BUZZER_COOLDOWN_MS,
     buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
     buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
+    buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
     defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
   });
 
@@ -109,6 +111,7 @@ export default function Config() {
             buzzerCooldownMs: data.buzzerCooldownMs ?? BUZZER_COOLDOWN_MS,
             buzzerCorrectMessageDurationMs: data.buzzerCorrectMessageDurationMs ?? BUZZER_CORRECT_MESSAGE_DURATION_MS,
             buzzerWrongMessageDurationMs: data.buzzerWrongMessageDurationMs ?? BUZZER_WRONG_MESSAGE_DURATION_MS,
+            buzzerCollectWindowMs: data.buzzerCollectWindowMs ?? DEFAULT_BUZZER_COLLECT_WINDOW_MS,
             defaultTimeMusicSec: data.defaultTimeMusicSec ?? DEFAULT_TIME_MUSIC_SEC,
           });
         }
@@ -171,6 +174,7 @@ export default function Config() {
       buzzerCooldownMs: BUZZER_COOLDOWN_MS,
       buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
       buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
+      buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
       defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
     });
   }
@@ -324,6 +328,17 @@ export default function Config() {
                 step={500}
                 unit="ms"
                 description="Temps d'affichage du message de mauvaise réponse (défaut: 3000ms = 3s)"
+              />
+
+              <ConfigField
+                label="Durée de la fenêtre de collecte des buzz (millisecondes)"
+                value={config.buzzerCollectWindowMs}
+                onChange={(val) => setConfig({ ...config, buzzerCollectWindowMs: val })}
+                min={500}
+                max={5000}
+                step={100}
+                unit="ms"
+                description="Temps pendant lequel les buzz sont collectés avant sélection aléatoire pondérée (défaut: 1500ms = 1,5s)"
               />
             </div>
           </section>

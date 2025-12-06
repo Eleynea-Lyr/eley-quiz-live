@@ -68,6 +68,8 @@ import {
   lockPlayerBuzz,
   resetPlayerBuzzLock,
   resetAllPlayerBuzzLocks,
+  finalizeBuzzerSelection,
+  getTimingConfig,
 } from "../lib/firebase-helpers";
 
 // ============================================================================
@@ -491,6 +493,7 @@ function AdminInner() {
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
+  const [buzzerCollectingUntil, setBuzzerCollectingUntil] = useState(null);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
   const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
@@ -783,6 +786,12 @@ function AdminInner() {
         setBuzzerPoints(Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS);
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
+        // buzzerCollectingUntil peut être un Timestamp Firestore
+        if (d.buzzerCollectingUntil && typeof d.buzzerCollectingUntil.toMillis === "function") {
+          setBuzzerCollectingUntil(d.buzzerCollectingUntil);
+        } else {
+          setBuzzerCollectingUntil(null);
+        }
       },
       (e) => console.error("onSnapshot state error:", e)
     );
@@ -1157,6 +1166,57 @@ function AdminInner() {
   useEffect(() => {
     isRevealRef.current = !!isRevealAnswerPhase;
   }, [isRevealAnswerPhase]);
+
+  /* === Timer pour finaliser la sélection du buzzer après la fenêtre de collecte === */
+  useEffect(() => {
+    if (!isBuzzerMode || buzzerState !== BUZZER_STATES.COLLECTING || !buzzerCollectingUntil) {
+      return;
+    }
+
+    const checkAndFinalize = async () => {
+      try {
+        const now = Date.now();
+        let untilMs;
+        
+        // Gérer le cas où buzzerCollectingUntil est un Timestamp Firestore
+        if (buzzerCollectingUntil && typeof buzzerCollectingUntil.toMillis === "function") {
+          untilMs = buzzerCollectingUntil.toMillis();
+        } else if (typeof buzzerCollectingUntil === "number") {
+          untilMs = buzzerCollectingUntil;
+        } else {
+          // Format inattendu, ne pas finaliser
+          return;
+        }
+        
+        if (now >= untilMs) {
+          // Fenêtre fermée, finaliser la sélection
+          console.log("[Admin] Finalizing buzzer selection, window closed", { now, untilMs, diff: now - untilMs });
+          const result = await finalizeBuzzerSelection(db);
+          if (result.ok) {
+            console.log("[Admin] Buzzer selection finalized successfully", { selectedPlayerId: result.selectedPlayerId });
+          } else if (result.reason !== "window-still-open") {
+            console.warn("[Admin] Failed to finalize buzzer selection:", result.reason);
+          }
+        } else {
+          // Log pour debug : combien de temps reste-t-il ?
+          const remaining = untilMs - now;
+          if (remaining < 200) { // Log seulement quand il reste moins de 200ms
+            console.log("[Admin] Buzzer collection window closing soon", { remaining });
+          }
+        }
+      } catch (e) {
+        console.error("[Admin] Error checking buzzer collection window:", e);
+      }
+    };
+
+    // Vérifier immédiatement
+    checkAndFinalize();
+
+    // Vérifier périodiquement (toutes les 100ms pour être réactif)
+    const interval = setInterval(checkAndFinalize, 100);
+
+    return () => clearInterval(interval);
+  }, [isBuzzerMode, buzzerState, buzzerCollectingUntil]);
 
   /* === Contrôle clavier EleyBuzz (touches 1, 2, 3) === */
   useEffect(() => {
@@ -2373,8 +2433,17 @@ function AdminInner() {
   }
 
   // Toggle buzzer state (idle ↔ open)
+  // Ne peut pas changer d'état si on est en COLLECTING ou LOCKED
   async function toggleBuzzerState() {
     if (!isBuzzerMode) return;
+    
+    // Ne pas permettre de changer d'état si on est en collecte ou verrouillé
+    if (buzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.LOCKED) {
+      setNotice("Le buzzer est en cours d'utilisation, attendez la fin de la sélection");
+      setTimeout(() => setNotice(null), 2000);
+      return;
+    }
+    
     try {
       const stateRef = doc(db, "quiz", "state");
       const nextState = buzzerState === "idle" ? "open" : "idle";
@@ -2432,6 +2501,9 @@ function AdminInner() {
     try {
       const wrongPlayerId = firstPlayerId;
       
+      // Retirer 2 points du score EleyBuzz (peut aller en négatif)
+      await awardBuzzerPoints(db, wrongPlayerId, -2);
+      
       // Lock le joueur qui s'est trompé avec un cooldown de 20 secondes
       // Le cooldown commence APRÈS le message "Mauvaise réponse" (3s)
       await lockPlayerBuzz(db, wrongPlayerId, buzzerCooldownMs);
@@ -2445,9 +2517,11 @@ function AdminInner() {
 
       // Reset après 3 secondes et réouvrir le buzzer
       // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
-      // (il sera débloqué après 20 secondes si personne ne rebuzz, ou dès qu'un autre buzz)
+      // IMPORTANT : Cela débloque aussi tous les joueurs qui étaient punis avant (condition de libération)
       setTimeout(async () => {
         try {
+          // Débloquer tous les joueurs SAUF celui qui vient de se tromper
+          // Cela libère automatiquement tous les joueurs qui étaient punis avant
           await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
           await resetBuzzerState(db, "open");
           await updateDoc(stateRef, {
