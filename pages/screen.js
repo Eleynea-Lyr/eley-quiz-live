@@ -43,6 +43,8 @@ import {
   ensureAwardsForQuestionTx,
 } from "../lib/firebase-helpers";
 
+import { SCREEN_MESSAGES } from "../lib/messages";
+
 // ====== Constantes spécifiques à screen.js ======
 
 // JOIN (DEV)
@@ -164,6 +166,9 @@ function ScreenInner() {
   // Image optionnelle au-dessus du QR (config: screenLeftImageUrl)
   const [leftImageUrl, setLeftImageUrl] = useState(null);
 
+  // Messages personnalisables
+  const [podiumTitle, setPodiumTitle] = useState(SCREEN_MESSAGES.podiumTitle);
+  const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
 
   // Leaderboard
   const [playersLB, setPlayersLB] = useState([]);
@@ -326,6 +331,16 @@ function ScreenInner() {
           ? d.screenLeftImageUrl
           : (LEFT_GENERIC_IMG_SRC || null)
       );
+
+      // Messages personnalisables depuis Firestore
+      const customPodiumTitle = typeof d?.screenQuiz?.podiumTitle === "string" && d.screenQuiz.podiumTitle.trim() !== ""
+        ? d.screenQuiz.podiumTitle
+        : SCREEN_MESSAGES.podiumTitle;
+      setPodiumTitle(customPodiumTitle);
+      const customFinalPodiumTitle = typeof d?.screenQuiz?.finalPodiumTitle === "string" && d.screenQuiz.finalPodiumTitle.trim() !== ""
+        ? d.screenQuiz.finalPodiumTitle
+        : SCREEN_MESSAGES.finalPodiumTitle;
+      setFinalPodiumTitle(customFinalPodiumTitle);
 
       setConfigLoaded(true);
     });
@@ -1554,7 +1569,7 @@ function ScreenInner() {
             textAlign: "center",
           }}
         >
-          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Score Final de la soirée</h1>
+          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>{finalPodiumTitle}</h1>
 
           {finalPodium.gold.length + finalPodium.silver.length + finalPodium.bronze.length === 0 ? (
             <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
@@ -1758,7 +1773,7 @@ function ScreenInner() {
       >
         {isQuizEnded ? (
           <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-            <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Voici le podium :</h1>
+            <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>{podiumTitle}</h1>
 
             {podium.gold.length + podium.silver.length + podium.bronze.length === 0 ? (
               <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>

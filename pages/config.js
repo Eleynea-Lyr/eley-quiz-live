@@ -15,6 +15,7 @@ import {
   BUZZER_COOLDOWN_MS,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
+  DEFAULT_BUZZER_WRONG_PENALTY,
   DEFAULT_TIME_MUSIC_SEC,
   DEFAULT_BUZZER_COLLECT_WINDOW_MS,
 } from "../lib/constants";
@@ -90,6 +91,7 @@ export default function Config() {
     buzzerCooldownMs: BUZZER_COOLDOWN_MS,
     buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
     buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
+    buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
     buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
     defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
   });
@@ -111,6 +113,7 @@ export default function Config() {
             buzzerCooldownMs: data.buzzerCooldownMs ?? BUZZER_COOLDOWN_MS,
             buzzerCorrectMessageDurationMs: data.buzzerCorrectMessageDurationMs ?? BUZZER_CORRECT_MESSAGE_DURATION_MS,
             buzzerWrongMessageDurationMs: data.buzzerWrongMessageDurationMs ?? BUZZER_WRONG_MESSAGE_DURATION_MS,
+            buzzerWrongPenalty: data.buzzerWrongPenalty ?? DEFAULT_BUZZER_WRONG_PENALTY,
             buzzerCollectWindowMs: data.buzzerCollectWindowMs ?? DEFAULT_BUZZER_COLLECT_WINDOW_MS,
             defaultTimeMusicSec: data.defaultTimeMusicSec ?? DEFAULT_TIME_MUSIC_SEC,
           });
@@ -174,6 +177,7 @@ export default function Config() {
       buzzerCooldownMs: BUZZER_COOLDOWN_MS,
       buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
       buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
+      buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
       buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
       defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
     });
@@ -328,6 +332,17 @@ export default function Config() {
                 step={500}
                 unit="ms"
                 description="Temps d'affichage du message de mauvaise réponse (défaut: 3000ms = 3s)"
+              />
+
+              <ConfigField
+                label="Pénalité pour mauvaise réponse (points)"
+                value={config.buzzerWrongPenalty}
+                onChange={(val) => setConfig({ ...config, buzzerWrongPenalty: val })}
+                min={1}
+                max={20}
+                step={1}
+                unit="pts"
+                description="Nombre de points perdus pour une mauvaise réponse (défaut: 3 pts)"
               />
 
               <ConfigField

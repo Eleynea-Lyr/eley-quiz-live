@@ -37,6 +37,7 @@ import {
   DEFAULT_TIME_MUSIC_SEC,
   PLAYER_COLORS,
   DEFAULT_BUZZER_POINTS,
+  DEFAULT_BUZZER_WRONG_PENALTY,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
   BUZZER_COOLDOWN_MS,
@@ -497,6 +498,7 @@ function AdminInner() {
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
   const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
+  const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
   const [defaultTimeMusicSec, setDefaultTimeMusicSec] = useState(DEFAULT_TIME_MUSIC_SEC);
 
   // Refs pour connaître la phase courante sans dépendance d'ordre
@@ -510,6 +512,7 @@ function AdminInner() {
     timeMusicStr: formatHMS(DEFAULT_TIME_MUSIC_SEC), // Initialiser avec la valeur par défaut formatée
     imageQuestionFile: null, // image affichée pendant la phase "question"
     imageReponseFile: null, // image affichée pendant la "révélation"
+    imageQuestionLarge: false, // afficher l'image question en plus grand (+30px)
   });
 
   // Matching — champs création
@@ -587,6 +590,8 @@ function AdminInner() {
         setBuzzerWrongMessageDurationMs(bwmd);
         const bcm = Number.isFinite(d?.buzzerCooldownMs) ? d.buzzerCooldownMs : BUZZER_COOLDOWN_MS;
         setBuzzerCooldownMs(bcm);
+        const bwp = Number.isFinite(d?.buzzerWrongPenalty) ? d.buzzerWrongPenalty : DEFAULT_BUZZER_WRONG_PENALTY;
+        setBuzzerWrongPenalty(bwp);
 
         // Default TimeMusic
         const dtms = Number.isFinite(d?.defaultTimeMusicSec) ? d.defaultTimeMusicSec : DEFAULT_TIME_MUSIC_SEC;
@@ -1536,6 +1541,7 @@ function AdminInner() {
         // Images (brutes, on ajustera juste après avec deleteField si besoin)
         imageQuestionUrl: it.imageQuestionUrl || "",
         imageReponseUrl: it.imageReponseUrl || it.imageUrl || "",
+        imageQuestionLarge: it.imageQuestionLarge || false,
 
         order:
           typeof it.order === "number"
@@ -1694,6 +1700,7 @@ function AdminInner() {
 
         imageQuestionUrl,
         imageReponseUrl,
+        imageQuestionLarge: newQ.imageQuestionLarge || false,
         // imageUrl déprécié
 
         createdAt: new Date(),
@@ -1710,6 +1717,7 @@ function AdminInner() {
         timeMusicStr: formatHMS(defaultTimeMusicSec), // Utiliser la valeur par défaut configurée
         imageQuestionFile: null,
         imageReponseFile: null,
+        imageQuestionLarge: false,
       });
       setNewMatchingMode("strict");
     } catch (err) {
@@ -2501,8 +2509,8 @@ function AdminInner() {
     try {
       const wrongPlayerId = firstPlayerId;
       
-      // Retirer 2 points du score EleyBuzz (peut aller en négatif)
-      await awardBuzzerPoints(db, wrongPlayerId, -2);
+      // Retirer les points de pénalité du score EleyBuzz (peut aller en négatif)
+      await awardBuzzerPoints(db, wrongPlayerId, -buzzerWrongPenalty);
       
       // Lock le joueur qui s'est trompé avec un cooldown de 20 secondes
       // Le cooldown commence APRÈS le message "Mauvaise réponse" (3s)
@@ -3087,6 +3095,16 @@ function AdminInner() {
                       disabled={it._imageUploading}
                       style={{ width: "100%", boxSizing: "border-box", margin: "6px 0 0 0" }}
                     />
+                    {it.imageQuestionUrl && (
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={it.imageQuestionLarge || false}
+                          onChange={(e) => handleFieldChange(it.id, "imageQuestionLarge", e.target.checked)}
+                        />
+                        <span>Afficher en grand</span>
+                      </label>
+                    )}
                   </td>
 
                   <td style={{ width: "30%", verticalAlign: "top", padding: "12px" }}>
@@ -4185,6 +4203,20 @@ function AdminInner() {
                     }))
                   }
                 />
+              </label>
+
+              <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={newQ.imageQuestionLarge || false}
+                  onChange={(e) =>
+                    setNewQ((p) => ({
+                      ...p,
+                      imageQuestionLarge: e.target.checked,
+                    }))
+                  }
+                />
+                <span>Afficher l'image question en grand (+200px)</span>
               </label>
 
               <label>

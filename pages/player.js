@@ -43,6 +43,7 @@ import {
   BUZZER_STATES,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
+  DEFAULT_BUZZER_WRONG_PENALTY,
 } from "../lib/constants";
 
 import {
@@ -72,7 +73,7 @@ import {
   registerBuzzerPress,
 } from "../lib/firebase-helpers";
 
-import { ELEYBUZZ_PLAYER_MESSAGES } from "../lib/messages";
+import { ELEYBUZZ_PLAYER_MESSAGES, SCREEN_MESSAGES } from "../lib/messages";
 
 // ---------------------------------------------------------------------------
 // Constante locale spécifique au player
@@ -184,6 +185,7 @@ export default function Player() {
   const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
+  const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
   const [activeQuizKey, setActiveQuizKey] = useState(null);
 
   // Joueur / inscription
@@ -259,6 +261,7 @@ export default function Player() {
 
   // Score Final state
   const [showFinalScore, setShowFinalScore] = useState(false);
+  const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
 
 
   // Reset déclenché via URL ?reset=1 (avant start)
@@ -687,6 +690,14 @@ export default function Player() {
         setBuzzerCorrectMessageDurationMs(bcmd);
         const bwmd = Number.isFinite(d?.buzzerWrongMessageDurationMs) ? d.buzzerWrongMessageDurationMs : BUZZER_WRONG_MESSAGE_DURATION_MS;
         setBuzzerWrongMessageDurationMs(bwmd);
+        const bwp = Number.isFinite(d?.buzzerWrongPenalty) ? d.buzzerWrongPenalty : DEFAULT_BUZZER_WRONG_PENALTY;
+        setBuzzerWrongPenalty(bwp);
+
+        // Messages personnalisables depuis Firestore
+        const customFinalPodiumTitle = typeof d?.screenQuiz?.finalPodiumTitle === "string" && d.screenQuiz.finalPodiumTitle.trim() !== ""
+          ? d.screenQuiz.finalPodiumTitle
+          : SCREEN_MESSAGES.finalPodiumTitle;
+        setFinalPodiumTitle(customFinalPodiumTitle);
       });
     });
     return () => unsub();
@@ -761,7 +772,7 @@ export default function Player() {
 
     rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
-  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec]);
+  }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
   // ============================================================================
   // /pages/player.js — Partie 3/6
@@ -2180,7 +2191,7 @@ export default function Player() {
                     marginBottom: 16
                   }}
                   dangerouslySetInnerHTML={{ 
-                    __html: addSmartLineBreaks(ELEYBUZZ_PLAYER_MESSAGES.punishment).replace(/\.\s+/g, ".<br>")
+                    __html: addSmartLineBreaks(ELEYBUZZ_PLAYER_MESSAGES.punishment.replace("{penalty}", String(buzzerWrongPenalty))).replace(/\.\s+/g, ".<br>")
                   }}
                 />
                 {/* Afficher le timer si cooldown actif, sinon juste le message */}
@@ -2466,7 +2477,7 @@ export default function Player() {
         }}
       >
         <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
-          Score Final de la soirée
+          {finalPodiumTitle}
         </h1>
         <div
           style={{
@@ -2742,12 +2753,12 @@ export default function Player() {
                 dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
               />
 
-              {/* Image question (optionnelle) - Taille réduite de moitié pour éviter que le clavier cache le champ input */}
+              {/* Image question (optionnelle) - Taille réduite de moitié pour éviter que le clavier cache le champ input, ou +200px si imageQuestionLarge */}
               {currentQuestion?.imageQuestionUrl ? (
                 <div
                   style={{
-                    width: PLAYER_IMG_MAX / 2,
-                    height: PLAYER_IMG_MAX / 2,
+                    width: currentQuestion.imageQuestionLarge ? (PLAYER_IMG_MAX / 2 + 200) : (PLAYER_IMG_MAX / 2),
+                    height: currentQuestion.imageQuestionLarge ? (PLAYER_IMG_MAX / 2 + 200) : (PLAYER_IMG_MAX / 2),
                     maxWidth: "100%",
                     margin: "16px auto",
                     display: "flex",
