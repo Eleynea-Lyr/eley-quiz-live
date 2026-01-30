@@ -94,6 +94,7 @@ export default function Config() {
     buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
     buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
     defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
+    archivesFolderPath: "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
   });
 
   // Charger la configuration depuis Firestore
@@ -116,6 +117,7 @@ export default function Config() {
             buzzerWrongPenalty: data.buzzerWrongPenalty ?? DEFAULT_BUZZER_WRONG_PENALTY,
             buzzerCollectWindowMs: data.buzzerCollectWindowMs ?? DEFAULT_BUZZER_COLLECT_WINDOW_MS,
             defaultTimeMusicSec: data.defaultTimeMusicSec ?? DEFAULT_TIME_MUSIC_SEC,
+            archivesFolderPath: data.archivesFolderPath ?? "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
           });
         }
       } catch (e) {
@@ -180,6 +182,7 @@ export default function Config() {
       buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
       buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
       defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
+      archivesFolderPath: "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
     });
   }
 
@@ -381,6 +384,96 @@ export default function Config() {
                 unit="s"
                 description="Durée par défaut pour TimeMusic lors de la création d'une question (défaut: 40s)"
               />
+            </div>
+          </section>
+
+          {/* Section Archives */}
+          <section
+            style={{
+              background: "#0b0f1a",
+              border: "1px solid #1f2a44",
+              borderRadius: 12,
+              padding: 24,
+            }}
+          >
+            <h2 style={{ fontSize: "1.5rem", marginBottom: 20, color: "#10b981" }}>
+              📁 Dossier d'Archives des Quiz
+            </h2>
+
+            <div style={{ display: "grid", gap: 16 }}>
+              <div>
+                <label
+                  style={{
+                    display: "block",
+                    marginBottom: 8,
+                    fontWeight: 600,
+                    fontSize: 14,
+                  }}
+                >
+                  Chemin du dossier d'archives
+                </label>
+                <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                  <input
+                    type="text"
+                    value={config.archivesFolderPath || ""}
+                    onChange={(e) => setConfig({ ...config, archivesFolderPath: e.target.value })}
+                    style={{
+                      flex: 1,
+                      padding: "8px 12px",
+                      borderRadius: 6,
+                      border: "1px solid #1f2a44",
+                      background: "#111",
+                      color: "#fff",
+                      fontSize: 14,
+                      fontFamily: "monospace",
+                    }}
+                    placeholder="D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz"
+                  />
+                  {typeof window !== 'undefined' && 'showDirectoryPicker' in window && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try {
+                          const dirHandle = await window.showDirectoryPicker({
+                            mode: 'readwrite',
+                            startIn: 'documents'
+                          });
+                          // Récupérer le nom du dossier (on ne peut pas avoir le chemin complet)
+                          const dirName = dirHandle.name;
+                          // Mettre à jour le chemin (l'utilisateur devra compléter si nécessaire)
+                          setConfig({ ...config, archivesFolderPath: `...\\${dirName}` });
+                          setNotice(`Dossier "${dirName}" sélectionné. Complétez le chemin complet si nécessaire.`);
+                          setTimeout(() => setNotice(null), 3000);
+                        } catch (err) {
+                          if (err.name !== 'AbortError') {
+                            console.error("Erreur sélection dossier:", err);
+                          }
+                        }
+                      }}
+                      style={{
+                        padding: "8px 16px",
+                        borderRadius: 6,
+                        border: "1px solid #1f2a44",
+                        background: "#2563eb",
+                        color: "#fff",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      📂 Choisir dossier
+                    </button>
+                  )}
+                </div>
+                <div style={{ marginTop: 4, fontSize: 12, opacity: 0.7, fontStyle: "italic" }}>
+                  Chemin du dossier où exporter/importer les quiz (format Windows : D:\\chemin\\vers\\dossier)
+                  {typeof window !== 'undefined' && 'showDirectoryPicker' in window && (
+                    <span style={{ display: "block", marginTop: 4 }}>
+                      💡 Utilisez "Choisir dossier" pour sélectionner le dossier une fois, il sera mémorisé pour les exports/imports suivants.
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
           </section>
         </div>

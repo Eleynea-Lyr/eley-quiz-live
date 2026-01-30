@@ -595,6 +595,9 @@ function AdminInner() {
         const dtms = Number.isFinite(d?.defaultTimeMusicSec) ? d.defaultTimeMusicSec : DEFAULT_TIME_MUSIC_SEC;
         setDefaultTimeMusicSec(dtms);
 
+        // Chemin du dossier d'archives (pour export/import)
+        // Stocké dans configDoc, sera utilisé par exportQuiz/importQuiz
+
         // Phrases de révélation
         if (Array.isArray(d?.revealPhrases) && d.revealPhrases.length > 0) {
           setRevealPhrases(d.revealPhrases);
@@ -1416,6 +1419,215 @@ function AdminInner() {
     const url = await uploadImage(file);
     if (url) handleFieldChange(id, targetField, url);
     handleFieldChange(id, "_imageUploading", false);
+  };
+
+  // ============================================================================
+  // [4.6] Export/Import de quiz
+  // ============================================================================
+
+  // Export d'un quiz complet (questions + URLs des images)
+  const exportQuiz = async (quizKey) => {
+    try {
+      if (!quizKey) {
+        alert("Aucun quiz sélectionné");
+        return;
+      }
+
+      setNotice("Export en cours...");
+      
+      // Récupérer le quiz depuis la liste
+      const quiz = quizzes.find((q) => q.key === quizKey);
+      if (!quiz) {
+        alert("Quiz introuvable");
+        return;
+      }
+
+      // Récupérer toutes les questions du quiz
+      const colRef = collection(db, "LesQuestions");
+      const qRef = query(
+        colRef,
+        where("quizKey", "==", quizKey),
+        orderBy("order", "asc")
+      );
+      const snap = await getDocs(qRef);
+      
+      const questions = snap.docs.map((d) => {
+        const data = d.data();
+        // S'assurer que les URLs sont bien des strings (pas null/undefined)
+        // Ne pas utiliser String() sur null/undefined car ça donnerait "null" ou "undefined"
+        // Vérifier aussi le champ imageUrl (ancien format possible)
+        let imageQuestionUrl = "";
+        let imageReponseUrl = "";
+        
+        if (data.imageQuestionUrl) {
+          const str = String(data.imageQuestionUrl).trim();
+          if (str && str !== "null" && str !== "undefined" && str.length > 0) {
+            imageQuestionUrl = str;
+          }
+        }
+        
+        if (data.imageReponseUrl) {
+          const str = String(data.imageReponseUrl).trim();
+          if (str && str !== "null" && str !== "undefined" && str.length > 0) {
+            imageReponseUrl = str;
+          }
+        }
+        
+        // Fallback sur imageUrl (ancien format)
+        if (!imageReponseUrl && data.imageUrl) {
+          const str = String(data.imageUrl).trim();
+          if (str && str !== "null" && str !== "undefined" && str.length > 0) {
+            imageReponseUrl = str;
+          }
+        }
+        
+        return {
+          text: data.text || "",
+          answers: Array.isArray(data.answers) ? data.answers : [],
+          imageQuestionUrl: imageQuestionUrl,
+          imageReponseUrl: imageReponseUrl,
+          imageQuestionLarge: data.imageQuestionLarge || false,
+          timeMusicSec: data.timeMusicSec || 0,
+          order: data.order || 0,
+          revealPhrases: Array.isArray(data.revealPhrases) ? data.revealPhrases : [],
+          matchingMode: data.matchingMode || "strict",
+        };
+      });
+
+      // Créer l'objet d'export
+      const exportData = {
+        version: "1.0",
+        quizName: quiz.name,
+        quizKey: quiz.key,
+        exportedAt: new Date().toISOString(),
+        questions: questions,
+      };
+
+      const jsonStr = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([jsonStr], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${quiz.name.replace(/[^a-z0-9]/gi, "_")}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      setNotice(`Quiz "${quiz.name}" exporté avec succès !`);
+      setTimeout(() => setNotice(null), 3000);
+    } catch (err) {
+      console.error("Erreur export:", err);
+      alert("Erreur lors de l'export : " + (err?.message || err));
+      setNotice(null);
+    }
+  };
+
+  // Import d'un quiz depuis un fichier JSON
+  const importQuiz = async (file, targetQuizKey = null) => {
+    try {
+      if (!file) {
+        alert("Aucun fichier sélectionné");
+        return;
+      }
+
+      setNotice("Import en cours...");
+
+      // Lire le fichier
+      const text = await file.text();
+      const exportData = JSON.parse(text);
+
+      // Vérifier la version
+      if (!exportData.version || !exportData.questions) {
+        throw new Error("Format de fichier invalide");
+      }
+
+      // Déterminer la clé du quiz cible
+      let finalQuizKey = targetQuizKey;
+      if (!finalQuizKey) {
+        // Créer un nouveau quiz avec le nom du quiz importé
+        const quizName = exportData.quizName || `Quiz importé ${Date.now()}`;
+        finalQuizKey = `quiz-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        // Ajouter le quiz à la liste
+        const cfgRef = doc(db, "quiz", "config");
+        const cfgSnap = await getDoc(cfgRef);
+        const cfgData = cfgSnap.exists() ? cfgSnap.data() : {};
+        const existingQuizzes = Array.isArray(cfgData.quizzes) ? cfgData.quizzes : [];
+        
+        await setDoc(
+          cfgRef,
+          {
+            quizzes: [...existingQuizzes, { key: finalQuizKey, name: quizName }],
+          },
+          { merge: true }
+        );
+      }
+
+      // Importer les questions
+      const colRef = collection(db, "LesQuestions");
+      let importedCount = 0;
+      let skippedCount = 0;
+      let imagesCount = 0;
+
+      for (const q of exportData.questions) {
+        try {
+          // S'assurer que les URLs sont bien des strings
+          const imageQuestionUrl = q.imageQuestionUrl ? String(q.imageQuestionUrl) : "";
+          const imageReponseUrl = q.imageReponseUrl ? String(q.imageReponseUrl) : "";
+          
+          // Créer la question
+          await addDoc(colRef, {
+            text: q.text || "",
+            answers: Array.isArray(q.answers) ? q.answers : [],
+            imageQuestionUrl: imageQuestionUrl,
+            imageReponseUrl: imageReponseUrl,
+            imageQuestionLarge: q.imageQuestionLarge || false,
+            timeMusicSec: q.timeMusicSec || 0,
+            order: q.order || importedCount * 1000,
+            revealPhrases: Array.isArray(q.revealPhrases) ? q.revealPhrases : [],
+            matchingMode: q.matchingMode || "strict",
+            timecodeSec: null, // Sera recalculé
+            quizKey: finalQuizKey,
+            createdAt: serverTimestamp(),
+          });
+
+          if (imageQuestionUrl || imageReponseUrl) {
+            imagesCount++;
+          }
+          importedCount++;
+        } catch (err) {
+          console.error("Erreur import question:", err);
+          skippedCount++;
+        }
+      }
+
+      // Recalculer les timecodes
+      if (importedCount > 0) {
+        // Recharger les questions pour recalculer
+        const qRef = query(
+          colRef,
+          where("quizKey", "==", finalQuizKey),
+          orderBy("order", "asc")
+        );
+        const snap = await getDocs(qRef);
+        setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        await recalcAllTimecodesFromOrder();
+      }
+
+      setNotice(
+        `Import terminé : ${importedCount} questions importées${skippedCount > 0 ? `, ${skippedCount} ignorées` : ""}${imagesCount > 0 ? `, ${imagesCount} avec images` : ""}`
+      );
+      setTimeout(() => setNotice(null), 4000);
+
+      // Sélectionner le quiz importé
+      setSelectedQuizKey(finalQuizKey);
+      setAdminTab(`quiz:${finalQuizKey}`);
+    } catch (err) {
+      console.error("Erreur import:", err);
+      alert("Erreur lors de l'import : " + (err?.message || err));
+      setNotice(null);
+    }
   };
 
   // Supprimer l’image QUESTION (met à jour le brouillon local ; la suppression réelle se fait dans saveOne)
@@ -4098,6 +4310,54 @@ function AdminInner() {
               >
                 Supprimer ce quiz
               </button>
+              
+              {/* Boutons Import/Export */}
+              <button
+                type="button"
+                onClick={() => currentQuiz && exportQuiz(currentQuiz.key)}
+                disabled={!currentQuiz}
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: "1px solid #374151",
+                  background: "#1f2937",
+                  color: "#e5e7eb",
+                  fontWeight: 600,
+                  cursor: currentQuiz ? "pointer" : "not-allowed",
+                  fontSize: 13,
+                }}
+                title="Exporter ce quiz en fichier JSON"
+              >
+                📥 Exporter
+              </button>
+              <label
+                style={{
+                  padding: "6px 12px",
+                  borderRadius: 8,
+                  border: "1px solid #374151",
+                  background: "#1f2937",
+                  color: "#e5e7eb",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  fontSize: 13,
+                  display: "inline-block",
+                }}
+                title="Importer un quiz depuis un fichier JSON"
+              >
+                📤 Importer
+                <input
+                  type="file"
+                  accept=".json"
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file && currentQuiz) {
+                      importQuiz(file, currentQuiz.key);
+                    }
+                    e.target.value = "";
+                  }}
+                />
+              </label>
             </div>
           </div>
 
