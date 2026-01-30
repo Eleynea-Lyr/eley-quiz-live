@@ -246,6 +246,7 @@ export default function Player() {
   const [firstPlayerId, setFirstPlayerId] = useState(null);
   const [canBuzz, setCanBuzz] = useState(true);
   const [buzzerCooldownUntilMs, setBuzzerCooldownUntilMs] = useState(null);
+  const [buzzerCooldownTick, setBuzzerCooldownTick] = useState(0); // Force re-render chaque seconde pour décompte fluide
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
   // Ref pour mémoriser de manière persistante si le joueur est puni (évite les flashes)
@@ -493,22 +494,11 @@ export default function Player() {
         // 2. Si firstPlayerId devient null (réinitialisation) → réinitialiser
         // 3. Si Firestore confirme l'état optimiste → réinitialiser (synchronisation)
         // 4. Si l'état Firestore change (par exemple, un autre joueur a buzzé) → réinitialiser
-        if (newBuzzerState === BUZZER_STATES.IDLE || (newFirstPlayerId === null && newBuzzerState !== BUZZER_STATES.COLLECTING)) {
+        if (newBuzzerState === BUZZER_STATES.IDLE || newFirstPlayerId === null) {
           // Nouvelle question ou réinitialisation : toujours réinitialiser l'optimiste
           setOptimisticBuzzerState(null);
           setOptimisticFirstPlayerId(null);
           setIsBuzzing(false); // Réactiver le bouton
-        } else if (newBuzzerState === BUZZER_STATES.COLLECTING) {
-          // Pendant COLLECTING, garder l'état optimiste si on a buzzé
-          // Permettre les clics multiples pour l'animation visuelle
-          if (optimisticFirstPlayerId === playerId || isBuzzing) {
-            // On a buzzé, garder l'état optimiste pour permettre les clics suivants
-            // Ne pas réinitialiser isBuzzing pour permettre l'animation visuelle
-          } else {
-            // On n'a pas encore buzzé, réinitialiser l'optimiste
-            setOptimisticBuzzerState(null);
-            setOptimisticFirstPlayerId(null);
-          }
         } else if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
           // Firestore confirme l'état optimiste : réinitialiser (synchronisation)
           setOptimisticBuzzerState(null);
@@ -1360,7 +1350,7 @@ export default function Player() {
 
   // GESTION DE LA PUNITION : Ref persistante pour éviter les flashes pendant la synchronisation
   // Le joueur est considéré comme puni si canBuzz est false (source de vérité Firestore)
-  // Une fois puni, on reste puni jusqu'à ce que canBuzz soit true ET que le buzzer soit OPEN (pas COLLECTING/LOCKED)
+  // Une fois puni, on reste puni jusqu'à ce que canBuzz soit true ET que le buzzer soit OPEN
   // Cela évite de voir le buzzer bleu brièvement avant qu'il ne devienne gris
   useEffect(() => {
     if (!isBuzzerMode || !playerId) return;
@@ -1375,46 +1365,57 @@ export default function Player() {
         setPunishedTick(t => t + 1); // Force re-render
       }
       
-      // Si canBuzz est false et que le buzzer est ouvert, démarrer le cooldown local
-      if (buzzerState === BUZZER_STATES.OPEN && !buzzerCooldownUntilMs && buzzerMessageType !== "wrong") {
+      // Si canBuzz est false, démarrer le cooldown local immédiatement
+      // Le cooldown doit démarrer même si le buzzer est réouvert (cas de mauvaise réponse)
+      if (!buzzerCooldownUntilMs) {
         const cooldownEndMs = now + buzzerCooldownMs;
         setBuzzerCooldownUntilMs(cooldownEndMs);
       }
     } else {
       // canBuzz est true : le joueur est libéré
-      // Mais on ne libère visuellement que si le buzzer n'est pas en train de collecter/verrouiller
       // Si le buzzer est LOCKED avec un autre joueur, on libère quand même (le buzzer sera gris, pas bleu)
-      // Si le buzzer est COLLECTING, on attend qu'il soit LOCKED ou OPEN avant de libérer
       if (isPunishedRef.current) {
-        const isBuzzerCollecting = buzzerState === BUZZER_STATES.COLLECTING;
-        
-        if (isBuzzerCollecting) {
-          // Pendant COLLECTING, on reste "punis" visuellement pour éviter le flash bleu
-          // Le joueur sera libéré quand le buzzer sera LOCKED ou OPEN
-        } else {
-          // Le buzzer n'est pas en COLLECTING : on peut libérer
-          // Si LOCKED avec un autre joueur, le buzzer sera gris (pas bleu), donc pas de flash
-          // Si OPEN ou IDLE, le buzzer sera bleu, ce qui est normal
-          isPunishedRef.current = false;
-          setPunishedTick(t => t + 1); // Force re-render
-          // Réinitialiser le cooldown car le joueur n'est plus puni
-          if (buzzerCooldownUntilMs) {
-            setBuzzerCooldownUntilMs(null);
-          }
+        // Le buzzer n'est pas verrouillé : on peut libérer
+        // Si LOCKED avec un autre joueur, le buzzer sera gris (pas bleu), donc pas de flash
+        // Si OPEN ou IDLE, le buzzer sera bleu, ce qui est normal
+        isPunishedRef.current = false;
+        setPunishedTick(t => t + 1); // Force re-render
+        // Réinitialiser le cooldown car le joueur n'est plus puni
+        if (buzzerCooldownUntilMs) {
+          setBuzzerCooldownUntilMs(null);
         }
       }
     }
   }, [isBuzzerMode, playerId, canBuzz, buzzerState, buzzerCooldownUntilMs, buzzerMessageType, buzzerCooldownMs]);
 
-  // Ticker cooldown EleyBuzz
+  // Ticker cooldown EleyBuzz - mise à jour chaque 100ms pour décompte fluide et précis
   useEffect(() => {
-    if (!buzzerCooldownUntilMs) return;
+    if (!buzzerCooldownUntilMs) {
+      setBuzzerCooldownTick(0);
+      return;
+    }
+    
+    // Vérifier immédiatement
+    const now = Date.now();
+    if (now >= buzzerCooldownUntilMs) {
+      setBuzzerCooldownUntilMs(null);
+      setBuzzerCooldownTick(0);
+      return;
+    }
+    
+    // Mettre à jour plus fréquemment (toutes les 100ms) pour un décompte fluide
+    // Cela garantit que le calcul du temps restant est toujours précis
     const id = setInterval(() => {
       const now = Date.now();
       if (now >= buzzerCooldownUntilMs) {
         setBuzzerCooldownUntilMs(null);
+        setBuzzerCooldownTick(0);
+      } else {
+        // Force re-render toutes les 100ms pour afficher le décompte précis
+        setBuzzerCooldownTick(t => t + 1);
       }
-    }, 250);
+    }, 100); // Mise à jour toutes les 100ms pour plus de fluidité
+    
     return () => clearInterval(id);
   }, [buzzerCooldownUntilMs]);
 
@@ -1432,6 +1433,40 @@ export default function Player() {
       });
     }
   }, [isBuzzerMode]);
+
+  // Rafraîchissement automatique pendant les phases LOCKED et IDLE pour éviter les blocages
+  // Nettoie les états optimistes et force un re-render périodique
+  // - Pendant LOCKED : quand la personne répond
+  // - Pendant IDLE : pendant l'attente ("écoute attentivement la question de Eley")
+  useEffect(() => {
+    if (!isBuzzerMode) return;
+    
+    // Activer le rafraîchissement pendant LOCKED (personne répond) ou IDLE (attente)
+    const shouldRefresh = buzzerState === BUZZER_STATES.LOCKED || buzzerState === BUZZER_STATES.IDLE;
+    if (!shouldRefresh) return;
+
+    // Nettoyer immédiatement les états optimistes qui ne sont plus nécessaires
+    // Une fois que Firestore confirme LOCKED, on n'a plus besoin de l'optimiste
+    if (optimisticBuzzerState && firstPlayerId) {
+      // Firestore a confirmé, on peut nettoyer l'optimiste
+      setOptimisticBuzzerState(null);
+      setOptimisticFirstPlayerId(null);
+    }
+
+    // Rafraîchissement périodique toutes les 500ms pendant LOCKED ou IDLE
+    // Cela force un re-render et nettoie les états qui pourraient s'accumuler
+    const refreshInterval = setInterval(() => {
+      // Forcer un petit re-render pour nettoyer les états
+      // Cela évite l'accumulation de mémoire et les blocages
+      if (optimisticBuzzerState && firstPlayerId) {
+        // Nettoyer l'optimiste si Firestore a confirmé
+        setOptimisticBuzzerState(null);
+        setOptimisticFirstPlayerId(null);
+      }
+    }, 500); // Rafraîchissement toutes les 500ms
+
+    return () => clearInterval(refreshInterval);
+  }, [isBuzzerMode, buzzerState, optimisticBuzzerState, firstPlayerId]);
 
 
   /* ============================ Vérification & Handlers ============================ */
@@ -1534,43 +1569,27 @@ export default function Player() {
     }
   };
 
-  // Handler EleyBuzz - optimisé pour la réactivité avec compensation de latence
-  // Permet les multi-clics rapides (le serveur gère qui a vraiment buzzé en premier)
-  // Pendant COLLECTING, permet les clics même si déjà buzzé (pour l'animation visuelle)
+  // Handler EleyBuzz - premier qui buzz = gagnant
   const handleBuzzerPress = async () => {
-    if (!playerId || !isBuzzerMode || (buzzerState !== BUZZER_STATES.OPEN && buzzerState !== BUZZER_STATES.COLLECTING)) return;
+    if (!playerId || !isBuzzerMode || buzzerState !== BUZZER_STATES.OPEN) return;
     if (buzzerCooldownUntilMs && Date.now() < buzzerCooldownUntilMs) return;
-
-    // Pendant COLLECTING, si on a déjà buzzé, permettre l'animation visuelle mais ne pas appeler le serveur
-    if (buzzerState === BUZZER_STATES.COLLECTING && (isBuzzing || optimisticFirstPlayerId === playerId)) {
-      // Déjà buzzé, juste permettre l'animation visuelle (ne pas appeler le serveur)
-      // L'animation est gérée par onTouchStart/onMouseDown
-      return;
-    }
     
-    // Vérifier canBuzz seulement si on n'est pas déjà en train de buzzer
-    if (!canBuzz && !isBuzzing) return;
+    // Vérifier canBuzz
+    if (!canBuzz) return;
 
-    // Capturer le timestamp local AVANT toute opération asynchrone
-    const localTimestampMs = Date.now();
-
-    // Mise à jour optimiste immédiate (mais ne pas bloquer les clics suivants)
-    // On permet plusieurs clics rapides, le serveur gérera qui a vraiment buzzé en premier
+    // Mise à jour optimiste immédiate
     if (!isBuzzing) {
       setIsBuzzing(true);
       startTransition(() => {
-        // Si on est en COLLECTING, garder COLLECTING, sinon passer à LOCKED
-        setOptimisticBuzzerState(buzzerState === BUZZER_STATES.COLLECTING ? BUZZER_STATES.COLLECTING : BUZZER_STATES.LOCKED);
+        setOptimisticBuzzerState(BUZZER_STATES.LOCKED);
         setOptimisticFirstPlayerId(playerId);
       });
     }
 
-    // Appel Firestore en arrière-plan (non-bloquant) avec timestamp local
-    // Peut être appelé plusieurs fois, le serveur gère l'idempotence
+    // Appel Firestore en arrière-plan (non-bloquant)
     try {
-      const result = await registerBuzzerPress(db, playerId, localTimestampMs);
-      // Si le buzz a échoué car déjà buzzé dans cette fenêtre, garder l'état optimiste
-      // pour permettre l'animation visuelle continue
+      const result = await registerBuzzerPress(db, playerId);
+      // Si le buzz a échoué, réinitialiser l'état optimiste
       if (!result.ok && result.reason === "already-buzzed") {
         // Déjà buzzé, garder l'état optimiste pour l'animation visuelle
         // Ne pas réinitialiser isBuzzing pour permettre les clics suivants
@@ -2099,16 +2118,15 @@ export default function Player() {
     // Firestore confirmera ensuite qui peut vraiment répondre (sécurité)
     const effectiveFirstPlayerId = optimisticFirstPlayerId || firstPlayerId;
     
-    // Permettre les multi-clics : ne pas bloquer si isBuzzing est true
-    // Le serveur gérera qui a vraiment buzzé en premier
-    // Permettre aussi pendant COLLECTING (si la fenêtre n'est pas fermée)
-    const canPressBuzzer = (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING) && canBuzz && (!buzzerCooldownUntilMs || now >= buzzerCooldownUntilMs);
-    // Calculer le temps restant pour le timer de punition (utiliser le `now` déjà calculé)
-    // Le timer affiche simplement le temps restant du cooldown de 20 secondes
+    // Permettre les clics si le buzzer est ouvert
+    const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz && (!buzzerCooldownUntilMs || now >= buzzerCooldownUntilMs);
+    // Calculer le temps restant pour le timer de punition
+    // Utiliser Date.now() directement pour avoir le temps réel à chaque render (forcé par buzzerCooldownTick)
+    const currentTime = Date.now();
     let buzzerCooldownRemainingSec = 0;
-    if (buzzerCooldownUntilMs && now < buzzerCooldownUntilMs) {
+    if (buzzerCooldownUntilMs && currentTime < buzzerCooldownUntilMs) {
       // Calculer simplement le temps restant en secondes (20, 19, 18... jusqu'à 1)
-      buzzerCooldownRemainingSec = Math.ceil((buzzerCooldownUntilMs - now) / 1000);
+      buzzerCooldownRemainingSec = Math.ceil((buzzerCooldownUntilMs - currentTime) / 1000);
       if (buzzerCooldownRemainingSec < 0) buzzerCooldownRemainingSec = 0;
     }
 
@@ -2176,8 +2194,10 @@ export default function Player() {
           
           if (isPunished) {
             // Calculer hasActiveCooldown dans le scope du bloc
-            const hasActiveCooldown = buzzerCooldownUntilMs && buzzerCooldownUntilMs > now;
-            const remainingSec = hasActiveCooldown ? Math.max(0, Math.ceil((buzzerCooldownUntilMs - now) / 1000)) : 0;
+            // Utiliser Date.now() directement pour avoir le temps réel à chaque render (forcé par buzzerCooldownTick)
+            const currentTimeForCooldown = Date.now();
+            const hasActiveCooldown = buzzerCooldownUntilMs && buzzerCooldownUntilMs > currentTimeForCooldown;
+            const remainingSec = hasActiveCooldown ? Math.max(0, Math.ceil((buzzerCooldownUntilMs - currentTimeForCooldown) / 1000)) : 0;
 
             return (
               <div style={{ marginBottom: 24, textAlign: "center" }}>
@@ -2226,7 +2246,7 @@ export default function Player() {
             );
           }
 
-          // États OPEN, COLLECTING, LOCKED : Affichage du buzzer
+          // États OPEN, LOCKED : Affichage du buzzer
           // Déterminer la couleur et l'état du buzzer
           const getBuzzerStyle = () => {
             // Si OPEN : bleu (actif)
@@ -2237,19 +2257,6 @@ export default function Player() {
                 shadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
                 isClickable: canPressBuzzer,
                 isAnimating: false,
-              };
-            }
-            
-            // Si COLLECTING : bleu pour TOUS, cliquable pour TOUS (même si déjà buzzé)
-            // (le serveur refusera les doubles buzz, mais visuellement tous peuvent continuer à cliquer)
-            // Pas d'animation automatique, seulement au clic/touch
-            if (effectiveBuzzerState === BUZZER_STATES.COLLECTING) {
-              return {
-                background: "#3b82f6",
-                border: "#fff",
-                shadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
-                isClickable: true, // Toujours cliquable pendant COLLECTING (même si déjà buzzé, pour l'animation visuelle)
-                isAnimating: false, // Pas d'animation automatique
               };
             }
             
@@ -2311,11 +2318,8 @@ export default function Player() {
               {/* Buzzer toujours visible (sauf IDLE) */}
               <button
                 onTouchStart={(e) => {
-                  // Animation visuelle seulement pour les buzzers bleus (OPEN ou COLLECTING)
-                  // Vérifier buzzerState (Firestore) aussi pour détecter COLLECTING immédiatement
-                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN 
-                    || effectiveBuzzerState === BUZZER_STATES.COLLECTING
-                    || buzzerState === BUZZER_STATES.COLLECTING;
+                  // Animation visuelle seulement pour les buzzers bleus (OPEN)
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   
                   if (canAnimate) {
                     e.preventDefault();
@@ -2323,24 +2327,21 @@ export default function Player() {
                     e.currentTarget.style.transform = "scale(0.95)";
                     e.currentTarget.style.background = "#2563eb";
                     
-                    // Appeler handleBuzzerPress seulement si cliquable (ou pendant COLLECTING)
-                    if (buzzerStyle.isClickable || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING) {
+                    // Appeler handleBuzzerPress seulement si cliquable
+                    if (buzzerStyle.isClickable) {
                       handleBuzzerPress();
                     }
                   }
                 }}
                 onClick={(e) => {
-                  // Animation visuelle seulement pour les buzzers bleus (OPEN ou COLLECTING)
-                  // Vérifier buzzerState (Firestore) aussi pour détecter COLLECTING immédiatement
-                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN 
-                    || effectiveBuzzerState === BUZZER_STATES.COLLECTING
-                    || buzzerState === BUZZER_STATES.COLLECTING;
+                  // Animation visuelle seulement pour les buzzers bleus (OPEN)
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   
                   if (canAnimate) {
                     e.preventDefault();
                     
-                    // Appeler handleBuzzerPress seulement si cliquable (ou pendant COLLECTING)
-                    if (buzzerStyle.isClickable || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING) {
+                    // Appeler handleBuzzerPress seulement si cliquable
+                    if (buzzerStyle.isClickable) {
                       handleBuzzerPress();
                     }
                   }
@@ -2357,7 +2358,7 @@ export default function Player() {
                   color: "#fff",
                   fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
                   fontWeight: 800,
-                  cursor: (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING) ? "pointer" : "default",
+                  cursor: effectiveBuzzerState === BUZZER_STATES.OPEN ? "pointer" : "default",
                   touchAction: "manipulation",
                   WebkitTapHighlightColor: "transparent",
                   userSelect: "none",
@@ -2366,33 +2367,32 @@ export default function Player() {
                   // Pas d'animation automatique, seulement au clic/touch
                 }}
                 onMouseDown={(e) => {
-                  // Animation visuelle seulement pour les buzzers bleus (OPEN ou COLLECTING)
-                  // Vérifier buzzerState (Firestore) aussi pour détecter COLLECTING immédiatement
-                  const canAnimate = (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING);
+                  // Animation visuelle seulement pour les buzzers bleus (OPEN)
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   if (canAnimate) {
                     e.currentTarget.style.transform = "scale(0.95)";
                     e.currentTarget.style.background = "#2563eb";
                   }
                 }}
                 onMouseUp={(e) => {
-                  // Réinitialiser seulement si on était en OPEN ou COLLECTING
-                  const canAnimate = (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING);
+                  // Réinitialiser seulement si on était en OPEN
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   if (canAnimate) {
                     e.currentTarget.style.transform = "scale(1)";
                     e.currentTarget.style.background = buzzerStyle.background;
                   }
                 }}
                 onMouseLeave={(e) => {
-                  // Réinitialiser seulement si on était en OPEN ou COLLECTING
-                  const canAnimate = (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING);
+                  // Réinitialiser seulement si on était en OPEN
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   if (canAnimate) {
                     e.currentTarget.style.transform = "scale(1)";
                     e.currentTarget.style.background = buzzerStyle.background;
                   }
                 }}
                 onTouchEnd={(e) => {
-                  // Réinitialiser seulement si on était en OPEN ou COLLECTING
-                  const canAnimate = (effectiveBuzzerState === BUZZER_STATES.OPEN || effectiveBuzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.COLLECTING);
+                  // Réinitialiser seulement si on était en OPEN
+                  const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   if (canAnimate) {
                     e.currentTarget.style.transform = "scale(1)";
                     e.currentTarget.style.background = buzzerStyle.background;
@@ -2409,7 +2409,7 @@ export default function Player() {
                 BUZZER
               </button>
               
-              {/* Messages de bonne/mauvaise réponse (affichés en dessous) - seulement en LOCKED, pas en COLLECTING */}
+              {/* Messages de bonne/mauvaise réponse (affichés en dessous) - seulement en LOCKED */}
               {effectiveBuzzerState === BUZZER_STATES.LOCKED && !isWaitingVerification && (
                 <div 
                   style={{ 

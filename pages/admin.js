@@ -69,7 +69,6 @@ import {
   lockPlayerBuzz,
   resetPlayerBuzzLock,
   resetAllPlayerBuzzLocks,
-  finalizeBuzzerSelection,
   getTimingConfig,
 } from "../lib/firebase-helpers";
 
@@ -494,7 +493,6 @@ function AdminInner() {
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
-  const [buzzerCollectingUntil, setBuzzerCollectingUntil] = useState(null);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
   const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
@@ -791,12 +789,6 @@ function AdminInner() {
         setBuzzerPoints(Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS);
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
-        // buzzerCollectingUntil peut être un Timestamp Firestore
-        if (d.buzzerCollectingUntil && typeof d.buzzerCollectingUntil.toMillis === "function") {
-          setBuzzerCollectingUntil(d.buzzerCollectingUntil);
-        } else {
-          setBuzzerCollectingUntil(null);
-        }
       },
       (e) => console.error("onSnapshot state error:", e)
     );
@@ -1172,56 +1164,6 @@ function AdminInner() {
     isRevealRef.current = !!isRevealAnswerPhase;
   }, [isRevealAnswerPhase]);
 
-  /* === Timer pour finaliser la sélection du buzzer après la fenêtre de collecte === */
-  useEffect(() => {
-    if (!isBuzzerMode || buzzerState !== BUZZER_STATES.COLLECTING || !buzzerCollectingUntil) {
-      return;
-    }
-
-    const checkAndFinalize = async () => {
-      try {
-        const now = Date.now();
-        let untilMs;
-        
-        // Gérer le cas où buzzerCollectingUntil est un Timestamp Firestore
-        if (buzzerCollectingUntil && typeof buzzerCollectingUntil.toMillis === "function") {
-          untilMs = buzzerCollectingUntil.toMillis();
-        } else if (typeof buzzerCollectingUntil === "number") {
-          untilMs = buzzerCollectingUntil;
-        } else {
-          // Format inattendu, ne pas finaliser
-          return;
-        }
-        
-        if (now >= untilMs) {
-          // Fenêtre fermée, finaliser la sélection
-          console.log("[Admin] Finalizing buzzer selection, window closed", { now, untilMs, diff: now - untilMs });
-          const result = await finalizeBuzzerSelection(db);
-          if (result.ok) {
-            console.log("[Admin] Buzzer selection finalized successfully", { selectedPlayerId: result.selectedPlayerId });
-          } else if (result.reason !== "window-still-open") {
-            console.warn("[Admin] Failed to finalize buzzer selection:", result.reason);
-          }
-        } else {
-          // Log pour debug : combien de temps reste-t-il ?
-          const remaining = untilMs - now;
-          if (remaining < 200) { // Log seulement quand il reste moins de 200ms
-            console.log("[Admin] Buzzer collection window closing soon", { remaining });
-          }
-        }
-      } catch (e) {
-        console.error("[Admin] Error checking buzzer collection window:", e);
-      }
-    };
-
-    // Vérifier immédiatement
-    checkAndFinalize();
-
-    // Vérifier périodiquement (toutes les 100ms pour être réactif)
-    const interval = setInterval(checkAndFinalize, 100);
-
-    return () => clearInterval(interval);
-  }, [isBuzzerMode, buzzerState, buzzerCollectingUntil]);
 
   /* === Contrôle clavier EleyBuzz (touches 1, 2, 3) === */
   useEffect(() => {
@@ -2488,14 +2430,14 @@ function AdminInner() {
         buzzerMessageType: "correct",
       });
 
-      // Reset après 5 secondes
+      // Reset après 1 seconde (au lieu de 5)
       setTimeout(async () => {
         await resetBuzzerState(db, "idle");
         await updateDoc(stateRef, {
           buzzerMessage: null,
           buzzerMessageType: null,
         });
-      }, buzzerCorrectMessageDurationMs);
+      }, 1000); // 1 seconde au lieu de buzzerCorrectMessageDurationMs
     } catch (e) {
       console.error("handleBuzzerCorrect error:", e);
       setNotice("Erreur lors de l'attribution des points");
@@ -2508,38 +2450,39 @@ function AdminInner() {
     if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
     try {
       const wrongPlayerId = firstPlayerId;
+      const stateRef = doc(db, "quiz", "state");
       
       // Retirer les points de pénalité du score EleyBuzz (peut aller en négatif)
       await awardBuzzerPoints(db, wrongPlayerId, -buzzerWrongPenalty);
       
       // Lock le joueur qui s'est trompé avec un cooldown de 20 secondes
-      // Le cooldown commence APRÈS le message "Mauvaise réponse" (3s)
+      // Le cooldown commence IMMÉDIATEMENT (pas de délai)
       await lockPlayerBuzz(db, wrongPlayerId, buzzerCooldownMs);
 
-      // Afficher message temporaire
-      const stateRef = doc(db, "quiz", "state");
+      // Afficher message temporaire (mais ne pas bloquer le reste)
       await updateDoc(stateRef, {
         buzzerMessage: "Mauvaise réponse !",
         buzzerMessageType: "wrong",
       });
 
-      // Reset après 3 secondes et réouvrir le buzzer
+      // DÉBLOQUER IMMÉDIATEMENT les autres joueurs et réouvrir le buzzer (sans délai)
       // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
       // IMPORTANT : Cela débloque aussi tous les joueurs qui étaient punis avant (condition de libération)
+      await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
+      await resetBuzzerState(db, "open");
+      
+      // Le message "Mauvaise réponse" reste affiché mais n'empêche pas le buzzer d'être ouvert
+      // On le nettoie après un court délai (juste pour l'affichage, pas pour bloquer)
       setTimeout(async () => {
         try {
-          // Débloquer tous les joueurs SAUF celui qui vient de se tromper
-          // Cela libère automatiquement tous les joueurs qui étaient punis avant
-          await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
-          await resetBuzzerState(db, "open");
           await updateDoc(stateRef, {
             buzzerMessage: null,
             buzzerMessageType: null,
           });
         } catch (e) {
-          console.error("[handleBuzzerWrong] Reset error:", e);
+          console.error("[handleBuzzerWrong] Clear message error:", e);
         }
-      }, buzzerWrongMessageDurationMs);
+      }, 1000); // Nettoyer le message après 1 seconde (mais le buzzer est déjà ouvert)
 
       // Cooldown de 20 secondes : si personne ne rebuzz, débloquer le joueur après 20s
       setTimeout(async () => {
@@ -2556,7 +2499,7 @@ function AdminInner() {
         } catch (e) {
           console.error("[handleBuzzerWrong] Cooldown unlock error:", e);
         }
-      }, buzzerWrongMessageDurationMs + buzzerCooldownMs);
+      }, buzzerCooldownMs); // 20 secondes directement (plus besoin d'ajouter buzzerWrongMessageDurationMs)
     } catch (e) {
       console.error("handleBuzzerWrong error:", e);
       setNotice("Erreur lors du traitement de la mauvaise réponse");
