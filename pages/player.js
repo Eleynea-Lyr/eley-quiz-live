@@ -2113,10 +2113,11 @@ export default function Player() {
     // Utiliser l'état optimiste pour le buzzerState ET firstPlayerId (affichage immédiat)
     // Cela permet d'afficher immédiatement "À toi de répondre !" pour le joueur qui buzz
     // et "Le buzzer est verrouillé..." pour les autres, sans attendre Firestore
-    const effectiveBuzzerState = optimisticBuzzerState || buzzerState;
+    // Garde-fou pour la production : s'assurer que buzzerState a toujours une valeur valide
+    const effectiveBuzzerState = optimisticBuzzerState || buzzerState || BUZZER_STATES.IDLE;
     // Utiliser optimisticFirstPlayerId pour l'affichage immédiat (UX améliorée)
     // Firestore confirmera ensuite qui peut vraiment répondre (sécurité)
-    const effectiveFirstPlayerId = optimisticFirstPlayerId || firstPlayerId;
+    const effectiveFirstPlayerId = optimisticFirstPlayerId || firstPlayerId || null;
     
     // Permettre les clics si le buzzer est ouvert
     const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz && (!buzzerCooldownUntilMs || now >= buzzerCooldownUntilMs);
@@ -2249,6 +2250,18 @@ export default function Player() {
           // États OPEN, LOCKED : Affichage du buzzer
           // Déterminer la couleur et l'état du buzzer
           const getBuzzerStyle = () => {
+            // Garde-fou pour la production : s'assurer que effectiveBuzzerState est valide
+            if (!effectiveBuzzerState || typeof effectiveBuzzerState !== 'string') {
+              // Fallback si l'état n'est pas valide (peut arriver en production)
+              return {
+                background: "#6b7280",
+                border: "#fff",
+                shadow: "0 8px 24px rgba(107, 114, 128, 0.3)",
+                isClickable: false,
+                isAnimating: false,
+              };
+            }
+
             // Si OPEN : bleu (actif)
             if (effectiveBuzzerState === BUZZER_STATES.OPEN) {
               return {
@@ -2265,7 +2278,8 @@ export default function Player() {
               // Pendant la vérification : bleu pour TOUS ceux qui ont buzzé
               // On reste en bleu tant que le serveur n'a pas confirmé (firstPlayerId === null)
               // Pas d'animation automatique, seulement au clic/touch
-              const isWaitingVerification = firstPlayerId === null && (isBuzzing || optimisticFirstPlayerId === playerId);
+              // Garde-fou pour la production : vérifier que les valeurs sont valides
+              const isWaitingVerification = (!firstPlayerId || firstPlayerId === null) && (isBuzzing || optimisticFirstPlayerId === playerId);
               
               if (isWaitingVerification) {
                 return {
@@ -2279,7 +2293,8 @@ export default function Player() {
               
               // Une fois le serveur a confirmé (firstPlayerId !== null) :
               // Premier joueur confirmé par le serveur : jaune (utiliser firstPlayerId, pas effectiveFirstPlayerId)
-              if (firstPlayerId === playerId) {
+              // Garde-fou pour la production : vérifier que les valeurs sont valides
+              if (firstPlayerId && playerId && firstPlayerId === playerId) {
                 return {
                   background: "#facc15",
                   border: "#fff",
@@ -2311,7 +2326,8 @@ export default function Player() {
           
           const buzzerStyle = getBuzzerStyle();
           // isWaitingVerification : le serveur n'a pas encore confirmé qui est le premier
-          const isWaitingVerification = firstPlayerId === null && (isBuzzing || optimisticFirstPlayerId === playerId);
+          // Garde-fou pour la production : vérifier que les valeurs sont valides
+          const isWaitingVerification = (!firstPlayerId || firstPlayerId === null) && (isBuzzing || optimisticFirstPlayerId === playerId);
           
           return (
             <>
@@ -2401,7 +2417,7 @@ export default function Player() {
                 title={
                   buzzerStyle.isClickable 
                     ? "Appuie pour buzzer !" 
-                    : firstPlayerId === playerId 
+                    : (firstPlayerId && playerId && firstPlayerId === playerId)
                       ? "À toi de répondre !" 
                       : "Le buzzer est verrouillé"
                 }
@@ -2417,22 +2433,25 @@ export default function Player() {
                     opacity: 0.9, 
                     fontSize: 18,
                     color: (() => {
-                      if (playerId === firstPlayerId && buzzerMessageType === "correct") return "#10b981";
-                      if (playerId === firstPlayerId && buzzerMessageType === "wrong") return "#ef4444";
+                      // Garde-fou pour la production : vérifier que les valeurs sont valides
+                      if (playerId && firstPlayerId && playerId === firstPlayerId && buzzerMessageType === "correct") return "#10b981";
+                      if (playerId && firstPlayerId && playerId === firstPlayerId && buzzerMessageType === "wrong") return "#ef4444";
                       return undefined;
                     })(),
-                    fontWeight: playerId === firstPlayerId ? 700 : 400,
+                    fontWeight: (playerId && firstPlayerId && playerId === firstPlayerId) ? 700 : 400,
                     lineHeight: 1.6,
                   }}
                   dangerouslySetInnerHTML={{ 
                     __html: (() => {
-                      if (playerId === firstPlayerId && buzzerMessageType === "correct") {
+                      // Garde-fou pour la production : vérifier que les valeurs sont valides
+                      const isFirstPlayer = playerId && firstPlayerId && playerId === firstPlayerId;
+                      if (isFirstPlayer && buzzerMessageType === "correct") {
                         return ELEYBUZZ_PLAYER_MESSAGES.correctAnswer;
                       }
-                      if (playerId === firstPlayerId && buzzerMessageType === "wrong") {
+                      if (isFirstPlayer && buzzerMessageType === "wrong") {
                         return ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer;
                       }
-                      if (playerId === firstPlayerId) {
+                      if (isFirstPlayer) {
                         return ELEYBUZZ_PLAYER_MESSAGES.yourTurn;
                       }
                       if (buzzerMessageType === "correct") {
@@ -2442,7 +2461,8 @@ export default function Player() {
                         return ELEYBUZZ_PLAYER_MESSAGES.tryYourChance;
                       }
                       // Si le buzzer est gris (pas le premier joueur), afficher le message "trop lent"
-                      if (firstPlayerId !== null && firstPlayerId !== playerId) {
+                      // Garde-fou pour la production : vérifier que les valeurs sont valides
+                      if (firstPlayerId && firstPlayerId !== null && playerId && firstPlayerId !== playerId) {
                         return ELEYBUZZ_PLAYER_MESSAGES.tooSlow;
                       }
                       return null; // Pas de message si rien de spécial
