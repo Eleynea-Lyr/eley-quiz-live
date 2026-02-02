@@ -43,7 +43,7 @@ import {
   ensureAwardsForQuestionTx,
 } from "../lib/firebase-helpers";
 
-import { SCREEN_MESSAGES } from "../lib/messages";
+import { SCREEN_MESSAGES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
 
 // ====== Constantes spécifiques à screen.js ======
 
@@ -169,11 +169,14 @@ function ScreenInner() {
   // Messages personnalisables
   const [podiumTitle, setPodiumTitle] = useState(SCREEN_MESSAGES.podiumTitle);
   const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
+  const [screenEleyBuzzMessages, setScreenEleyBuzzMessages] = useState(ELEYBUZZ_SCREEN_MESSAGES);
 
   // Leaderboard
   const [playersLB, setPlayersLB] = useState([]);
+  const [teamsLB, setTeamsLB] = useState([]);
   const [leaderboardTopN, setLeaderboardTopN] = useState(DEFAULT_LEADERBOARD_TOP_N);
-  const awardGuardRef = useRef({}); // utilisé plus tard pour l’attribution des points
+  const [leaderboardView, setLeaderboardView] = useState("teams"); // "teams" | "players"
+  const awardGuardRef = useRef({}); // utilisé plus tard pour l'attribution des points
 
   // Fin de manche (poussée par l’admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
@@ -284,6 +287,7 @@ function ScreenInner() {
           score: Number(v.score || 0),
           buzzScore: Number(v.buzzScore || 0),
           color: v.color || null,
+          teamId: v.teamId || null,
           isKicked: !!v.isKicked,
           lastDelta: Number(v.lastDelta || 0),
           lastDeltaForQuestionId: v.lastDeltaForQuestionId || null,
@@ -291,6 +295,26 @@ function ScreenInner() {
         };
       });
       setPlayersLB(arr);
+    });
+    return () => unsub();
+  }, []);
+
+  /* ----------------------------- Écouter teams ------------------------------ */
+  useEffect(() => {
+    const col = collection(doc(db, "quiz", "state"), "teams");
+    const unsub = onSnapshot(col, (snap) => {
+      const arr = snap.docs.map((d) => {
+        const v = d.data() || {};
+        return {
+          id: d.id,
+          name: v.name || "",
+          teamQuizScore: Number(v.teamQuizScore || 0),
+          color: v.color || null,
+          memberIds: Array.isArray(v.memberIds) ? v.memberIds : [],
+          isKicked: !!v.isKicked,
+        };
+      });
+      setTeamsLB(arr);
     });
     return () => unsub();
   }, []);
@@ -310,6 +334,13 @@ function ScreenInner() {
       // taille du top
       const topN = Number.isFinite(d?.leaderboardTopN) ? d.leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
       setLeaderboardTopN(topN);
+
+      // Vue du leaderboard (Équipes ou Joueurs)
+      if (d?.leaderboardView === "players" || d?.leaderboardView === "teams") {
+        setLeaderboardView(d.leaderboardView);
+      } else {
+        setLeaderboardView("teams"); // Par défaut : équipes
+      }
 
       // bornes quiz & manches
       setQuizEndSec(typeof d?.endOffsetSec === "number" ? d.endOffsetSec : null);
@@ -341,6 +372,16 @@ function ScreenInner() {
         ? d.screenQuiz.finalPodiumTitle
         : SCREEN_MESSAGES.finalPodiumTitle;
       setFinalPodiumTitle(customFinalPodiumTitle);
+      
+      // Messages EleyBuzz Screen
+      if (d.screenEleyBuzz) {
+        setScreenEleyBuzzMessages({
+          ...ELEYBUZZ_SCREEN_MESSAGES,
+          ...d.screenEleyBuzz,
+        });
+      } else {
+        setScreenEleyBuzzMessages(ELEYBUZZ_SCREEN_MESSAGES);
+      }
 
       setConfigLoaded(true);
     });
@@ -513,137 +554,266 @@ function ScreenInner() {
 
   /* ----------------------- Leaderboard (tri & top N) ----------------------- */
   const leaderboard = useMemo(() => {
-    const rows = (playersLB || [])
-      .filter((p) => !p.isKicked)
-      .slice();
+    if (leaderboardView === "teams") {
+      // Leaderboard par équipes
+      const rows = (teamsLB || [])
+        .filter((t) => !t.isKicked)
+        .map((t) => ({
+          id: t.id,
+          name: t.name || "",
+          score: Number(t.teamQuizScore || 0),
+          _nameKey: normalizeNameAlpha(t.name || ""),
+        }))
+        .sort((a, b) => {
+          if (a.score !== b.score) return b.score - a.score;
+          return a._nameKey.localeCompare(b._nameKey);
+        });
 
-    rows.sort((a, b) => {
-      const sa = Number(a.score || 0);
-      const sb = Number(b.score || 0);
-      if (sa !== sb) return sb - sa; // score desc
-      const ak = a._nameKey;
-      const bk = b._nameKey;
-      if (ak < bk) return -1;
-      if (ak > bk) return 1;
-      return 0;
-    });
+      // Rangs avec égalités
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = p.score;
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
+      });
 
-    // Rangs avec égalités
-    let lastScore = null;
-    let lastRank = 0;
-    rows.forEach((p, i) => {
-      const sc = Number(p.score || 0);
-      if (i === 0) {
-        p._rank = 1;
-        lastScore = sc;
-        lastRank = 1;
-      } else if (sc === lastScore) {
-        p._rank = lastRank;
-      } else {
-        p._rank = i + 1;
-        lastScore = sc;
-        lastRank = p._rank;
-      }
-    });
+      const top = Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
+      return rows.slice(0, top);
+    } else {
+      // Leaderboard par joueurs (comportement original)
+      // IMPORTANT: Filtrer les joueurs qui n'ont pas d'équipe
+      const rows = (playersLB || [])
+        .filter((p) => !p.isKicked && p.teamId) // Un joueur doit avoir une équipe
+        .slice();
 
-    const top = Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
-    return rows.slice(0, top);
-  }, [playersLB, leaderboardTopN]);
+      rows.sort((a, b) => {
+        const sa = Number(a.score || 0);
+        const sb = Number(b.score || 0);
+        if (sa !== sb) return sb - sa; // score desc
+        const ak = a._nameKey;
+        const bk = b._nameKey;
+        if (ak < bk) return -1;
+        if (ak > bk) return 1;
+        return 0;
+      });
+
+      // Rangs avec égalités
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = Number(p.score || 0);
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
+      });
+
+      const top = Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N;
+      return rows.slice(0, top);
+    }
+  }, [playersLB, teamsLB, leaderboardView, leaderboardTopN]);
 
   // Podium (fin de quiz) : basé sur les RANGS (1, 2, 3) comme dans le classement
   // Score final = score quiz uniquement (sans EleyBuzz pour la fin de quiz normale)
   const podium = useMemo(() => {
-    const rows = (playersLB || [])
-      .filter((p) => !p.isKicked)
-      .map((p) => {
-        const scoreQuiz = Number(p.score || 0);
-        return {
-          id: p.id,
-          name: p.name || "",
-          score: scoreQuiz,
-          _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
-        };
-      })
-      .sort((a, b) => {
-        // Tri par score quiz uniquement, puis nom
-        if (a.score !== b.score) return b.score - a.score;
-        return a._nameKey.localeCompare(b._nameKey);
+    if (leaderboardView === "teams") {
+      // Podium par équipes
+      const rows = (teamsLB || [])
+        .filter((t) => !t.isKicked)
+        .map((t) => {
+          const scoreQuiz = Number(t.teamQuizScore || 0);
+          return {
+            id: t.id,
+            name: t.name || "",
+            score: scoreQuiz,
+            _nameKey: normalizeNameAlpha(t.name || ""),
+          };
+        })
+        .sort((a, b) => {
+          if (a.score !== b.score) return b.score - a.score;
+          return a._nameKey.localeCompare(b._nameKey);
+        });
+
+      // Calcul des rangs "compétition" : 1,1,3,4… (basé sur score équipe quiz)
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = p.score;
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
       });
 
-    // Calcul des rangs "compétition" : 1,1,3,4… (basé sur score quiz)
-    let lastScore = null;
-    let lastRank = 0;
-    rows.forEach((p, i) => {
-      const sc = p.score;
-      if (i === 0) {
-        p._rank = 1;
-        lastScore = sc;
-        lastRank = 1;
-      } else if (sc === lastScore) {
-        p._rank = lastRank;
-      } else {
-        p._rank = i + 1;
-        lastScore = sc;
-        lastRank = p._rank;
-      }
-    });
+      const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
+      const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
+      const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
 
-    // Groupes de médailles alignés sur le classement (basé sur score quiz)
-    const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
-    const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
-    const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
+      return { gold, silver, bronze };
+    } else {
+      // Podium par joueurs (comportement original)
+      // IMPORTANT: Filtrer les joueurs qui n'ont pas d'équipe
+      const rows = (playersLB || [])
+        .filter((p) => !p.isKicked && p.teamId) // Un joueur doit avoir une équipe
+        .map((p) => {
+          const scoreQuiz = Number(p.score || 0);
+          return {
+            id: p.id,
+            name: p.name || "",
+            score: scoreQuiz,
+            _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+          };
+        })
+        .sort((a, b) => {
+          // Tri par score quiz uniquement, puis nom
+          if (a.score !== b.score) return b.score - a.score;
+          return a._nameKey.localeCompare(b._nameKey);
+        });
 
-    return { gold, silver, bronze };
-  }, [playersLB]);
+      // Calcul des rangs "compétition" : 1,1,3,4… (basé sur score quiz)
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = p.score;
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
+      });
 
-  // Podium final (Score Final de la soirée) : Quiz + EleyBuzz
+      // Groupes de médailles alignés sur le classement (basé sur score quiz)
+      const gold = rows.filter((p) => p.score > 0 && p._rank === 1);
+      const silver = rows.filter((p) => p.score > 0 && p._rank === 2);
+      const bronze = rows.filter((p) => p.score > 0 && p._rank === 3);
+
+      return { gold, silver, bronze };
+    }
+  }, [playersLB, teamsLB, leaderboardView]);
+
+  // Podium final (Score Final de la soirée) : Quiz + EleyBuzz (joueurs) ou Score Équipe Quiz (équipes)
   const finalPodium = useMemo(() => {
-    const rows = (playersLB || [])
-      .filter((p) => !p.isKicked)
-      .map((p) => {
-        const scoreQuiz = Number(p.score || 0);
-        const buzzScore = Number(p.buzzScore || 0);
-        const scoreFinal = scoreQuiz + buzzScore;
-        return {
-          id: p.id,
-          name: p.name || "",
-          score: scoreQuiz,
-          buzzScore: buzzScore,
-          scoreFinal: scoreFinal,
-          _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
-        };
-      })
-      .sort((a, b) => {
-        // Tri par score final (quiz + EleyBuzz), puis nom
-        if (a.scoreFinal !== b.scoreFinal) return b.scoreFinal - a.scoreFinal;
-        return a._nameKey.localeCompare(b._nameKey);
+    if (leaderboardView === "teams") {
+      // Podium final par équipes (score équipe quiz uniquement, pas de bonus)
+      const rows = (teamsLB || [])
+        .filter((t) => !t.isKicked)
+        .map((t) => {
+          const scoreFinal = Number(t.teamQuizScore || 0);
+          return {
+            id: t.id,
+            name: t.name || "",
+            scoreFinal: scoreFinal,
+            _nameKey: normalizeNameAlpha(t.name || ""),
+          };
+        })
+        .sort((a, b) => {
+          if (a.scoreFinal !== b.scoreFinal) return b.scoreFinal - a.scoreFinal;
+          return a._nameKey.localeCompare(b._nameKey);
+        });
+
+      // Calcul des rangs "compétition" : 1,1,3,4… (basé sur score équipe quiz)
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = p.scoreFinal;
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
       });
 
-    // Calcul des rangs "compétition" : 1,1,3,4… (basé sur scoreFinal)
-    let lastScore = null;
-    let lastRank = 0;
-    rows.forEach((p, i) => {
-      const sc = p.scoreFinal;
-      if (i === 0) {
-        p._rank = 1;
-        lastScore = sc;
-        lastRank = 1;
-      } else if (sc === lastScore) {
-        p._rank = lastRank;
-      } else {
-        p._rank = i + 1;
-        lastScore = sc;
-        lastRank = p._rank;
-      }
-    });
+      const gold = rows.filter((p) => p.scoreFinal > 0 && p._rank === 1);
+      const silver = rows.filter((p) => p.scoreFinal > 0 && p._rank === 2);
+      const bronze = rows.filter((p) => p.scoreFinal > 0 && p._rank === 3);
 
-    // Groupes de médailles alignés sur le classement (basé sur scoreFinal)
-    const gold = rows.filter((p) => p.scoreFinal > 0 && p._rank === 1);
-    const silver = rows.filter((p) => p.scoreFinal > 0 && p._rank === 2);
-    const bronze = rows.filter((p) => p.scoreFinal > 0 && p._rank === 3);
+      return { gold, silver, bronze, all: rows };
+    } else {
+      // Podium final par joueurs (comportement original : Quiz + EleyBuzz)
+      // IMPORTANT: Filtrer les joueurs qui n'ont pas d'équipe
+      const rows = (playersLB || [])
+        .filter((p) => !p.isKicked && p.teamId) // Un joueur doit avoir une équipe
+        .map((p) => {
+          const scoreQuiz = Number(p.score || 0);
+          const buzzScore = Number(p.buzzScore || 0);
+          const scoreFinal = scoreQuiz + buzzScore;
+          return {
+            id: p.id,
+            name: p.name || "",
+            score: scoreQuiz,
+            buzzScore: buzzScore,
+            scoreFinal: scoreFinal,
+            _nameKey: p._nameKey || normalizeNameAlpha(p.name || ""),
+          };
+        })
+        .sort((a, b) => {
+          // Tri par score final (quiz + EleyBuzz), puis nom
+          if (a.scoreFinal !== b.scoreFinal) return b.scoreFinal - a.scoreFinal;
+          return a._nameKey.localeCompare(b._nameKey);
+        });
 
-    return { gold, silver, bronze, all: rows };
-  }, [playersLB]);
+      // Calcul des rangs "compétition" : 1,1,3,4… (basé sur scoreFinal)
+      let lastScore = null;
+      let lastRank = 0;
+      rows.forEach((p, i) => {
+        const sc = p.scoreFinal;
+        if (i === 0) {
+          p._rank = 1;
+          lastScore = sc;
+          lastRank = 1;
+        } else if (sc === lastScore) {
+          p._rank = lastRank;
+        } else {
+          p._rank = i + 1;
+          lastScore = sc;
+          lastRank = p._rank;
+        }
+      });
+
+      // Groupes de médailles alignés sur le classement (basé sur scoreFinal)
+      const gold = rows.filter((p) => p.scoreFinal > 0 && p._rank === 1);
+      const silver = rows.filter((p) => p.scoreFinal > 0 && p._rank === 2);
+      const bronze = rows.filter((p) => p.scoreFinal > 0 && p._rank === 3);
+
+      return { gold, silver, bronze, all: rows };
+    }
+  }, [playersLB, teamsLB, leaderboardView]);
 
 
   /* ---------------- Dérivés & logique bornée par la manche ---------------- */
@@ -905,7 +1075,56 @@ function ScreenInner() {
     !isRoundBreak
   );
 
-  /* ===== Attribution des points : déclenchée pendant la fenêtre de révélation ===== */
+  /* ===== Attribution des points équipe : déclenchée immédiatement quand un award est créé ===== */
+  useEffect(() => {
+    const qid = currentQuestion?.id || null;
+    if (!qid) return;
+
+    // Écouter les awards pour cette question et déclencher l'attribution des points équipe immédiatement
+    const awardsCol = collection(db, "answers", qid, "awards");
+    let lastDocIds = new Set();
+    
+    // Initialiser avec les awards existants
+    getDocs(awardsCol).then((snap) => {
+      snap.docs.forEach(d => lastDocIds.add(d.id));
+    }).catch((e) => {
+      console.error("[Screen] Error initializing awards listener:", e);
+    });
+
+    const unsub = onSnapshot(awardsCol, (snap) => {
+      // Détecter les nouveaux awards en comparant les IDs (plus fiable que le count)
+      const currentDocIds = new Set(snap.docs.map(d => d.id));
+      const newDocIds = Array.from(currentDocIds).filter(id => !lastDocIds.has(id));
+      
+      if (newDocIds.length > 0 && !awardGuardRef.current[qid]) {
+        // Mettre à jour lastDocIds avant l'appel pour éviter les doubles détections
+        lastDocIds = currentDocIds;
+        
+        awardGuardRef.current[qid] = "pending";
+        // Appeler immédiatement (sans délai) pour accélérer l'attribution
+        ensureAwardsForQuestionTx(db, qid).then(() => {
+          // Succès, garder le guard pour éviter les doubles appels
+          // Le guard sera réinitialisé quand on change de question
+        }).catch((e) => {
+          console.error("[Screen] awards TX error:", e);
+          delete awardGuardRef.current[qid]; // autorise un retry si la TX échoue
+        });
+      } else if (snap.docs.length > 0) {
+        // Mettre à jour lastDocIds même si on n'a pas déclenché d'appel
+        lastDocIds = currentDocIds;
+      }
+    }, (e) => {
+      console.error("[Screen] awards listener error:", e);
+    });
+
+    return () => {
+      unsub();
+      // Réinitialiser le guard quand on change de question
+      delete awardGuardRef.current[qid];
+    };
+  }, [currentQuestion?.id]);
+
+  /* ===== Attribution des points : déclenchée pendant la fenêtre de révélation (fallback) ===== */
   useEffect(() => {
     const qid = currentQuestion?.id || null;
     if (!qid) return;
@@ -1339,40 +1558,40 @@ function ScreenInner() {
             <div 
               style={{ fontSize: "1.5rem", opacity: 0.85, maxWidth: "min(800px, 90%)" }}
               dangerouslySetInnerHTML={{ 
-                __html: addSmartLineBreaks("Écoute attentivement la question et appuie vite sur le buzzer de ton téléphone si tu connais la réponse.")
+                __html: addSmartLineBreaks(screenEleyBuzzMessages.idle)
                   .replace(/\.\s+/g, ".<br>")
               }}
             />
           )}
 
-          {buzzerState === BUZZER_STATES.OPEN && (
-            <div style={{ fontSize: "1.5rem", opacity: 0.85, color: "#22c55e", fontWeight: 700 }}>
-              Le buzzer est OUVERT ! Préparez-vous à buzzer !
+          {buzzerState === BUZZER_STATES.OPEN && !buzzerMessage && (
+            <div style={{ fontSize: "1.5rem", opacity: 0.85, color: "#3b82f6", fontWeight: 700 }}>
+              Le buzzer est ouvert, préparez-vous à buzzer !
             </div>
           )}
 
           {buzzerState === BUZZER_STATES.LOCKED && firstPlayerName && !buzzerMessage && (
             <div>
               <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
-                {firstPlayerName} a buzzé !
+                {firstPlayerName} {screenEleyBuzzMessages.locked}
               </div>
               <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
-                On attend sa réponse...
+                {screenEleyBuzzMessages.waitingAnswer}
               </div>
             </div>
           )}
 
-          {/* Messages temporaires */}
-          {buzzerMessage && buzzerMessageType && (
+          {/* Messages temporaires - seulement pour "correct", pas pour "wrong" */}
+          {buzzerMessage && buzzerMessageType === "correct" && (
             <div
               style={{
                 fontSize: "2.5rem",
                 fontWeight: 800,
                 padding: "20px 40px",
                 borderRadius: 12,
-                background: buzzerMessageType === "correct" ? "#0b3a1e" : "#7f1d1d",
-                border: `2px solid ${buzzerMessageType === "correct" ? "#22c55e" : "#dc2626"}`,
-                color: buzzerMessageType === "correct" ? "#86efac" : "#fecaca",
+                background: "#0b3a1e",
+                border: "2px solid #22c55e",
+                color: "#86efac",
                 animation: "fadeIn 200ms ease-in",
               }}
             >
@@ -1569,7 +1788,7 @@ function ScreenInner() {
             textAlign: "center",
           }}
         >
-          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>{finalPodiumTitle}</h1>
+          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Fin de la soirée, Voici le podium final :</h1>
 
           {finalPodium.gold.length + finalPodium.silver.length + finalPodium.bronze.length === 0 ? (
             <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
@@ -1577,10 +1796,12 @@ function ScreenInner() {
             </div>
           ) : (
             <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
-              {/* 🥇 Or — 2× plus gros */}
+              {/* 🥇 Or / ⭐ Or — 2× plus gros */}
               {finalPodium.gold.length > 0 && (
                 <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                  <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>
+                    {leaderboardView === "teams" ? "🥇" : "💛"} Or
+                  </div>
                   {finalPodium.gold.map((p) => (
                     <div
                       key={p.id}
@@ -1596,10 +1817,12 @@ function ScreenInner() {
                 </div>
               )}
 
-              {/* 🥈 Argent */}
+              {/* 🥈 Argent / ⭐ Argent */}
               {finalPodium.silver.length > 0 && (
                 <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                    {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
+                  </div>
                   {finalPodium.silver.map((p) => (
                     <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                       <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -1612,10 +1835,12 @@ function ScreenInner() {
                 </div>
               )}
 
-              {/* 🥉 Bronze */}
+              {/* 🥉 Bronze / ⭐ Bronze */}
               {finalPodium.bronze.length > 0 && (
                 <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                    {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
+                  </div>
                   {finalPodium.bronze.map((p) => (
                     <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                       <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -1781,10 +2006,12 @@ function ScreenInner() {
               </div>
             ) : (
               <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
-                {/* 🥇 Or — 2× plus gros */}
+                {/* 🥇 Or / 💛 Or — 2× plus gros */}
                 {podium.gold.length > 0 && (
                   <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                    <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥇" : "💛"} Or
+                    </div>
                     {podium.gold.map((p) => (
                       <div
                         key={p.id}
@@ -1800,10 +2027,12 @@ function ScreenInner() {
                   </div>
                 )}
 
-                {/* 🥈 Argent */}
+                {/* 🥈 Argent / 🤍 Argent */}
                 {podium.silver.length > 0 && (
                   <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
+                    </div>
                     {podium.silver.map((p) => (
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -1816,10 +2045,12 @@ function ScreenInner() {
                   </div>
                 )}
 
-                {/* 🥉 Bronze */}
+                {/* 🥉 Bronze / 🤎 Bronze */}
                 {podium.bronze.length > 0 && (
                   <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
+                    </div>
                     {podium.bronze.map((p) => (
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -1848,10 +2079,12 @@ function ScreenInner() {
               </div>
             ) : (
               <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 8 }}>
-                {/* 🥇 Or — 2× plus gros */}
+                {/* 🥇 Or / 💛 Or — 2× plus gros */}
                 {podium.gold.length > 0 && (
                   <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 6 }}>🥇 Or</div>
+                    <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥇" : "💛"} Or
+                    </div>
                     {podium.gold.map((p) => (
                       <div
                         key={p.id}
@@ -1865,10 +2098,12 @@ function ScreenInner() {
                   </div>
                 )}
 
-                {/* 🥈 Argent */}
+                {/* 🥈 Argent / 🤍 Argent */}
                 {podium.silver.length > 0 && (
                   <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥈 Argent</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
+                    </div>
                     {podium.silver.map((p) => (
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -1881,10 +2116,12 @@ function ScreenInner() {
                   </div>
                 )}
 
-                {/* 🥉 Bronze */}
+                {/* 🥉 Bronze / 🤎 Bronze */}
                 {podium.bronze.length > 0 && (
                   <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>🥉 Bronze</div>
+                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
+                      {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
+                    </div>
                     {podium.bronze.map((p) => (
                       <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                         <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
@@ -2180,7 +2417,7 @@ function ScreenInner() {
         <div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
-              Classement
+              {leaderboardView === "teams" ? "⭐ Score des équipes" : "👤 Classement des joueurs"}
             </h3>
             <div style={{ opacity: 0.7, fontSize: 12 }}>
               Top {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
@@ -2211,7 +2448,21 @@ function ScreenInner() {
           {leaderboard.map((p, idx) => {
             const rank = Number(p._rank ?? (idx + 1));
             const s = Number(p.score || 0);
-            const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+            // Utiliser des médailles pour les équipes (or/argent/bronze), des cœurs colorés pour les joueurs
+            let medal = "";
+            let medalColor = null;
+            if (s > 0) {
+              if (rank === 1) {
+                medal = leaderboardView === "teams" ? "🥇" : "💛"; // Médailles pour équipes, cœurs pour joueurs
+                medalColor = null;
+              } else if (rank === 2) {
+                medal = leaderboardView === "teams" ? "🥈" : "🤍";
+                medalColor = null;
+              } else if (rank === 3) {
+                medal = leaderboardView === "teams" ? "🥉" : "🤎";
+                medalColor = null;
+              }
+            }
             const showDelta = Boolean(
               inRevealWindowForLB &&
               currentQuestionIdForLB &&
@@ -2244,7 +2495,19 @@ function ScreenInner() {
                         width: 10,
                         height: 10,
                         borderRadius: 3,
-                        background: p.color || "#64748b",
+                        background: (() => {
+                          if (leaderboardView === "teams") {
+                            const team = teamsLB.find((t) => t.id === p.id);
+                            return team?.color || "#64748b";
+                          } else {
+                            const player = playersLB.find((pl) => pl.id === p.id);
+                            if (player?.teamId) {
+                              const team = teamsLB.find((t) => t.id === player.teamId);
+                              return team?.color || player.color || "#64748b";
+                            }
+                            return player?.color || "#64748b";
+                          }
+                        })(),
                         border: "1px solid rgba(255,255,255,0.25)",
                         flex: "0 0 auto",
                       }}
@@ -2256,9 +2519,17 @@ function ScreenInner() {
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
+                        color: leaderboardView === "teams" ? (() => {
+                          const team = teamsLB.find((t) => t.id === p.id);
+                          return team?.color || "#e5e7eb";
+                        })() : undefined,
                       }}
                     >
-                      {p.name || "(sans nom)"} {medal}
+                      {p.name || "(sans nom)"} {medal && (
+                        <span style={{ color: medalColor || undefined }}>
+                          {medal}
+                        </span>
+                      )}
                     </span>
                   </div>
 
@@ -2286,6 +2557,10 @@ function ScreenInner() {
                     fontWeight: 800,
                     fontVariantNumeric: "tabular-nums",
                     letterSpacing: 0.2,
+                    color: leaderboardView === "teams" ? (() => {
+                      const team = teamsLB.find((t) => t.id === p.id);
+                      return team?.color || "#e5e7eb";
+                    })() : undefined,
                   }}
                   aria-label="score"
                   title={`${p.score} points`}

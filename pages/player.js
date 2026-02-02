@@ -44,6 +44,7 @@ import {
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
   DEFAULT_BUZZER_WRONG_PENALTY,
+  DEFAULT_BUZZER_POINTS,
 } from "../lib/constants";
 
 import {
@@ -60,6 +61,8 @@ import {
   getAnswerMode,
   isAliasName,
   validateName,
+  validateTeamName,
+  normalizeTeamName,
   messageForRank,
   finalScoreMessageForRank,
   medalForRank,
@@ -71,6 +74,9 @@ import {
   useMobileVH,
   recordFirstCorrectAndPredict,
   registerBuzzerPress,
+  createTeamTx,
+  joinTeamTx,
+  leaveTeamTx,
 } from "../lib/firebase-helpers";
 
 import { ELEYBUZZ_PLAYER_MESSAGES, SCREEN_MESSAGES } from "../lib/messages";
@@ -145,6 +151,7 @@ export default function Player() {
 
   // Leaderboard (fin de quiz)
   const [playersLB, setPlayersLB] = useState([]);
+  const [teamsLB, setTeamsLB] = useState([]);
 
   // Id local (persisté)
   const myIdRef = useRef(null);
@@ -186,6 +193,7 @@ export default function Player() {
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
   const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
+  const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [activeQuizKey, setActiveQuizKey] = useState(null);
 
   // Joueur / inscription
@@ -198,6 +206,18 @@ export default function Player() {
   const [isKicked, setIsKicked] = useState(false);
   const [rejectedNames, setRejectedNames] = useState([]);
   const selfRenameRef = useRef(false); // true si le joueur a déclenché un renommage
+
+  // Équipe
+  const [teamId, setTeamId] = useState(null);
+  const [teamName, setTeamName] = useState("");
+  const [teamColor, setTeamColor] = useState(null); // Couleur de l'équipe
+  const [teamMemberCount, setTeamMemberCount] = useState(0); // Nombre de membres dans l'équipe
+  const [teamQuizScore, setTeamQuizScore] = useState(0); // Score équipe quiz
+  const [needsTeamSelection, setNeedsTeamSelection] = useState(false);
+  const [teamInputName, setTeamInputName] = useState("");
+  const [availableTeams, setAvailableTeams] = useState([]);
+  const [teamSelectionMode, setTeamSelectionMode] = useState(null); // "create" | "join" | null
+  const [teamSearchQuery, setTeamSearchQuery] = useState(""); // Pour filtrer les équipes
 
   // Sentinelle fin de manche (posée côté Admin)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] = useState(null);
@@ -245,15 +265,9 @@ export default function Player() {
   const [buzzerState, setBuzzerState] = useState("idle");
   const [firstPlayerId, setFirstPlayerId] = useState(null);
   const [canBuzz, setCanBuzz] = useState(true);
-  const [buzzerCooldownUntilMs, setBuzzerCooldownUntilMs] = useState(null);
-  const [buzzerCooldownTick, setBuzzerCooldownTick] = useState(0); // Force re-render chaque seconde pour décompte fluide
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
-  // Ref pour mémoriser de manière persistante si le joueur est puni (évite les flashes)
-  // Utiliser un ref au lieu d'un state pour éviter les re-renders inutiles
-  const isPunishedRef = useRef(false);
-  // State pour forcer le re-render quand nécessaire
-  const [, setPunishedTick] = useState(0);
+  const [lastWrongPenalty, setLastWrongPenalty] = useState(null);
   // État optimiste pour le buzzer (affichage immédiat sans attendre Firestore)
   const [optimisticBuzzerState, setOptimisticBuzzerState] = useState(null);
   const [optimisticFirstPlayerId, setOptimisticFirstPlayerId] = useState(null);
@@ -264,6 +278,8 @@ export default function Player() {
   const [showFinalScore, setShowFinalScore] = useState(false);
   const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
 
+  // Messages personnalisables depuis Firestore
+  const [playerEleyBuzzMessages, setPlayerEleyBuzzMessages] = useState(ELEYBUZZ_PLAYER_MESSAGES);
 
   // Reset déclenché via URL ?reset=1 (avant start)
   const pendingResetRef = useRef(false);
@@ -351,19 +367,17 @@ export default function Player() {
 
       const d = snap.data() || {};
 
-      // Si le nom est refusé, réinitialiser complètement pour forcer une nouvelle inscription
+      // Si le nom est refusé, permettre au joueur de changer son nom sur la même ligne
       if (d.nameStatus === "rejected") {
         startTransition(() => {
           setIsKicked(false);
           setError("Nom refusé : trouve un autre nom plus adapté à la soirée :)");
           setInputName("");
-          setPlayerName("");
-          setPlayerId(null);
+          // Ne pas réinitialiser playerId ni playerName pour garder les scores
+          // Le joueur pourra changer son nom via handleNameSubmit
         });
-        localStorage.removeItem("playerId");
-        localStorage.removeItem("playerName");
-        // Le useEffect se désabonnera automatiquement car playerId devient null
-        return; // Sortir tôt pour éviter de mettre à jour playerName
+        // Ne pas supprimer playerId du localStorage pour conserver les scores
+        return; // Sortir tôt pour éviter de mettre à jour playerName avec le nom refusé
       }
 
       startTransition(() => {
@@ -393,6 +407,12 @@ export default function Player() {
         // Sinon (undefined, null, true), on considère qu'il est true
         setCanBuzz(canBuzzValue !== false);
       });
+      
+      // Lire la dernière pénalité appliquée pour l'affichage
+      const penaltyValue = Number.isFinite(d.lastWrongPenalty) ? d.lastWrongPenalty : null;
+      startTransition(() => {
+        setLastWrongPenalty(penaltyValue);
+      });
 
       let serverRejected = Array.isArray(d.rejectedNames) ? d.rejectedNames : [];
       const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
@@ -410,11 +430,92 @@ export default function Player() {
       localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
       startTransition(() => setRejectedNames(union));
 
+      // Charger l'équipe du joueur
+      const playerTeamId = d.teamId || null;
+      if (playerTeamId) {
+        setTeamId(playerTeamId);
+        // Charger le nom de l'équipe
+        const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+        getDoc(doc(teamsCol, playerTeamId))
+          .then((teamSnap) => {
+            if (teamSnap.exists()) {
+              const teamData = teamSnap.data();
+              setTeamName(teamData.name || "");
+              setTeamColor(teamData.color || null);
+              setTeamMemberCount((teamData.memberIds || []).length);
+              setTeamQuizScore(Number(teamData.teamQuizScore || 0));
+              setNeedsTeamSelection(false);
+            } else {
+              // L'équipe n'existe plus, forcer la sélection d'une nouvelle
+              setTeamId(null);
+              setTeamName("");
+              setTeamColor(null);
+              setTeamMemberCount(0);
+              setNeedsTeamSelection(true);
+            }
+          })
+          .catch((e) => {
+            console.error("Error loading team:", e);
+            setTeamId(null);
+            setTeamName("");
+            setTeamColor(null);
+            setTeamMemberCount(0);
+            setNeedsTeamSelection(true);
+          });
+      } else {
+        setTeamId(null);
+        setTeamName("");
+        setTeamColor(null);
+        setTeamMemberCount(0);
+        // Un joueur DOIT avoir une équipe, forcer la sélection
+        setNeedsTeamSelection(true);
+      }
+
       startTransition(() => setPlayerDocLoaded(true));
     });
 
     return () => unsub();
-  }, [playerId]);
+  }, [playerId, isRunning]);
+
+  // 3.5) Écouter les changements de l'équipe du joueur en temps réel pour le score équipe
+  // IMPORTANT: Ce listener est UNIQUEMENT pour mettre à jour le score équipe.
+  // Il n'influence JAMAIS la logique de détection "déjà répondu" qui est basée uniquement
+  // sur les submissions individuelles du joueur (answers/{qid}/submissions/{playerId}).
+  useEffect(() => {
+    if (!playerId) return;
+    // Si pas d'équipe, on ne peut pas écouter, mais on ne bloque pas le reste
+    if (!teamId) {
+      setTeamQuizScore(0);
+      return;
+    }
+
+    const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+    const teamRef = doc(teamsCol, teamId);
+    const unsub = onSnapshot(teamRef, (teamSnap) => {
+      if (!teamSnap.exists()) {
+        // L'équipe n'existe plus
+        setTeamId(null);
+        setTeamName("");
+        setTeamColor(null);
+        setTeamMemberCount(0);
+        setTeamQuizScore(0);
+        setNeedsTeamSelection(true);
+        return;
+      }
+
+      // Mettre à jour les données de l'équipe (y compris pendant le quiz pour le score en temps réel)
+      // Ceci est COMPLÈTEMENT décorrélé de la logique de détection "déjà répondu"
+      const teamData = teamSnap.data();
+      setTeamName(teamData.name || "");
+      setTeamColor(teamData.color || null);
+      setTeamMemberCount((teamData.memberIds || []).length);
+      setTeamQuizScore(Number(teamData.teamQuizScore || 0));
+    }, (e) => {
+      console.error("Error listening to team:", e);
+    });
+
+    return () => unsub();
+  }, [playerId, teamId]);
 
   // 4) Si aucun playerId → considérer le doc joueur "chargé"
   useEffect(() => {
@@ -527,6 +628,10 @@ export default function Player() {
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
         setShowFinalScore(!!d.showFinalScore);
+        
+        // Lire buzzerPoints depuis quiz/state
+        const bp = Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS;
+        setBuzzerPoints(bp);
       });
 
       if (!startMs) {
@@ -602,7 +707,6 @@ export default function Player() {
           // 4) Réinitialiser les états EleyBuzz locaux (débloquer le joueur)
           startTransition(() => {
             setCanBuzz(true);
-            setBuzzerCooldownUntilMs(null);
             setOptimisticBuzzerState(null);
             setOptimisticFirstPlayerId(null);
             setIsBuzzing(false);
@@ -614,7 +718,24 @@ export default function Player() {
   }, []);
 
 
-  // 7) Récupérer les questions du quiz ACTIF
+  // 7) Charger les messages personnalisés depuis Firestore
+  useEffect(() => {
+    const configRef = doc(db, "quiz", "config");
+    const unsub = onSnapshot(configRef, (snap) => {
+      const data = snap.data() || {};
+      if (data.playerEleyBuzz) {
+        setPlayerEleyBuzzMessages({
+          ...ELEYBUZZ_PLAYER_MESSAGES,
+          ...data.playerEleyBuzz,
+        });
+      } else {
+        setPlayerEleyBuzzMessages(ELEYBUZZ_PLAYER_MESSAGES);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // 8) Récupérer les questions du quiz ACTIF
   useEffect(() => {
     let cancelled = false;
 
@@ -688,6 +809,24 @@ export default function Player() {
           ? d.screenQuiz.finalPodiumTitle
           : SCREEN_MESSAGES.finalPodiumTitle;
         setFinalPodiumTitle(customFinalPodiumTitle);
+
+        // Liste globale des noms refusés
+        const globalRejected = Array.isArray(d?.globalRejectedNames) ? d.globalRejectedNames : [];
+        const isAliasNameLocal = (raw) => /^player\s*\d+$/i.test(String(raw || "").trim());
+        const filteredGlobal = globalRejected.filter((n) => !isAliasNameLocal(n));
+        
+        // Fusionner avec la liste locale (depuis localStorage)
+        let prev = [];
+        try {
+          const raw = localStorage.getItem("rejectedNamesCache");
+          prev = raw ? JSON.parse(raw) : [];
+          if (!Array.isArray(prev)) prev = [];
+        } catch {
+          prev = [];
+        }
+        const union = Array.from(new Set([...prev.filter((n) => !isAliasNameLocal(n)), ...filteredGlobal]));
+        localStorage.setItem("rejectedNamesCache", JSON.stringify(union));
+        startTransition(() => setRejectedNames(union));
       });
     });
     return () => unsub();
@@ -709,6 +848,25 @@ export default function Player() {
         };
       });
       startTransition(() => setPlayersLB(arr));
+    });
+    return () => unsub();
+  }, []);
+
+  // 8.6) Abonnement teams → alimente le leaderboard des équipes
+  useEffect(() => {
+    const col = collection(doc(db, "quiz", "state"), "teams");
+    const unsub = onSnapshot(col, (snap) => {
+      const arr = snap.docs.map((d) => {
+        const v = d.data() || {};
+        return {
+          id: d.id,
+          name: v.name || "",
+          teamQuizScore: Number(v.teamQuizScore || 0),
+          color: v.color || null,
+          isKicked: !!v.isKicked,
+        };
+      });
+      startTransition(() => setTeamsLB(arr));
     });
     return () => unsub();
   }, []);
@@ -1212,6 +1370,8 @@ export default function Player() {
     instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
 
   // 🔁 Recharger l'état "bonne réponse" après un F5
+  // IMPORTANT: Cette fonction vérifie UNIQUEMENT la soumission INDIVIDUELLE de CE joueur.
+  // Elle ne vérifie JAMAIS les soumissions d'autres joueurs ou les awards d'équipe.
   useEffect(() => {
     const qid = currentQuestionId;
     if (!qid || !playerId) return;
@@ -1222,12 +1382,15 @@ export default function Player() {
     let cancelled = false;
     (async () => {
       try {
-        // answers/{qid}/submissions/{playerId}
+        // Vérification UNIQUEMENT de la soumission INDIVIDUELLE de CE joueur
+        // answers/{qid}/submissions/{playerId} - pas de vérification d'équipe ici
         const subRef = doc(db, "answers", qid, "submissions", playerId);
         const snap = await getDoc(subRef);
         if (cancelled || !snap.exists()) return;
 
         const data = snap.data() || {};
+        // Si CE joueur n'a pas répondu correctement, on ne marque rien
+        // Même si d'autres joueurs de l'équipe ont répondu
         if (!data.isCorrect) return;
 
         // Par défaut : F5 après bonne réponse dans le “run” actuel
@@ -1286,9 +1449,17 @@ export default function Player() {
 
 
   // “Déjà correct” (persiste même après un Back)
+  // IMPORTANT: Cette logique est UNIQUEMENT basée sur les réponses INDIVIDUELLES du joueur.
+  // Elle ne dépend JAMAIS de l'équipe ou des réponses d'autres joueurs.
+  // Elle vérifie uniquement:
+  // 1. answeredAtRef: marqué quand CE joueur répond correctement
+  // 2. lastAnswerQidRef: mis à jour quand CE joueur répond correctement
+  // 3. instantWin: créé quand CE joueur répond correctement
+  // 4. result: vient de la soumission de CE joueur
   const alreadyCorrect = useMemo(() => {
     const qid = currentQuestionId;
     if (!qid) return false;
+    // Vérifications basées UNIQUEMENT sur les réponses individuelles de CE joueur
     if (answeredAtRef.current[qid] != null) return true;
     if (lastAnswerQidRef.current === qid) return true;
     if (instantWin && instantWin.qid === qid) return true;
@@ -1348,83 +1519,14 @@ export default function Player() {
     return () => clearInterval(id);
   }, [cooldownUntilMs]);
 
-  // GESTION DE LA PUNITION : Ref persistante pour éviter les flashes pendant la synchronisation
-  // Le joueur est considéré comme puni si canBuzz est false (source de vérité Firestore)
-  // Une fois puni, on reste puni jusqu'à ce que canBuzz soit true ET que le buzzer soit OPEN
-  // Cela évite de voir le buzzer bleu brièvement avant qu'il ne devienne gris
-  useEffect(() => {
-    if (!isBuzzerMode || !playerId) return;
-    
-    const now = Date.now();
-    
-    // Si canBuzz est false, le joueur est puni (source de vérité Firestore)
-    if (!canBuzz) {
-      // Marquer comme puni dans le ref (persistant)
-      if (!isPunishedRef.current) {
-        isPunishedRef.current = true;
-        setPunishedTick(t => t + 1); // Force re-render
-      }
-      
-      // Si canBuzz est false, démarrer le cooldown local immédiatement
-      // Le cooldown doit démarrer même si le buzzer est réouvert (cas de mauvaise réponse)
-      if (!buzzerCooldownUntilMs) {
-        const cooldownEndMs = now + buzzerCooldownMs;
-        setBuzzerCooldownUntilMs(cooldownEndMs);
-      }
-    } else {
-      // canBuzz est true : le joueur est libéré
-      // Si le buzzer est LOCKED avec un autre joueur, on libère quand même (le buzzer sera gris, pas bleu)
-      if (isPunishedRef.current) {
-        // Le buzzer n'est pas verrouillé : on peut libérer
-        // Si LOCKED avec un autre joueur, le buzzer sera gris (pas bleu), donc pas de flash
-        // Si OPEN ou IDLE, le buzzer sera bleu, ce qui est normal
-        isPunishedRef.current = false;
-        setPunishedTick(t => t + 1); // Force re-render
-        // Réinitialiser le cooldown car le joueur n'est plus puni
-        if (buzzerCooldownUntilMs) {
-          setBuzzerCooldownUntilMs(null);
-        }
-      }
-    }
-  }, [isBuzzerMode, playerId, canBuzz, buzzerState, buzzerCooldownUntilMs, buzzerMessageType, buzzerCooldownMs]);
-
-  // Ticker cooldown EleyBuzz - mise à jour chaque 100ms pour décompte fluide et précis
-  useEffect(() => {
-    if (!buzzerCooldownUntilMs) {
-      setBuzzerCooldownTick(0);
-      return;
-    }
-    
-    // Vérifier immédiatement
-    const now = Date.now();
-    if (now >= buzzerCooldownUntilMs) {
-      setBuzzerCooldownUntilMs(null);
-      setBuzzerCooldownTick(0);
-      return;
-    }
-    
-    // Mettre à jour plus fréquemment (toutes les 100ms) pour un décompte fluide
-    // Cela garantit que le calcul du temps restant est toujours précis
-    const id = setInterval(() => {
-      const now = Date.now();
-      if (now >= buzzerCooldownUntilMs) {
-        setBuzzerCooldownUntilMs(null);
-        setBuzzerCooldownTick(0);
-      } else {
-        // Force re-render toutes les 100ms pour afficher le décompte précis
-        setBuzzerCooldownTick(t => t + 1);
-      }
-    }, 100); // Mise à jour toutes les 100ms pour plus de fluidité
-    
-    return () => clearInterval(id);
-  }, [buzzerCooldownUntilMs]);
+  // GESTION DE LA PUNITION : Le joueur est puni si canBuzz est false (source de vérité Firestore)
+  // Une fois puni, on reste puni jusqu'à ce que le buzzer revienne à IDLE (nouvelle question)
 
   // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
   useEffect(() => {
     if (!isBuzzerMode) {
       // Quand EleyBuzz est désactivé, réinitialiser tous les états locaux
       startTransition(() => {
-        setBuzzerCooldownUntilMs(null);
         setOptimisticBuzzerState(null);
         setOptimisticFirstPlayerId(null);
         setIsBuzzing(false); // Réactiver le bouton
@@ -1572,9 +1674,8 @@ export default function Player() {
   // Handler EleyBuzz - premier qui buzz = gagnant
   const handleBuzzerPress = async () => {
     if (!playerId || !isBuzzerMode || buzzerState !== BUZZER_STATES.OPEN) return;
-    if (buzzerCooldownUntilMs && Date.now() < buzzerCooldownUntilMs) return;
     
-    // Vérifier canBuzz
+    // Vérifier canBuzz (si le joueur a donné une mauvaise réponse, il ne peut plus buzzer)
     if (!canBuzz) return;
 
     // Mise à jour optimiste immédiate
@@ -1735,15 +1836,62 @@ export default function Player() {
   // Score depuis Firestore (mis à jour en temps réel par recordFirstCorrectAndPredict)
   const myScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
   const myBuzzScore = useMemo(() => (meRow ? Number(meRow.buzzScore || 0) : 0), [meRow]);
-  const myMedal = useMemo(
-    () => (Number(myScore) > 0 ? medalForRank(myRank) : ""),
-    [myRank, myScore]
-  );
+  // Cœurs colorés pour les joueurs (pas de médailles)
+  const myMedal = useMemo(() => {
+    if (!myRank || myScore <= 0) return "";
+    return myRank === 1 ? "💛" : myRank === 2 ? "🤍" : myRank === 3 ? "🤎" : "";
+  }, [myRank, myScore]);
   const myEndMessage = useMemo(() => {
     return Number(myScore) > 0
       ? messageForRank(myRank)
       : "Merci pour ta participation !";
   }, [myRank, myScore]);
+
+  // Classement des équipes
+  const teamsRanking = useMemo(() => {
+    const rows = (teamsLB || [])
+      .filter((t) => !t.isKicked)
+      .map((t) => ({
+        ...t,
+        _nameKey: normalizeNameAlpha(t.name || ""),
+        score: Number(t.teamQuizScore || 0),
+      }));
+    rows.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      return a._nameKey.localeCompare(b._nameKey);
+    });
+    let lastScore = null;
+    let lastRank = 0;
+    rows.forEach((t, i) => {
+      const sc = Number(t.score || 0);
+      if (i === 0) {
+        t._rank = 1;
+        lastScore = sc;
+        lastRank = 1;
+      } else if (sc === lastScore) {
+        t._rank = lastRank;
+      } else {
+        t._rank = i + 1;
+        lastScore = sc;
+        lastRank = t._rank;
+      }
+    });
+    return rows;
+  }, [teamsLB]);
+
+  // Trouver l'équipe du joueur et son rang
+  const myTeamRow = useMemo(() => {
+    if (!teamId) return null;
+    return teamsRanking.find((t) => t.id === teamId) || null;
+  }, [teamId, teamsRanking]);
+
+  const myTeamRank = useMemo(() => (myTeamRow ? myTeamRow._rank : null), [myTeamRow]);
+  const myTeamScore = useMemo(() => (myTeamRow ? myTeamRow.score : 0), [myTeamRow]);
+  // Médailles pour les équipes (pas de cœurs)
+  const myTeamMedal = useMemo(() => {
+    if (!myTeamRank || myTeamScore <= 0) return "";
+    return myTeamRank === 1 ? "🥇" : myTeamRank === 2 ? "🥈" : myTeamRank === 3 ? "🥉" : "";
+  }, [myTeamRank, myTeamScore]);
 
   // Classement final (Quiz + EleyBuzz) pour le Score Final
   const finalRanking = useMemo(() => {
@@ -1804,10 +1952,11 @@ export default function Player() {
 
   const myFinalScore = useMemo(() => (myFinalRow ? myFinalRow.scoreFinal : 0), [myFinalRow]);
   const myFinalRank = useMemo(() => (myFinalRow ? myFinalRow._rank : null), [myFinalRow]);
-  const myFinalMedal = useMemo(
-    () => (Number(myFinalScore) > 0 ? medalForRank(myFinalRank) : ""),
-    [myFinalRank, myFinalScore]
-  );
+  // Cœurs colorés pour les joueurs (pas de médailles)
+  const myFinalMedal = useMemo(() => {
+    if (!myFinalRank || myFinalScore <= 0) return "";
+    return myFinalRank === 1 ? "💛" : myFinalRank === 2 ? "🤍" : myFinalRank === 3 ? "🤎" : "";
+  }, [myFinalRank, myFinalScore]);
 
   /* ===== Helpers Firestore pour le nom ===== */
   async function nameExists(nameNorm, excludeId = null) {
@@ -1859,12 +2008,15 @@ export default function Player() {
           nameStatus: "ok",
           rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [],
           canBuzz: true, // Initialiser canBuzz à true pour permettre le buzzer
+          teamId: null, // Pas d'équipe au départ
         });
         setPlayerId(ref.id);
         localStorage.setItem("playerId", ref.id);
         localStorage.setItem("playerName", v.value);
         setPlayerName(v.value);
         setInputName("");
+        // Déclencher l'écran de sélection d'équipe
+        setNeedsTeamSelection(true);
       } else {
         await updateDoc(doc(playersCol, playerId), {
           name: v.value,
@@ -1883,24 +2035,202 @@ export default function Player() {
     }
   }
 
+  // Fonctions pour les équipes
+  async function loadAvailableTeams() {
+    try {
+      const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+      const q = query(
+        teamsCol,
+        where("isKicked", "==", false),
+        where("nameStatus", "!=", "rejected")
+      );
+      const snap = await getDocs(q);
+      const teams = snap.docs.map((d) => ({
+        id: d.id,
+        name: d.data().name || "",
+        color: d.data().color || null,
+        memberCount: (d.data().memberIds || []).length,
+      }));
+      setAvailableTeams(teams);
+    } catch (e) {
+      console.error("loadAvailableTeams error:", e);
+      setAvailableTeams([]);
+    }
+  }
+
+  async function handleCreateTeam(e) {
+    e?.preventDefault?.();
+    setError("");
+
+    const v = validateTeamName(teamInputName);
+    if (!v.ok) {
+      if (v.reason === "length") setError("Le nom doit faire entre 1 et 20 caractères.");
+      else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (' ') et tirets.");
+      else if (v.reason === "politics") setError("Évite les noms à caractère politique. Merci !");
+      else if (v.reason === "moderation") setError("Nom inadapté au tout public.");
+      else setError("Nom invalide.");
+      setTeamInputName("");
+      return;
+    }
+
+    const nameNorm = normalizeTeamName(v.value);
+    setBusy(true);
+    try {
+      const result = await createTeamTx(db, v.value, playerId, nameNorm);
+      if (result.ok) {
+        setTeamId(result.teamId);
+        setTeamName(v.value);
+        setTeamColor(result.color || null);
+        // Charger le nombre de membres depuis Firestore pour avoir la valeur exacte
+        const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+        getDoc(doc(teamsCol, result.teamId))
+          .then((teamSnap) => {
+            if (teamSnap.exists()) {
+              const teamData = teamSnap.data();
+              setTeamMemberCount((teamData.memberIds || []).length);
+            }
+          })
+          .catch((e) => console.error("Error loading team member count:", e));
+        setNeedsTeamSelection(false);
+        setTeamInputName("");
+      } else {
+        if (result.reason === "name-exists") {
+          setError("Ce nom d'équipe est déjà pris.");
+        } else {
+          setError("Quitte d'abord ton équipe actuelle avant de créer une nouvelle équipe.");
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Quitte d'abord ton équipe actuelle avant de créer une nouvelle équipe.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleJoinTeam(selectedTeamId) {
+    if (!selectedTeamId || !playerId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await joinTeamTx(db, selectedTeamId, playerId);
+      if (result.ok) {
+        const team = availableTeams.find((t) => t.id === selectedTeamId);
+        if (team) {
+          setTeamId(selectedTeamId);
+          setTeamName(team.name);
+          setTeamColor(team.color || null);
+          // Charger le nombre de membres depuis Firestore
+          const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+          getDoc(doc(teamsCol, selectedTeamId))
+            .then((teamSnap) => {
+              if (teamSnap.exists()) {
+                const teamData = teamSnap.data();
+                setTeamMemberCount((teamData.memberIds || []).length);
+              }
+            })
+            .catch((e) => console.error("Error loading team member count:", e));
+        }
+        setNeedsTeamSelection(false);
+      } else {
+        if (result.reason === "team-not-found") {
+          setError("Équipe introuvable.");
+        } else if (result.reason === "team-unavailable") {
+          setError("Cette équipe n'est plus disponible.");
+        } else {
+          setError("Impossible de rejoindre l'équipe. Réessaie.");
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Impossible de rejoindre l'équipe. Réessaie.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleLeaveTeam() {
+    if (!playerId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await leaveTeamTx(db, playerId);
+      if (result.ok) {
+        setTeamId(null);
+        setTeamName("");
+        setTeamColor(null);
+        setTeamMemberCount(0);
+        setNeedsTeamSelection(true);
+        // Les équipes sont chargées en temps réel via onSnapshot, pas besoin de loadAvailableTeams
+      } else {
+        setError("Impossible de quitter l'équipe. Réessaie.");
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Impossible de quitter l'équipe. Réessaie.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Écouter les équipes en temps réel pendant la sélection
+  // IMPORTANT: Permettre la sélection d'équipe même si le quiz est en cours
+  useEffect(() => {
+    if (!needsTeamSelection || !playerId) return;
+
+    const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+    // Firestore ne supporte pas !=, donc on récupère toutes les équipes non kickées
+    // et on filtre côté client pour exclure les équipes rejetées
+    const q = query(
+      teamsCol,
+      where("isKicked", "==", false)
+    );
+    const unsub = onSnapshot(q, (snap) => {
+      const teams = snap.docs
+        .filter((d) => {
+          const data = d.data();
+          // Filtrer côté client : exclure les équipes rejetées
+          return data.nameStatus !== "rejected";
+        })
+        .map((d) => ({
+          id: d.id,
+          name: d.data().name || "",
+          color: d.data().color || null,
+          memberCount: (d.data().memberIds || []).length,
+        }));
+      setAvailableTeams(teams);
+    }, (e) => {
+      console.error("onSnapshot teams error:", e);
+      setAvailableTeams([]);
+    });
+
+    return () => unsub();
+  }, [needsTeamSelection, playerId, isRunning]);
+
   async function resetAndDeletePlayer() {
     try {
       selfRenameRef.current = true;
       const pid = playerId || localStorage.getItem("playerId");
       if (pid) {
         const playersCol = collection(doc(db, "quiz", "state"), "players");
-        await deleteDoc(doc(playersCol, pid));
+        // Ne pas supprimer le joueur, juste réinitialiser le nom
+        // L'équipe est conservée
+        await updateDoc(doc(playersCol, pid), {
+          name: null,
+          nameNorm: null,
+          nameStatus: null,
+        });
       }
     } catch (e) {
-      console.error("Suppression du joueur échouée :", e);
+      console.error("Réinitialisation du nom échouée :", e);
     } finally {
-      localStorage.removeItem("playerId");
       localStorage.removeItem("playerName");
       startTransition(() => {
-        setPlayerId(null);
         setPlayerName("");
         setInputName("");
         setError("");
+        // Ne pas réinitialiser teamId et teamName - l'équipe est conservée
+        // Ne pas mettre needsTeamSelection à false pour permettre la modification du nom
       });
     }
   }
@@ -1961,8 +2291,90 @@ export default function Player() {
   // Splash avant 1er boot complet
   if (!splashReleased) return <Splash />;
 
-  // 1) Écran d’inscription (nom refusé ou pas encore inscrit)
-  if (!playerId || (typeof error === "string" && error.startsWith("Nom refusé"))) {
+  // Composant réutilisable pour le bandeau joueur
+  const PlayerBadge = ({ showTimer = false, position = "absolute" }) => {
+    if (!playerName || !teamId) return null;
+    
+    // Tronquer le nom du joueur à 10 caractères maximum
+    const truncatedPlayerName = playerName.length > 10 ? playerName.substring(0, 10) + "…" : playerName;
+    
+    // Tronquer le nom d'équipe à 15 caractères maximum
+    const truncatedTeamName = teamName && teamName.length > 15 ? teamName.substring(0, 15) + "…" : teamName;
+    
+    return (
+      <div
+        style={{
+          position,
+          top: position === "absolute" ? `calc(12px + ${SAFE_TOP})` : undefined,
+          left: position === "absolute" ? "12px" : undefined,
+          width: "auto",
+          maxWidth: position === "absolute" ? "calc(100vw - 24px)" : "100%",
+          marginBottom: position === "relative" ? 12 : undefined,
+          zIndex: 20,
+          background: "#0b1e3d",
+          border: "1px solid #1f2a44",
+          borderRadius: 9999,
+          padding: "5px 10px",
+          fontSize: 12,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "flex-start",
+          justifyContent: "flex-start",
+          gap: 4,
+          color: "#fff",
+        }}
+        aria-label="Nom du joueur"
+        title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
+      >
+        {/* Première ligne : nom d'équipe et score équipe (légèrement plus gros) */}
+        {truncatedTeamName && teamId && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-start",
+              gap: 4,
+              fontSize: 14,
+            }}
+          >
+            <span style={{ fontSize: 14 }}>⭐</span>
+            <span style={{ color: teamColor || "#fff", fontWeight: 600, fontSize: 14 }}>
+              {truncatedTeamName}
+            </span>
+            <span style={{ opacity: 0.9, fontVariantNumeric: "tabular-nums", color: teamColor || "#fff", fontSize: 14 }}>
+              • {teamQuizScore}
+            </span>
+          </div>
+        )}
+        
+        {/* Deuxième ligne : avatar, nom, score joueur, score EleyBuzz */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-start",
+            gap: 5,
+            fontSize: 10,
+          }}
+        >
+          <span style={{ fontSize: 10 }}>👤</span>
+          <b style={{ letterSpacing: 0.2, fontSize: 10 }}>
+            {truncatedPlayerName}
+          </b>
+          <span style={{ marginLeft: 2, opacity: 0.9, fontVariantNumeric: "tabular-nums", fontSize: 10 }}>
+            • {myScore != null ? myScore : 0}
+          </span>
+          <span style={{ marginLeft: 2, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15", fontSize: 10 }}>
+            • ⚡ {myBuzzScore != null ? myBuzzScore : 0}
+          </span>
+          {nameLocked && <span style={{ opacity: 0.7, marginLeft: 4, fontSize: 10 }}>🔒</span>}
+        </div>
+      </div>
+    );
+  };
+
+  // 1) Écran d'inscription (nom refusé ou pas encore inscrit, ou nom réinitialisé)
+  if (!playerId || !playerName || (typeof error === "string" && error.startsWith("Nom refusé"))) {
     return (
       <div
         style={{
@@ -1995,8 +2407,8 @@ export default function Player() {
               type="text"
               value={inputName}
               onChange={(e) => setInputName(e.target.value)}
-              maxLength={30}
-              placeholder="ex : Les Quichettes"
+              maxLength={10}
+              placeholder="ex : Les Quichettes (max 10)"
               style={{
                 width: "100%",
                 maxWidth: "100%",
@@ -2012,7 +2424,7 @@ export default function Player() {
               autoFocus
             />
             <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-              Lettres FR, chiffres, espaces, apostrophes (’ '), tirets. 1–30 caractères.
+              Lettres FR, chiffres, espaces, apostrophes (' '), tirets. Max 10 caractères.
             </div>
 
             {error && (
@@ -2064,6 +2476,363 @@ export default function Player() {
     );
   }
 
+  // Fonction pour supprimer l'équipe si le joueur est seul
+  async function handleDeleteTeam() {
+    if (!playerId || !teamId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await leaveTeamTx(db, playerId);
+      if (result.ok) {
+        setTeamId(null);
+        setTeamName("");
+        setTeamColor(null);
+        setTeamMemberCount(0);
+        setTeamSelectionMode(null);
+        // L'équipe sera supprimée automatiquement par leaveTeamTx si le joueur était seul
+      } else {
+        setError("Impossible de supprimer l'équipe. Réessaie.");
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Impossible de supprimer l'équipe. Réessaie.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // 1.5) Écran de sélection d'équipe (après l'inscription)
+  // IMPORTANT: Un joueur DOIT avoir une équipe pour jouer, même si le quiz est en cours
+  if ((needsTeamSelection || !teamId) && playerId) {
+    // Vérifier si le joueur est seul dans son équipe
+    const isSoloInTeam = teamId && teamMemberCount === 1;
+    
+    return (
+      <div
+        style={{
+          minHeight: "calc(var(--vh, 1vh) * 100)",
+          background: "#000814",
+          color: "white",
+          display: "grid",
+          placeItems: "center",
+          padding: 24,
+          textAlign: "center",
+          overflowX: "hidden",
+        }}
+      >
+        <div style={{ width: "min(360px, 100%)", margin: "0 auto" }}>
+          {!isSoloInTeam && (
+            <>
+              <h1 style={{ margin: 0, fontSize: "2rem", fontWeight: 800 }}>
+                {teamSelectionMode === "create" ? "Crée ton équipe" : "Choisis ton équipe"}
+              </h1>
+              <p style={{ opacity: 0.85, marginTop: 10 }}>
+                {teamSelectionMode === "create" 
+                  ? "Crée une nouvelle équipe. Attention, si tu es déjà dans une équipe, pense à la quitter avant d'en créer une nouvelle."
+                  : teamSelectionMode === "join"
+                  ? "Rejoins une équipe existante. Attention, si tu fais déjà partie d'une équipe, tu en seras exclu automatiquement."
+                  : "Crée une nouvelle équipe ou rejoins une équipe existante"}
+              </p>
+            </>
+          )}
+
+          {error && (
+            <div style={{ marginTop: 12, color: "#fecaca", fontSize: 14 }}>
+              {error}
+            </div>
+          )}
+
+          {/* Si le joueur est seul dans son équipe, afficher d'abord le bouton de suppression */}
+          {isSoloInTeam && !teamSelectionMode && (
+            <div style={{ marginTop: 16 }}>
+              <p style={{ opacity: 0.85, marginBottom: 12 }}>
+                Tu es seul dans l'équipe <b style={{ color: teamColor || "#fff" }}>{teamName}</b>.
+                <br />
+                Tu dois d'abord supprimer cette équipe avant de créer ou rejoindre une autre équipe.
+              </p>
+              <button
+                onClick={handleDeleteTeam}
+                disabled={busy}
+                style={{
+                  width: "100%",
+                  padding: "clamp(10px, 2.8vw, 12px) 12px",
+                  borderRadius: 10,
+                  border: "1px solid #dc2626",
+                  background: busy ? "#64748b" : "#dc2626",
+                  color: "white",
+                  fontWeight: 700,
+                  cursor: busy ? "not-allowed" : "pointer",
+                }}
+              >
+                {busy ? "Suppression…" : `Supprimer l'équipe "${teamName}"`}
+              </button>
+              <button
+                onClick={() => {
+                  setNeedsTeamSelection(false);
+                  setError("");
+                }}
+                disabled={busy}
+                style={{
+                  marginTop: 12,
+                  width: "100%",
+                  padding: "8px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "transparent",
+                  color: "white",
+                  fontWeight: 600,
+                  cursor: busy ? "not-allowed" : "pointer",
+                }}
+              >
+                Annuler
+              </button>
+            </div>
+          )}
+
+          {/* Mode création */}
+          {teamSelectionMode === "create" && !isSoloInTeam && (
+            <form onSubmit={handleCreateTeam} style={{ marginTop: 16 }}>
+              <input
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+                inputMode="text"
+                enterKeyHint="send"
+                type="text"
+                value={teamInputName}
+                onChange={(e) => setTeamInputName(e.target.value)}
+                maxLength={15}
+                placeholder="ex : LES CHAMPIONS (max 15)"
+                style={{
+                  width: "100%",
+                  maxWidth: "100%",
+                  boxSizing: "border-box",
+                  display: "block",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "#0b1220",
+                  color: "white",
+                  fontSize: "clamp(14px, 3.9vw, 16px)",
+                  textTransform: "uppercase",
+                }}
+                autoFocus
+              />
+              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
+                Max 15 caractères. Le nom sera en majuscules.
+              </div>
+              <button
+                type="submit"
+                disabled={busy || !teamInputName.trim()}
+                style={{
+                  marginTop: 12,
+                  width: "100%",
+                  padding: "clamp(10px, 2.8vw, 12px) 12px",
+                  borderRadius: 10,
+                  border: "1px solid #2a2a2a",
+                  background: busy ? "#64748b" : "#3b82f6",
+                  color: "white",
+                  fontWeight: 700,
+                  cursor: busy || !teamInputName.trim() ? "not-allowed" : "pointer",
+                }}
+              >
+                {busy ? "Création…" : "Créer l'équipe"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setTeamSelectionMode(null);
+                  setTeamInputName("");
+                  setError("");
+                }}
+                style={{
+                  marginTop: 8,
+                  width: "100%",
+                  padding: "8px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "transparent",
+                  color: "white",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Annuler
+              </button>
+            </form>
+          )}
+
+          {/* Mode rejoindre */}
+          {teamSelectionMode === "join" && !isSoloInTeam && (
+            <div style={{ marginTop: 16 }}>
+              {/* Champ de recherche */}
+              <input
+                type="text"
+                placeholder="Recherche ton équipe"
+                value={teamSearchQuery}
+                onChange={(e) => setTeamSearchQuery(e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "#0b1220",
+                  color: "white",
+                  fontSize: "clamp(14px, 3.9vw, 16px)",
+                  marginBottom: 12,
+                }}
+                autoFocus
+              />
+              
+              {/* Filtrer les équipes selon la recherche */}
+              {(() => {
+                const filteredTeams = teamSearchQuery.trim()
+                  ? availableTeams.filter((team) =>
+                      team.name.toLowerCase().includes(teamSearchQuery.toLowerCase())
+                    )
+                  : availableTeams;
+
+                if (filteredTeams.length === 0) {
+                  return (
+                    <div style={{ opacity: 0.7, marginTop: 12 }}>
+                      {teamSearchQuery.trim()
+                        ? `Aucune équipe trouvée pour "${teamSearchQuery}"`
+                        : "Aucune équipe disponible pour le moment."}
+                    </div>
+                  );
+                }
+
+                return (
+                  <div style={{ maxHeight: "50vh", overflowY: "auto", marginTop: 12 }}>
+                    {filteredTeams.map((team) => (
+                    <button
+                      key={team.id}
+                      onClick={() => handleJoinTeam(team.id)}
+                      disabled={busy}
+                      style={{
+                        width: "100%",
+                        marginBottom: 8,
+                        padding: "12px",
+                        borderRadius: 10,
+                        border: "1px solid #334155",
+                        background: "#0b1220",
+                        color: "white",
+                        textAlign: "left",
+                        cursor: busy ? "not-allowed" : "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 12,
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 20,
+                          height: 20,
+                          borderRadius: 4,
+                          background: team.color || "#6b7280",
+                          display: "inline-block",
+                          flexShrink: 0,
+                        }}
+                      />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontWeight: 600 }}>{team.name}</div>
+                        <div style={{ fontSize: 12, opacity: 0.7 }}>
+                          {team.memberCount} membre{team.memberCount > 1 ? "s" : ""}
+                        </div>
+                      </div>
+                    </button>
+                    ))}
+                  </div>
+                );
+              })()}
+              <button
+                type="button"
+                onClick={() => {
+                  setTeamSelectionMode(null);
+                  setError("");
+                }}
+                style={{
+                  marginTop: 12,
+                  width: "100%",
+                  padding: "8px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "transparent",
+                  color: "white",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Annuler
+              </button>
+            </div>
+          )}
+
+          {/* Choix initial */}
+          {!teamSelectionMode && !isSoloInTeam && (
+            <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+              <button
+                onClick={() => setTeamSelectionMode("create")}
+                disabled={busy}
+                style={{
+                  width: "100%",
+                  padding: "clamp(10px, 2.8vw, 12px) 12px",
+                  borderRadius: 10,
+                  border: "1px solid #2a2a2a",
+                  background: "#3b82f6",
+                  color: "white",
+                  fontWeight: 700,
+                  cursor: busy ? "not-allowed" : "pointer",
+                }}
+              >
+                Créer une équipe
+              </button>
+              <button
+                onClick={() => {
+                  setTeamSelectionMode("join");
+                  // Les équipes sont chargées en temps réel via onSnapshot
+                }}
+                disabled={busy}
+                style={{
+                  width: "100%",
+                  padding: "clamp(10px, 2.8vw, 12px) 12px",
+                  borderRadius: 10,
+                  border: "1px solid #334155",
+                  background: "transparent",
+                  color: "white",
+                  fontWeight: 600,
+                  cursor: busy ? "not-allowed" : "pointer",
+                }}
+              >
+                Rejoindre une équipe
+              </button>
+              {teamId && teamName && teamMemberCount > 1 && (
+                <button
+                  onClick={handleLeaveTeam}
+                  disabled={busy}
+                  style={{
+                    marginTop: 8,
+                    width: "100%",
+                    padding: "8px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ef4444",
+                    background: "transparent",
+                    color: "#ef4444",
+                    fontWeight: 600,
+                    cursor: busy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Quitter l'équipe "{teamName}"
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   // 2) Écran bloquant si le joueur a été retiré
   if (isKicked && playerId) {
     return (
@@ -2099,37 +2868,43 @@ export default function Player() {
   // Permet d'accéder à EleyBuzz même si le quiz n'a pas encore démarré
   // ============================================================================
   if (isBuzzerMode && playerId) {
-    // VÉRIFICATION DE PUNITION EN PREMIER (avant même de calculer effectiveBuzzerState)
-    // Utiliser le ref isPunishedRef qui est géré par le useEffect ci-dessus
-    // Cela garantit qu'un joueur puni ne verra JAMAIS le buzzer, même pendant les transitions d'état
-    const now = Date.now();
-    // Utiliser isPunishedRef.current comme source de vérité principale (évite les flashes)
-    // Vérifier aussi !canBuzz comme fallback (sécurité supplémentaire en cas de latence)
-    // Si canBuzz est false, le joueur est puni, point final
-    // IMPORTANT : Ne pas utiliser effectiveBuzzerState ici car il dépend de optimisticBuzzerState
-    // qui peut changer avant que canBuzz ne soit synchronisé
-    const isPunished = isPunishedRef.current || !canBuzz;
-    
-    // Utiliser l'état optimiste pour le buzzerState ET firstPlayerId (affichage immédiat)
-    // Cela permet d'afficher immédiatement "À toi de répondre !" pour le joueur qui buzz
-    // et "Le buzzer est verrouillé..." pour les autres, sans attendre Firestore
-    // Garde-fou pour la production : s'assurer que buzzerState a toujours une valeur valide
+    // VÉRIFICATION DE PUNITION : 
+    // Le joueur est puni seulement si canBuzz est false ET que le buzzer n'est pas en IDLE
+    // Quand le buzzer est en IDLE, tous les joueurs sont débloqués (nouvelle question)
+    // IMPORTANT : Ne pas considérer comme puni si le joueur vient juste de buzzer (firstPlayerId === playerId)
+    // car dans ce cas, le buzzer est jaune (en attente de réponse de l'admin)
     const effectiveBuzzerState = optimisticBuzzerState || buzzerState || BUZZER_STATES.IDLE;
-    // Utiliser optimisticFirstPlayerId pour l'affichage immédiat (UX améliorée)
-    // Firestore confirmera ensuite qui peut vraiment répondre (sécurité)
     const effectiveFirstPlayerId = optimisticFirstPlayerId || firstPlayerId || null;
     
-    // Permettre les clics si le buzzer est ouvert
-    const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz && (!buzzerCooldownUntilMs || now >= buzzerCooldownUntilMs);
-    // Calculer le temps restant pour le timer de punition
-    // Utiliser Date.now() directement pour avoir le temps réel à chaque render (forcé par buzzerCooldownTick)
-    const currentTime = Date.now();
-    let buzzerCooldownRemainingSec = 0;
-    if (buzzerCooldownUntilMs && currentTime < buzzerCooldownUntilMs) {
-      // Calculer simplement le temps restant en secondes (20, 19, 18... jusqu'à 1)
-      buzzerCooldownRemainingSec = Math.ceil((buzzerCooldownUntilMs - currentTime) / 1000);
-      if (buzzerCooldownRemainingSec < 0) buzzerCooldownRemainingSec = 0;
-    }
+    // Un joueur est puni seulement s'il a donné une mauvaise réponse confirmée par l'admin
+    // La source de vérité est canBuzz : si canBuzz est false, le joueur est puni
+    // MAIS on ne considère pas comme puni si le joueur vient juste de buzzer (firstPlayerId === playerId) car dans ce cas c'est jaune
+    const isCurrentlyBuzzing = effectiveFirstPlayerId && playerId && effectiveFirstPlayerId === playerId;
+    
+    // Un joueur est puni seulement si :
+    // 1. canBuzz est false (verrouillé par l'admin après mauvaise réponse)
+    // 2. Le buzzer n'est pas en IDLE (nouvelle question - tous débloqués)
+    // 3. Le joueur n'est PAS en train de buzzer (sinon c'est jaune, pas rouge)
+    // 4. Il n'y a PAS de message "wrong" actif pour un autre joueur (pour éviter les faux positifs)
+    // Note : canBuzz reste false pour un joueur qui a donné une mauvaise réponse, même après réouverture du buzzer
+    // Il sera réinitialisé à true seulement quand le buzzer reviendra à IDLE (nouvelle question)
+    // IMPORTANT : Si le joueur vient de buzzer (isCurrentlyBuzzing), on ne le considère JAMAIS comme puni
+    // car dans ce cas, le buzzer est jaune (en attente de réponse de l'admin)
+    const hasActiveWrongMessage = buzzerMessageType === "wrong" && effectiveFirstPlayerId && effectiveFirstPlayerId !== playerId;
+    const isPunished = !canBuzz && 
+                       effectiveBuzzerState !== BUZZER_STATES.IDLE && 
+                       !isCurrentlyBuzzing &&
+                       !hasActiveWrongMessage; // Ne pas considérer comme puni si le message "wrong" est pour un autre joueur
+    
+    // Utiliser l'état optimiste pour firstPlayerId (affichage immédiat)
+    // Cela permet d'afficher immédiatement "À toi de répondre !" pour le joueur qui buzz
+    // et "Le buzzer est verrouillé..." pour les autres, sans attendre Firestore
+    // Utiliser optimisticFirstPlayerId pour l'affichage immédiat (UX améliorée)
+    // Firestore confirmera ensuite qui peut vraiment répondre (sécurité)
+    // effectiveFirstPlayerId est déjà déclaré plus haut
+    
+    // Permettre les clics si le buzzer est ouvert et que le joueur peut buzzer
+    const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz;
 
     return (
       <div
@@ -2146,40 +2921,25 @@ export default function Player() {
             position: "relative",
           }}
         >
-        {/* Badge nom joueur en haut-gauche (même ligne que le timer) */}
-        {playerName && (
+        {/* Bandeau joueur en haut */}
+        {playerName && teamId && <PlayerBadge showTimer={true} />}
+        
+        {/* Timer sous le bandeau */}
+        {(isRunning || isBuzzerMode) && (
           <div
             style={{
               position: "absolute",
-              top: `calc(12px + ${SAFE_TOP})`,
-              left: 12,
-              zIndex: 20,
-              background: "#0b1e3d",
-              border: "1px solid #1f2a44",
-              borderRadius: 9999,
+              top: `calc(60px + ${SAFE_TOP})`,
+              right: 12,
+              background: "#111",
               padding: "6px 10px",
-              fontSize: 14,
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              color: "#fff",
+              borderRadius: 8,
+              fontFamily: "monospace",
+              letterSpacing: 1,
+              border: "1px solid #2a2a2a",
             }}
-            aria-label="Nom du joueur"
-            title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
           >
-            <span>👤</span>
-            <b style={{ letterSpacing: 0.2 }}>{playerName}</b>
-            {(isRunning || isBuzzerMode) && myScore != null && (
-              <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums" }}>
-                • {myScore}
-              </span>
-            )}
-            {isBuzzerMode && (
-              <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15" }}>
-                • ⚡ {myBuzzScore}
-              </span>
-            )}
-            {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
+            ⏱ {formatHMS(elapsedSec)}
           </div>
         )}
 
@@ -2193,42 +2953,50 @@ export default function Player() {
           // isPunished est déjà calculé AVANT ce bloc (ligne ~2041)
           // Cela garantit qu'on ne regarde même pas l'état du buzzer si le joueur est puni
           
+          // Si le joueur a donné une mauvaise réponse, afficher un buzzer rouge avec message
+          // Si le joueur est puni (canBuzz === false et buzzer pas en IDLE)
+          // Cela signifie qu'il a donné une mauvaise réponse et ne peut plus buzzer jusqu'à la prochaine question
           if (isPunished) {
-            // Calculer hasActiveCooldown dans le scope du bloc
-            // Utiliser Date.now() directement pour avoir le temps réel à chaque render (forcé par buzzerCooldownTick)
-            const currentTimeForCooldown = Date.now();
-            const hasActiveCooldown = buzzerCooldownUntilMs && buzzerCooldownUntilMs > currentTimeForCooldown;
-            const remainingSec = hasActiveCooldown ? Math.max(0, Math.ceil((buzzerCooldownUntilMs - currentTimeForCooldown) / 1000)) : 0;
-
+            // Afficher le buzzer rouge avec le message
             return (
               <div style={{ marginBottom: 24, textAlign: "center" }}>
+                {/* Buzzer rouge */}
+                <button
+                  disabled
+                  style={{
+                    width: "min(280px, 80vw)",
+                    height: "min(280px, 80vw)",
+                    maxWidth: 300,
+                    maxHeight: 300,
+                    borderRadius: "50%",
+                    border: "4px solid #fff",
+                    background: "#ef4444", // Rouge pour mauvaise réponse
+                    color: "#fff",
+                    fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
+                    fontWeight: 800,
+                    cursor: "default",
+                    touchAction: "manipulation",
+                    WebkitTapHighlightColor: "transparent",
+                    userSelect: "none",
+                    boxShadow: "0 8px 24px rgba(239, 68, 68, 0.4)",
+                    marginBottom: 24,
+                  }}
+                >
+                  BUZZER
+                </button>
+                
+                {/* Message de mauvaise réponse */}
                 <div 
                   style={{ 
                     opacity: 0.9, 
                     fontSize: 18, 
-                    color: "#f59e0b",
+                    color: "#ef4444",
                     fontWeight: 700,
                     lineHeight: 1.6,
-                    marginBottom: 16
                   }}
-                  dangerouslySetInnerHTML={{ 
-                    __html: addSmartLineBreaks(ELEYBUZZ_PLAYER_MESSAGES.punishment.replace("{penalty}", String(buzzerWrongPenalty))).replace(/\.\s+/g, ".<br>")
-                  }}
-                />
-                {/* Afficher le timer si cooldown actif, sinon juste le message */}
-                {hasActiveCooldown && (
-                  <div 
-                    style={{ 
-                      fontSize: "2.5rem", 
-                      fontWeight: 800, 
-                      color: "#f59e0b",
-                      fontFamily: "monospace",
-                      letterSpacing: 2
-                    }}
-                  >
-                    {remainingSec}
-                  </div>
-                )}
+                >
+                  Mauvaise réponse{lastWrongPenalty ? `, tu perds ${lastWrongPenalty} point${lastWrongPenalty > 1 ? 's' : ''}` : ''}. Attends la prochaine question pour rejouer !
+                </div>
               </div>
             );
           }
@@ -2241,7 +3009,7 @@ export default function Player() {
               <div 
                 style={{ opacity: 0.85, fontSize: 16, lineHeight: 1.6 }}
                 dangerouslySetInnerHTML={{ 
-                  __html: "Écoute attentivement la question de Eley.<br><br>Puis, dès que le Buzzer apparaît, appuie vite dessus si tu connais la réponse !<br><br>Attention, tu auras une pénalité si tu réponds faux !"
+                  __html: addSmartLineBreaks(playerEleyBuzzMessages.idle)
                 }}
               />
             );
@@ -2254,9 +3022,9 @@ export default function Player() {
             if (!effectiveBuzzerState || typeof effectiveBuzzerState !== 'string') {
               // Fallback si l'état n'est pas valide (peut arriver en production)
               return {
-                background: "#6b7280",
-                border: "#fff",
-                shadow: "0 8px 24px rgba(107, 114, 128, 0.3)",
+                background: "#0f172a", // Presque noir avec teinte bleue, presque fondu avec le fond
+                border: "#1e293b", // Bordure très foncée
+                shadow: "0 8px 24px rgba(10, 10, 26, 0.6)", // Ombre très foncée, presque invisible
                 isClickable: false,
                 isAnimating: false,
               };
@@ -2292,11 +3060,32 @@ export default function Player() {
               }
               
               // Une fois le serveur a confirmé (firstPlayerId !== null) :
-              // Premier joueur confirmé par le serveur : jaune (utiliser firstPlayerId, pas effectiveFirstPlayerId)
+              // Premier joueur confirmé par le serveur : jaune par défaut, vert si bonne réponse, rouge si mauvaise réponse
               // Garde-fou pour la production : vérifier que les valeurs sont valides
               if (firstPlayerId && playerId && firstPlayerId === playerId) {
+                // Si c'est une bonne réponse, afficher en vert
+                if (buzzerMessageType === "correct") {
+                  return {
+                    background: "#10b981", // Vert pour bonne réponse
+                    border: "#fff",
+                    shadow: "0 8px 24px rgba(16, 185, 129, 0.4)",
+                    isClickable: false,
+                    isAnimating: false,
+                  };
+                }
+                // Si c'est une mauvaise réponse, afficher en rouge
+                if (buzzerMessageType === "wrong") {
+                  return {
+                    background: "#ef4444", // Rouge pour mauvaise réponse
+                    border: "#fff",
+                    shadow: "0 8px 24px rgba(239, 68, 68, 0.4)",
+                    isClickable: false,
+                    isAnimating: false,
+                  };
+                }
+                // Sinon, jaune par défaut (en attente de réponse)
                 return {
-                  background: "#facc15",
+                  background: "#facc15", // Jaune par défaut
                   border: "#fff",
                   shadow: "0 8px 24px rgba(250, 204, 21, 0.4)",
                   isClickable: false,
@@ -2304,11 +3093,12 @@ export default function Player() {
                 };
               }
               
-              // Autres joueurs : gris (même ceux qui avaient buzzé mais ne sont pas premiers)
+              // Autres joueurs : gris très foncé (même ceux qui avaient buzzé mais ne sont pas premiers)
+              // Couleur très sombre pour bien indiquer qu'on ne peut plus buzzer
               return {
-                background: "#6b7280",
-                border: "#fff",
-                shadow: "0 8px 24px rgba(107, 114, 128, 0.3)",
+                background: "#0f172a", // Presque noir avec teinte bleue, presque fondu avec le fond #0a0a1a
+                border: "#1e293b", // Bordure très foncée pour se fondre avec le fond
+                shadow: "0 8px 24px rgba(10, 10, 26, 0.6)", // Ombre très foncée, presque invisible
                 isClickable: false,
                 isAnimating: false,
               };
@@ -2371,14 +3161,20 @@ export default function Player() {
                   borderRadius: "50%",
                   border: `4px solid ${buzzerStyle.border}`,
                   background: buzzerStyle.background,
-                  color: "#fff",
+                  color: (() => {
+                    // Griser le texte seulement si le buzzer est verrouillé ET que ce n'est pas le premier joueur
+                    const isGreyedOut = effectiveBuzzerState === BUZZER_STATES.LOCKED && 
+                                       firstPlayerId && 
+                                       firstPlayerId !== playerId;
+                    return isGreyedOut ? "#334155" : "#fff"; // Gris très foncé (presque invisible) si verrouillé, blanc sinon
+                  })(),
                   fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
                   fontWeight: 800,
                   cursor: effectiveBuzzerState === BUZZER_STATES.OPEN ? "pointer" : "default",
                   touchAction: "manipulation",
                   WebkitTapHighlightColor: "transparent",
                   userSelect: "none",
-                  transition: "transform 100ms ease, background 100ms ease",
+                  transition: "transform 100ms ease, background 100ms ease, color 100ms ease",
                   boxShadow: buzzerStyle.shadow,
                   // Pas d'animation automatique, seulement au clic/touch
                 }}
@@ -2446,24 +3242,24 @@ export default function Player() {
                       // Garde-fou pour la production : vérifier que les valeurs sont valides
                       const isFirstPlayer = playerId && firstPlayerId && playerId === firstPlayerId;
                       if (isFirstPlayer && buzzerMessageType === "correct") {
-                        return ELEYBUZZ_PLAYER_MESSAGES.correctAnswer;
+                        return `Bravo, tu gagnes ${buzzerPoints} point${buzzerPoints > 1 ? 's' : ''} bonus⚡`;
                       }
                       if (isFirstPlayer && buzzerMessageType === "wrong") {
-                        return ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer;
+                        return `Mauvaise réponse${lastWrongPenalty ? `, tu perds ${lastWrongPenalty} point${lastWrongPenalty > 1 ? 's' : ''}` : ''}. Attends la prochaine question pour rejouer !`;
                       }
                       if (isFirstPlayer) {
-                        return ELEYBUZZ_PLAYER_MESSAGES.yourTurn;
+                        return playerEleyBuzzMessages.yourTurn;
                       }
                       if (buzzerMessageType === "correct") {
-                        return ELEYBUZZ_PLAYER_MESSAGES.waitNextQuestion;
+                        return playerEleyBuzzMessages.waitNextQuestion;
                       }
                       if (buzzerMessageType === "wrong") {
-                        return ELEYBUZZ_PLAYER_MESSAGES.tryYourChance;
+                        return playerEleyBuzzMessages.tryYourChance;
                       }
                       // Si le buzzer est gris (pas le premier joueur), afficher le message "trop lent"
                       // Garde-fou pour la production : vérifier que les valeurs sont valides
                       if (firstPlayerId && firstPlayerId !== null && playerId && firstPlayerId !== playerId) {
-                        return ELEYBUZZ_PLAYER_MESSAGES.tooSlow;
+                        return playerEleyBuzzMessages.tooSlow || playerEleyBuzzMessages.locked;
                       }
                       return null; // Pas de message si rien de spécial
                     })()
@@ -2497,12 +3293,44 @@ export default function Player() {
         }}
       >
         <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
-          {finalPodiumTitle}
+          Fin de la soirée, voici les scores
         </h1>
+        
+        {/* Bloc Score équipe */}
+        {teamId && (
+          <div
+            style={{
+              marginTop: 8,
+              marginBottom: 20,
+              padding: 16,
+              borderRadius: 12,
+              background: "#0b0f1a",
+              border: "1px solid #1f2a44",
+              textAlign: "center",
+              maxWidth: "min(500px, 95%)",
+            }}
+          >
+            <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700 }}>
+              <span style={{ color: "#fff" }}>Ton équipe a </span>
+              <span style={{ color: teamColor || "#fff" }}><b>{teamQuizScore}</b></span>
+              <span style={{ color: "#fff" }}> points</span>
+            </div>
+            {myTeamRank != null && (
+              <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8 }}>
+                {myTeamMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myTeamMedal}</span>}
+                <span style={{ color: "#fff" }}>Classement : </span>
+                <span style={{ color: teamColor || "#fff" }}>{myTeamRank === 1 ? "1er" : myTeamRank === 2 ? "2ème" : myTeamRank === 3 ? "3ème" : `${myTeamRank}ème`}</span>
+                <span style={{ color: "#fff" }}> des équipes</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Bloc Score personnel */}
         <div
           style={{
-            marginTop: 8,
-            padding: 20,
+            marginTop: teamId ? 0 : 8,
+            padding: 16,
             borderRadius: 12,
             background: "#0b0f1a",
             border: "1px solid #1f2a44",
@@ -2510,16 +3338,16 @@ export default function Player() {
             maxWidth: "min(500px, 95%)",
           }}
         >
-          <div style={{ fontSize: "clamp(1.5rem, 5vw, 2rem)", fontWeight: 800, marginBottom: 12 }}>
-            Fin de la soirée, ton score est de :
+          <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700, marginBottom: 8 }}>
+            Ton score personnel
           </div>
-          <div style={{ fontSize: "clamp(2rem, 8vw, 3rem)", fontWeight: 900, color: "#facc15", marginBottom: 16 }}>
+          <div style={{ fontSize: "clamp(1.5rem, 6vw, 2rem)", fontWeight: 900, color: "#fff" }}>
             {myFinalScore} pts
           </div>
           {myFinalRank != null && (
-            <div style={{ fontSize: "clamp(1.1rem, 4vw, 1.3rem)", opacity: 0.9 }}>
-              {myFinalMedal && <span style={{ fontSize: "1.5rem", marginRight: 8 }}>{myFinalMedal}</span>}
-              {messageForRank(myFinalRank)}
+            <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8, opacity: 0.9 }}>
+              {myFinalMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myFinalMedal}</span>}
+              Classement : {myFinalRank === 1 ? "1er" : myFinalRank === 2 ? "2ème" : myFinalRank === 3 ? "3ème" : `${myFinalRank}ème`} des joueurs
             </div>
           )}
         </div>
@@ -2536,47 +3364,96 @@ export default function Player() {
           background: "#0a0a1a",
           color: "#fff",
           minHeight: "calc(var(--vh, 1vh) * 100)",
-          display: "grid",
-          placeItems: "center",
+          display: "flex",
+          flexDirection: "column",
           padding: "24px",
+          paddingTop: `calc(12px + ${SAFE_TOP})`,
           textAlign: "center",
+          position: "relative",
         }}
       >
-        <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
+        {/* Bandeau joueur en haut */}
+        {playerName && teamId && <PlayerBadge position="relative" />}
+        
+        {/* Timer sous le bandeau */}
+        {isRunning && (
+          <div
+            style={{
+              background: "#111",
+              padding: "6px 10px",
+              borderRadius: 8,
+              fontFamily: "monospace",
+              letterSpacing: 1,
+              border: "1px solid #2a2a2a",
+              display: "inline-block",
+              marginBottom: 24,
+              alignSelf: "center",
+            }}
+          >
+            ⏱ {formatHMS(elapsedSec)}
+          </div>
+        )}
+
+        <div style={{ width: "min(380px, 100%)", margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
           <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
             ELEY&nbsp;Quiz — En attente du départ
           </h1>
-        </div>
 
-        <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
-          <p style={{ opacity: 0.85 }}>
-            {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
-            L'Admin n'a pas encore lancé le quiz.
-          </p>
+          <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
+            <p style={{ opacity: 0.85 }}>
+              {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
+              {teamName ? (
+                <>Tu es dans l'équipe <b style={{ color: teamColor || "#fff" }}>{teamName}</b>.<br /></>
+              ) : null}
+              L'Admin n'a pas encore lancé le quiz.
+            </p>
 
-          {(!nameLocked && !isRunning) ? (
-            <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-              Envie de changer de nom ?{" "}
-              <button
-                onClick={resetAndDeletePlayer}
-                style={{
-                  color: "#93c5fd",
-                  background: "transparent",
-                  border: "none",
-                  cursor: "pointer",
-                  textDecoration: "underline",
-                }}
-              >
-                Modifier mon nom
-              </button>
-            </div>
-          ) : (
-            nameLocked && (
-              <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                Ton nom a été fixé par l'animateur.
-              </div>
-            )
-          )}
+            {(!nameLocked && !isRunning) ? (
+              <>
+                <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                  Envie de changer de nom ?{" "}
+                  <button
+                    onClick={resetAndDeletePlayer}
+                    style={{
+                      color: "#93c5fd",
+                      background: "transparent",
+                      border: "none",
+                      cursor: "pointer",
+                      textDecoration: "underline",
+                    }}
+                  >
+                    Modifier mon nom
+                  </button>
+                </div>
+                {teamId && teamName && (
+                  <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                    Envie de changer d'équipe ?{" "}
+                    <button
+                      onClick={() => {
+                        setNeedsTeamSelection(true);
+                        setTeamSelectionMode(null);
+                      }}
+                      style={{
+                        color: "#93c5fd",
+                        background: "transparent",
+                        border: "none",
+                        cursor: "pointer",
+                        textDecoration: "underline",
+                      }}
+                    >
+                      Changer d'équipe
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              nameLocked && (
+                <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+                  Ton nom a été fixé par l'animateur.
+                </div>
+              )
+            )}
+          </div>
         </div>
       </div>
     );
@@ -2620,57 +3497,25 @@ export default function Player() {
         }}
       />
 
-      {/* Timer discret en haut-droite */}
-      <div
-        style={{
-          position: "absolute",
-          top: `calc(12px + ${SAFE_TOP})`,
-          right: 12,
-          background: "#111",
-          padding: "6px 10px",
-          borderRadius: 8,
-          fontFamily: "monospace",
-          letterSpacing: 1,
-          border: "1px solid #2a2a2a",
-        }}
-      >
-        ⏱ {formatHMS(elapsedSec)}
-      </div>
-
-      {/* Badge nom joueur en haut-gauche (même ligne que le timer) */}
-      {(isRunning || isBuzzerMode) && playerName && (
+      {/* Bandeau joueur en haut */}
+      {playerName && teamId && <PlayerBadge showTimer={true} />}
+      
+      {/* Timer sous le bandeau */}
+      {(isRunning || isBuzzerMode) && (
         <div
           style={{
             position: "absolute",
-            top: `calc(12px + ${SAFE_TOP})`,
-            left: 12,
-            zIndex: 20,
-            background: "#0b1e3d",
-            border: "1px solid #1f2a44",
-            borderRadius: 9999,
+            top: `calc(60px + ${SAFE_TOP})`,
+            right: 12,
+            background: "#111",
             padding: "6px 10px",
-            fontSize: 14,
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 6,
-            color: "#fff",
+            borderRadius: 8,
+            fontFamily: "monospace",
+            letterSpacing: 1,
+            border: "1px solid #2a2a2a",
           }}
-          aria-label="Nom du joueur"
-          title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
         >
-          <span>👤</span>
-          <b style={{ letterSpacing: 0.2 }}>{playerName}</b>
-          {(isRunning || isBuzzerMode) && myScore != null && (
-            <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums" }}>
-              • {myScore}
-            </span>
-          )}
-          {(isRunning || isBuzzerMode) && (
-            <span style={{ marginLeft: 4, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15" }}>
-              • ⚡ {myBuzzScore}
-            </span>
-          )}
-          {nameLocked && <span style={{ opacity: 0.7, marginLeft: 6 }}>🔒</span>}
+          ⏱ {formatHMS(elapsedSec)}
         </div>
       )}
 
@@ -2680,24 +3525,54 @@ export default function Player() {
       {isQuizEnded ? (
         <>
           <h2 style={{ fontSize: "2rem", marginTop: 24 }}>Fin du quiz</h2>
+          
+          {/* Bloc Score équipe */}
+          {teamId && (
+            <div
+              style={{
+                marginTop: 8,
+                marginBottom: 20,
+                padding: 16,
+                borderRadius: 12,
+                background: "#0b0f1a",
+                border: "1px solid #1f2a44",
+                textAlign: "center",
+              }}
+            >
+              <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700, color: teamColor || "#fff" }}>
+                Ton équipe a <b>{teamQuizScore}</b> points
+              </div>
+              {myTeamRank != null && (
+                <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8, color: teamColor || "#fff" }}>
+                  {myTeamMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myTeamMedal}</span>}
+                  Classement : {myTeamRank === 1 ? "1er" : myTeamRank === 2 ? "2ème" : myTeamRank === 3 ? "3ème" : `${myTeamRank}ème`}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Bloc Score personnel */}
           <div
             style={{
-              marginTop: 8,
-              padding: 12,
+              marginTop: teamId ? 0 : 8,
+              padding: 16,
               borderRadius: 12,
               background: "#0b0f1a",
               border: "1px solid #1f2a44",
               textAlign: "center",
             }}
           >
-            <div style={{ fontSize: "clamp(1.1rem, 4.8vw, 1.5rem)", fontWeight: 800 }}>
-              {myMedal ? `${myMedal} ` : ""}{myRank != null ? finalScoreMessageForRank(myRank, myScore) : "Merci pour ta participation !"}
+            <div style={{ fontSize: "clamp(1rem, 4vw, 1.2rem)", fontWeight: 600, marginBottom: 12, opacity: 0.9 }}>
+              Voici ton score personnel
             </div>
-            {myRank != null && (
-              <div style={{ marginTop: 6, opacity: 0.9, fontSize: "clamp(0.95rem, 3.8vw, 1rem)" }}>
-                Ton score : <b>{myScore}</b> • Classement : <b>{Number(myScore) > 0 ? `#${myRank}` : "dernier"}</b>
-              </div>
-            )}
+            <div style={{ fontSize: "clamp(1.1rem, 4.5vw, 1.4rem)", fontWeight: 700 }}>
+              <b>{myScore != null ? myScore : 0}</b> points
+              {myBuzzScore != null && myBuzzScore > 0 && (
+                <span style={{ marginLeft: 8, color: "#facc15" }}>
+                  • ⚡ <b>{myBuzzScore}</b> bonus
+                </span>
+              )}
+            </div>
           </div>
         </>
       ) : isRoundBreak ? (
@@ -2707,23 +3582,18 @@ export default function Player() {
             Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
           </h2>
           <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>
-            (pause de manche)
+            (pause)
           </div>
-          <div style={{ marginTop: 10, opacity: 0.9 }}>
-            Ton score actuel est : <b>{myScore}</b>
-          </div>
-          {myRank != null && (
-            <div
-              style={{
-                marginTop: 6,
-                opacity: 0.9,
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-              }}
-            >
-              {myMedal ? <span aria-label="médaille" title="médaille">{myMedal}</span> : null}
-              <span>Tu es {Number(myScore) > 0 ? (myRank === 1 ? "1er" : `${myRank}ᵉ`) : "dernier"} dans le classement</span>
+          {/* Score équipe (plus visible) */}
+          {teamId && myTeamRank != null && (
+            <div style={{ marginTop: 12, fontSize: "1.5rem", fontWeight: 900, color: teamColor || "#fff" }}>
+              {myTeamMedal && <span style={{ marginRight: 8 }}>{myTeamMedal}</span>}
+              <span>Équipe {teamName || ""} : <b>{myTeamScore}</b> pts</span>
+              {myTeamRank <= 3 && (
+                <span style={{ marginLeft: 8, fontSize: "1.1rem" }}>
+                  ({myTeamRank === 1 ? "1ère" : `${myTeamRank}ème`} place)
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -3042,10 +3912,25 @@ export default function Player() {
                 {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
               </div>
               {Number.isFinite(gainedPoints) && (
-                <div style={{ marginTop: 6, fontSize: "0.95rem", opacity: 0.9 }}>
-                  Tu as marqué {gainedPoints} point{gainedPoints > 1 ? "s" : ""}
-                  {instantWin?.rank ? ` ${medalForRank(instantWin.rank)}` : ""}
-                </div>
+                <>
+                  {/* Score équipe (plus visible) */}
+                  {teamId && myTeamRank != null && (
+                    <div style={{ marginTop: 8, fontSize: "1.2rem", fontWeight: 900, color: teamColor || "#fff" }}>
+                      {myTeamMedal && <span style={{ marginRight: 6 }}>{myTeamMedal}</span>}
+                      <span>Équipe {teamName || ""} : <b>{myTeamScore}</b> pts</span>
+                      {myTeamRank <= 3 && (
+                        <span style={{ marginLeft: 6, fontSize: "0.9rem" }}>
+                          ({myTeamRank === 1 ? "1ère" : `${myTeamRank}ème`} place)
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {/* Score individuel (moins visible) */}
+                  <div style={{ marginTop: 4, fontSize: "0.9rem", opacity: 0.8 }}>
+                    Tu as marqué {gainedPoints} point{gainedPoints > 1 ? "s" : ""}
+                    {instantWin?.rank ? (instantWin.rank === 1 ? " 💛" : instantWin.rank === 2 ? " 🤍" : instantWin.rank === 3 ? " 🤎" : "") : ""}
+                  </div>
+                </>
               )}
             </div>
           )}

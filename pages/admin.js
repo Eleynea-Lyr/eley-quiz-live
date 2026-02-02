@@ -3,7 +3,7 @@
 // Scope : Interface d'administration complète (questions, joueurs, contrôles)
 // ============================================================================
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, Fragment } from "react";
 import { db, storage } from "../lib/firebase";
 import {
   collection,
@@ -21,6 +21,7 @@ import {
   onSnapshot,
   Timestamp,
   arrayUnion,
+  arrayRemove,
   runTransaction,
   where,
   increment,
@@ -31,6 +32,7 @@ import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 // Imports depuis les fichiers utilitaires
 import {
   DEFAULT_SCORING_TABLE,
+  DEFAULT_TEAM_SCORING_TABLE,
   DEFAULT_REVEAL_DURATION_SEC,
   DEFAULT_LEADERBOARD_TOP_N,
   TIME_MUSIC_MIN_SEC,
@@ -40,10 +42,9 @@ import {
   DEFAULT_BUZZER_WRONG_PENALTY,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
-  BUZZER_COOLDOWN_MS,
   BUZZER_STATES,
 } from "../lib/constants";
-import { DEFAULT_REVEAL_PHRASES } from "../lib/messages";
+import { DEFAULT_REVEAL_PHRASES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
 
 import {
   parseHMS,
@@ -55,13 +56,16 @@ import {
   normKey,
   pickColorDifferent,
   normalizeNameAlpha,
+  normalizeTeamName,
   getTimeSec,
   roundIndexOfTime,
 } from "../lib/utils";
 
 import {
+  deleteTeamTx,
   ensureAwardsForQuestionTx,
   resetScoringCache,
+  resetTeamScoringCache,
   registerBuzzerPress,
   awardBuzzerPoints,
   resetBuzzerState,
@@ -93,7 +97,13 @@ async function ensureConfigDefaults() {
   const patch = {};
 
   // Defaults existants
-  if (!("scoringTable" in data)) patch.scoringTable = DEFAULT_SCORING_TABLE;
+  // Vérifier si la table de scoring est l'ancienne (commence par 30) et la mettre à jour
+  const currentScoringTable = data.scoringTable;
+  const isOldScoringTable = Array.isArray(currentScoringTable) && currentScoringTable[0] === 30;
+  if (!("scoringTable" in data) || isOldScoringTable) {
+    patch.scoringTable = DEFAULT_SCORING_TABLE;
+  }
+  if (!("teamScoringTable" in data)) patch.teamScoringTable = DEFAULT_TEAM_SCORING_TABLE;
   if (!("revealDurationSec" in data)) {
     patch.revealDurationSec = DEFAULT_REVEAL_DURATION_SEC;
   }
@@ -133,6 +143,13 @@ async function ensureConfigDefaults() {
 
   if (Object.keys(patch).length > 0) {
     await setDoc(cfgRef, patch, { merge: true });
+    // Si on a mis à jour la table de scoring, réinitialiser le cache
+    if (patch.scoringTable) {
+      resetScoringCache();
+    }
+    if (patch.teamScoringTable) {
+      resetTeamScoringCache();
+    }
   }
 
   // Backfill des questions existantes : leur attribuer quizKey = defaultQuizKey si manquant
@@ -443,6 +460,19 @@ function AdminInner() {
   const [playersLoading, setPlayersLoading] = useState(true);
   const assignedColorRef = useRef(new Set());
   const lastAssignedColorRef = useRef(null);
+  
+  // Filtrage des joueurs
+  const [showRejected, setShowRejected] = useState(false);
+  const [showKicked, setShowKicked] = useState(false);
+  
+  // Liste globale des noms refusés
+  const [globalRejectedNames, setGlobalRejectedNames] = useState([]);
+
+  // Équipes
+  const [teams, setTeams] = useState([]);
+  const [teamsLoading, setTeamsLoading] = useState(true);
+  const [expandedTeamIds, setExpandedTeamIds] = useState(new Set()); // Set d'IDs d'équipes ouvertes
+  const [leaderboardView, setLeaderboardView] = useState("teams"); // "teams" | "players"
 
   // Ordre d’arrivée local
   const playerOrderRef = useRef(new Map()); // id -> index d’arrivée
@@ -495,9 +525,15 @@ function AdminInner() {
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
-  const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
   const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
   const [defaultTimeMusicSec, setDefaultTimeMusicSec] = useState(DEFAULT_TIME_MUSIC_SEC);
+  
+  // Messages personnalisables EleyBuzz Screen
+  const [screenEleyBuzzMessages, setScreenEleyBuzzMessages] = useState(ELEYBUZZ_SCREEN_MESSAGES);
+  
+  // États pour l'édition des scores
+  const [editingScore, setEditingScore] = useState({ playerId: null, field: null }); // { playerId: "xxx", field: "score" ou "buzzScore" }
+  const [editingValue, setEditingValue] = useState("");
 
   // Refs pour connaître la phase courante sans dépendance d'ordre
   const isCountdownRef = useRef(false);
@@ -586,8 +622,6 @@ function AdminInner() {
         setBuzzerCorrectMessageDurationMs(bcmd);
         const bwmd = Number.isFinite(d?.buzzerWrongMessageDurationMs) ? d.buzzerWrongMessageDurationMs : BUZZER_WRONG_MESSAGE_DURATION_MS;
         setBuzzerWrongMessageDurationMs(bwmd);
-        const bcm = Number.isFinite(d?.buzzerCooldownMs) ? d.buzzerCooldownMs : BUZZER_COOLDOWN_MS;
-        setBuzzerCooldownMs(bcm);
         const bwp = Number.isFinite(d?.buzzerWrongPenalty) ? d.buzzerWrongPenalty : DEFAULT_BUZZER_WRONG_PENALTY;
         setBuzzerWrongPenalty(bwp);
 
@@ -603,6 +637,20 @@ function AdminInner() {
           setRevealPhrases(d.revealPhrases);
         } else {
           setRevealPhrases([...DEFAULT_REVEAL_PHRASES]);
+        }
+
+        // Liste globale des noms refusés
+        if (Array.isArray(d?.globalRejectedNames)) {
+          setGlobalRejectedNames(d.globalRejectedNames);
+        } else {
+          setGlobalRejectedNames([]);
+        }
+
+        // Vue du leaderboard (Équipes ou Joueurs)
+        if (d?.leaderboardView === "players" || d?.leaderboardView === "teams") {
+          setLeaderboardView(d.leaderboardView);
+        } else {
+          setLeaderboardView("teams"); // Par défaut : équipes
         }
 
         // Quiz sélectionné dans l'UI : si absent, basculer sur le quiz actif
@@ -799,6 +847,23 @@ function AdminInner() {
     return () => unsub();
   }, []);
 
+  // Charger les messages personnalisés depuis Firestore
+  useEffect(() => {
+    const configRef = doc(db, "quiz", "config");
+    const unsub = onSnapshot(configRef, (snap) => {
+      const data = snap.data() || {};
+      if (data.screenEleyBuzz) {
+        setScreenEleyBuzzMessages({
+          ...ELEYBUZZ_SCREEN_MESSAGES,
+          ...data.screenEleyBuzz,
+        });
+      } else {
+        setScreenEleyBuzzMessages(ELEYBUZZ_SCREEN_MESSAGES);
+      }
+    });
+    return () => unsub();
+  }, []);
+
   // ============================================================================
   // /pages/admin.js — Partie 3/6
   // Scope : Effets 4→6 + Heartbeat dynamique + Dérivés rounds/reveal +
@@ -906,7 +971,9 @@ function AdminInner() {
           updateDoc(pref, { nameNorm: normKey(p.name || "") }).catch(() => { });
         }
 
-        if (!p.color && !assignedColorRef.current.has(p.id)) {
+        // Assigner une couleur seulement si le joueur n'a pas d'équipe
+        // Si le joueur a une équipe, la couleur sera héritée de l'équipe
+        if (!p.teamId && !p.color && !assignedColorRef.current.has(p.id)) {
           assignedColorRef.current.add(p.id);
           const prev = lastAssignedColorRef.current;
           const color = pickColorDifferent(prev, PLAYER_COLORS);
@@ -935,6 +1002,42 @@ function AdminInner() {
 
     return () => unsub();
   }, []);
+
+  // [3.3.1] Effect — Écouter /quiz/state/teams
+  const previousTeamsRef = useRef([]);
+  useEffect(() => {
+    const teamsCol = collection(db, "quiz", "state", "teams");
+    const unsub = onSnapshot(teamsCol, (snap) => {
+      const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      
+      // Détecter les nouvelles équipes (celles qui n'étaient pas dans la liste précédente)
+      const previousTeamIds = new Set(previousTeamsRef.current.map((t) => t.id));
+      const newTeamIds = arr
+        .filter((t) => !previousTeamIds.has(t.id))
+        .map((t) => t.id);
+      
+      setTeams(arr);
+      previousTeamsRef.current = arr; // Mettre à jour la référence
+      setTeamsLoading(false);
+      
+      // Ouvrir toutes les équipes par défaut au premier chargement
+      if (expandedTeamIds.size === 0 && arr.length > 0) {
+        setExpandedTeamIds(new Set(arr.map((t) => t.id)));
+      } else if (newTeamIds.length > 0) {
+        // Ouvrir automatiquement les nouvelles équipes créées
+        setExpandedTeamIds((prev) => {
+          const newSet = new Set(prev);
+          newTeamIds.forEach((teamId) => newSet.add(teamId));
+          return newSet;
+        });
+      }
+    }, (e) => {
+      console.error("onSnapshot teams error:", e);
+      setTeamsLoading(false);
+    });
+
+    return () => unsub();
+  }, [expandedTeamIds.size]);
 
   // [3.4] Effect — Heartbeat dynamique (boost pendant reveal/countdown)
   useEffect(() => {
@@ -1168,31 +1271,8 @@ function AdminInner() {
   }, [isRevealAnswerPhase]);
 
 
-  /* === Contrôle clavier EleyBuzz (touches 1, 2, 3) === */
-  useEffect(() => {
-    if (!isBuzzerMode) return;
-
-    const handleKeyDown = (e) => {
-      // Touche 1 : toggle buzzer state (idle ↔ open)
-      if (e.key === "1" && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        e.preventDefault();
-        toggleBuzzerState();
-      }
-      // Touche 2 : bonne réponse
-      else if (e.key === "2" && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        e.preventDefault();
-        handleBuzzerCorrect();
-      }
-      // Touche 3 : mauvaise réponse
-      else if (e.key === "3" && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        e.preventDefault();
-        handleBuzzerWrong();
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isBuzzerMode, buzzerState, firstPlayerId, firstPlayerName, buzzerPoints]);
+  /* === Contrôle clavier EleyBuzz (désactivé - les raccourcis seront gérés via Stream Deck) === */
+  // Les raccourcis clavier 1, 2, 3 ont été désactivés pour permettre l'utilisation normale du clavier numérique
 
   /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
   useEffect(() => {
@@ -2329,6 +2409,7 @@ function AdminInner() {
         typeof d.name === "string" ? d.name : currentName || ""
       );
 
+      // Mettre à jour le statut du joueur (garder ses scores)
       const baseUpdates = {
         nameStatus: "rejected",
         nameLocked: false,
@@ -2339,13 +2420,39 @@ function AdminInner() {
             : new Date(),
       };
 
-      const updates = isAliased
-        ? baseUpdates
-        : { ...baseUpdates, rejectedNames: arrayUnion(norm) };
+      await updateDoc(ref, baseUpdates);
 
-      await updateDoc(ref, updates);
+      // Ajouter le nom à la liste globale des noms refusés (si ce n'est pas un alias)
+      if (!isAliased && norm) {
+        const configRef = doc(db, "quiz", "config");
+        const configSnap = await getDoc(configRef);
+        const configData = configSnap.exists() ? configSnap.data() : {};
+        const currentRejected = Array.isArray(configData.globalRejectedNames) 
+          ? configData.globalRejectedNames 
+          : [];
+        
+        // Éviter les doublons
+        if (!currentRejected.includes(norm)) {
+          await updateDoc(configRef, {
+            globalRejectedNames: arrayUnion(norm)
+          }, { merge: true });
+        }
+      }
     } catch (e) {
       console.error("rejectPlayer failed:", e);
+    }
+  }
+
+  // [5.2.1] Retirer un nom de la liste globale des noms refusés
+  async function removeRejectedName(nameNorm) {
+    try {
+      const configRef = doc(db, "quiz", "config");
+      await updateDoc(configRef, {
+        globalRejectedNames: arrayRemove(nameNorm)
+      }, { merge: true });
+    } catch (e) {
+      console.error("removeRejectedName failed:", e);
+      alert("Erreur lors de la suppression du nom : " + (e?.message || e));
     }
   }
 
@@ -2356,6 +2463,120 @@ function AdminInner() {
       await updateDoc(doc(playersCol, id), { isKicked: true });
     } catch (e) {
       console.error("kickPlayer", e);
+    }
+  }
+
+  // [5.3.1] Réaccepter un joueur kické (conserve ses scores)
+  async function unkickPlayer(id) {
+    try {
+      const playersCol = collection(db, "quiz", "state", "players");
+      await updateDoc(doc(playersCol, id), { isKicked: false });
+    } catch (e) {
+      console.error("unkickPlayer", e);
+    }
+  }
+
+  // [5.4.1] Actions sur les équipes
+  async function rejectTeam(teamId, teamName) {
+    try {
+      // Ajouter à la liste globale des noms d'équipes refusés avant de supprimer
+      const norm = normalizeTeamName(teamName);
+      if (norm) {
+        const configRef = doc(db, "quiz", "config");
+        const configSnap = await getDoc(configRef);
+        const configData = configSnap.exists() ? configSnap.data() : {};
+        const currentRejected = Array.isArray(configData.globalRejectedTeamNames) 
+          ? configData.globalRejectedTeamNames 
+          : [];
+        
+        if (!currentRejected.includes(norm)) {
+          await updateDoc(configRef, {
+            globalRejectedTeamNames: arrayUnion(norm)
+          }, { merge: true });
+        }
+      }
+
+      // Supprimer l'équipe et retirer tous ses membres
+      const result = await deleteTeamTx(db, teamId);
+      if (!result.ok) {
+        console.error("rejectTeam failed:", result.reason);
+        alert("Erreur lors de la suppression de l'équipe : " + (result.reason || "Erreur inconnue"));
+      }
+    } catch (e) {
+      console.error("rejectTeam failed:", e);
+      alert("Erreur lors de la suppression de l'équipe : " + (e?.message || e));
+    }
+  }
+
+  async function kickTeam(teamId) {
+    try {
+      const teamsCol = collection(db, "quiz", "state", "teams");
+      const teamRef = doc(teamsCol, teamId);
+      const teamSnap = await getDoc(teamRef);
+      if (!teamSnap.exists()) return;
+
+      const teamData = teamSnap.data();
+      const memberIds = teamData.memberIds || [];
+
+      // Kick l'équipe
+      await updateDoc(teamRef, { isKicked: true, updatedAt: serverTimestamp() });
+
+      // Kick tous les membres
+      const playersCol = collection(db, "quiz", "state", "players");
+      const batch = writeBatch(db);
+      memberIds.forEach((playerId) => {
+        const playerRef = doc(playersCol, playerId);
+        batch.update(playerRef, { isKicked: true });
+      });
+      await batch.commit();
+    } catch (e) {
+      console.error("kickTeam failed:", e);
+    }
+  }
+
+  async function unkickTeam(teamId) {
+    try {
+      const teamsCol = collection(db, "quiz", "state", "teams");
+      const teamRef = doc(teamsCol, teamId);
+      const teamSnap = await getDoc(teamRef);
+      if (!teamSnap.exists()) return;
+
+      const teamData = teamSnap.data();
+      const memberIds = teamData.memberIds || [];
+
+      // Réaccepter l'équipe
+      await updateDoc(teamRef, { 
+        isKicked: false,
+        updatedAt: serverTimestamp(),
+      });
+
+      // Réaccepter tous les membres
+      const playersCol = collection(db, "quiz", "state", "players");
+      const batch = writeBatch(db);
+      memberIds.forEach((playerId) => {
+        const playerRef = doc(playersCol, playerId);
+        batch.update(playerRef, { isKicked: false });
+      });
+      await batch.commit();
+    } catch (e) {
+      console.error("unkickTeam failed:", e);
+    }
+  }
+
+  async function saveTeamScore(teamId, field, value) {
+    try {
+      const teamsCol = collection(db, "quiz", "state", "teams");
+      const numValue = Number(value);
+      if (!Number.isFinite(numValue)) return;
+      await updateDoc(doc(teamsCol, teamId), {
+        [field]: numValue,
+        updatedAt: serverTimestamp(),
+      });
+      setEditingScore({ playerId: null, field: null });
+      setEditingValue("");
+    } catch (e) {
+      console.error("saveTeamScore failed:", e);
+      alert("Erreur lors de la sauvegarde : " + (e?.message || e));
     }
   }
 
@@ -2477,6 +2698,17 @@ function AdminInner() {
 
       await deleteAllPlayers();
 
+      // Supprimer toutes les équipes
+      const teamsCol = collection(doc(db, "quiz", "state"), "teams");
+      const teamsSnap = await getDocs(teamsCol);
+      const deleteTeamsBatch = writeBatch(db);
+      teamsSnap.docs.forEach((teamDoc) => {
+        deleteTeamsBatch.delete(teamDoc.ref);
+      });
+      if (teamsSnap.docs.length > 0) {
+        await deleteTeamsBatch.commit();
+      }
+
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -2571,6 +2803,7 @@ function AdminInner() {
           buzzerState: "idle",
           firstPlayerId: null,
           firstPlayerName: null,
+          wrongAnswerCount: 0, // Initialiser le compteur de mauvaises réponses
         });
         // Réinitialiser tous les canBuzz des joueurs à true (pour débloquer ceux qui étaient en punition)
         await resetAllPlayerBuzzLocks(db, []);
@@ -2611,11 +2844,9 @@ function AdminInner() {
       const nextState = buzzerState === "idle" ? "open" : "idle";
       await resetBuzzerState(db, nextState);
       
-      // Quand on ouvre le buzzer, débloquer tous les joueurs (sauf ceux en cooldown de punition)
-      // Cela permet de s'assurer que tous les joueurs peuvent buzzer
-      if (nextState === "open") {
-        await resetAllPlayerBuzzLocks(db, []);
-      }
+      // Note : On ne débloque PAS les joueurs punis quand on ouvre le buzzer
+      // Les joueurs punis restent verrouillés jusqu'à la prochaine question (quand le buzzer revient à IDLE)
+      // resetBuzzerState débloque automatiquement tous les joueurs quand nextState === "idle"
     } catch (e) {
       console.error("toggleBuzzerState error:", e);
       setNotice("Erreur lors du changement d'état du buzzer");
@@ -2637,19 +2868,20 @@ function AdminInner() {
       
       // Afficher message temporaire (géré côté Screen via Firestore)
       const stateRef = doc(db, "quiz", "state");
+      const correctMessage = `${screenEleyBuzzMessages.correctAnswer} ${firstPlayerName || "Joueur"}, ${screenEleyBuzzMessages.youWin} ${buzzerPoints} ${screenEleyBuzzMessages.pts}`;
       await updateDoc(stateRef, {
-        buzzerMessage: `Bravo ${firstPlayerName || "Joueur"}, tu gagnes ${buzzerPoints} pts !`,
+        buzzerMessage: correctMessage,
         buzzerMessageType: "correct",
       });
 
-      // Reset après 1 seconde (au lieu de 5)
+      // Reset après 5 secondes
       setTimeout(async () => {
         await resetBuzzerState(db, "idle");
         await updateDoc(stateRef, {
           buzzerMessage: null,
           buzzerMessageType: null,
         });
-      }, 1000); // 1 seconde au lieu de buzzerCorrectMessageDurationMs
+      }, 5000); // 5 secondes
     } catch (e) {
       console.error("handleBuzzerCorrect error:", e);
       setNotice("Erreur lors de l'attribution des points");
@@ -2664,54 +2896,41 @@ function AdminInner() {
       const wrongPlayerId = firstPlayerId;
       const stateRef = doc(db, "quiz", "state");
       
-      // Retirer les points de pénalité du score EleyBuzz (peut aller en négatif)
-      await awardBuzzerPoints(db, wrongPlayerId, -buzzerWrongPenalty);
+      // Lire le compteur de mauvaises réponses pour cette question
+      const stateSnap = await getDoc(stateRef);
+      const stateData = stateSnap.exists() ? stateSnap.data() : {};
+      const wrongAnswerCount = Number(stateData.wrongAnswerCount || 0);
       
-      // Lock le joueur qui s'est trompé avec un cooldown de 20 secondes
-      // Le cooldown commence IMMÉDIATEMENT (pas de délai)
-      await lockPlayerBuzz(db, wrongPlayerId, buzzerCooldownMs);
-
-      // Afficher message temporaire (mais ne pas bloquer le reste)
+      // Calculer la pénalité progressive :
+      // 1ère = -1, 2ème = -2, 3ème = -3, 4ème = -4, 5ème+ = -5
+      const penalty = Math.min(wrongAnswerCount + 1, 5);
+      
+      // Retirer les points de pénalité du score EleyBuzz (peut aller en négatif)
+      await awardBuzzerPoints(db, wrongPlayerId, -penalty);
+      
+      // Stocker la pénalité appliquée dans le document du joueur pour l'affichage
+      const playerRef = doc(db, "quiz", "state", "players", wrongPlayerId);
+      await updateDoc(playerRef, {
+        lastWrongPenalty: penalty,
+      }, { merge: true });
+      
+      // Incrémenter le compteur de mauvaises réponses pour cette question
       await updateDoc(stateRef, {
-        buzzerMessage: "Mauvaise réponse !",
-        buzzerMessageType: "wrong",
-      });
+        wrongAnswerCount: wrongAnswerCount + 1,
+      }, { merge: true });
+      
+      // Lock le joueur qui s'est trompé jusqu'à la prochaine question (pas de cooldown)
+      // Le joueur ne pourra plus buzzer jusqu'à ce que le buzzer revienne à IDLE (nouvelle question)
+      await lockPlayerBuzz(db, wrongPlayerId, null);
 
-      // DÉBLOQUER IMMÉDIATEMENT les autres joueurs et réouvrir le buzzer (sans délai)
+      // DÉBLOQUER les autres joueurs et réouvrir le buzzer
       // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
-      // IMPORTANT : Cela débloque aussi tous les joueurs qui étaient punis avant (condition de libération)
       await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
+      
+      // Réouvrir le buzzer (sans afficher de message "mauvaise réponse" pour éviter le clignotement)
       await resetBuzzerState(db, "open");
       
-      // Le message "Mauvaise réponse" reste affiché mais n'empêche pas le buzzer d'être ouvert
-      // On le nettoie après un court délai (juste pour l'affichage, pas pour bloquer)
-      setTimeout(async () => {
-        try {
-          await updateDoc(stateRef, {
-            buzzerMessage: null,
-            buzzerMessageType: null,
-          });
-        } catch (e) {
-          console.error("[handleBuzzerWrong] Clear message error:", e);
-        }
-      }, 1000); // Nettoyer le message après 1 seconde (mais le buzzer est déjà ouvert)
-
-      // Cooldown de 20 secondes : si personne ne rebuzz, débloquer le joueur après 20s
-      setTimeout(async () => {
-        try {
-          // Vérifier que le buzzer est toujours ouvert et qu'aucun autre joueur n'a buzzé
-          const stateSnap = await getDoc(stateRef);
-          if (stateSnap.exists()) {
-            const data = stateSnap.data() || {};
-            // Si le buzzer est toujours ouvert et qu'aucun autre joueur n'a buzzé, débloquer
-            if (data.buzzerState === BUZZER_STATES.OPEN && !data.firstPlayerId) {
-              await resetPlayerBuzzLock(db, wrongPlayerId);
-            }
-          }
-        } catch (e) {
-          console.error("[handleBuzzerWrong] Cooldown unlock error:", e);
-        }
-      }, buzzerCooldownMs); // 20 secondes directement (plus besoin d'ajouter buzzerWrongMessageDurationMs)
+      // Note : Le joueur qui s'est trompé reste verrouillé (canBuzz: false) jusqu'à la prochaine question
     } catch (e) {
       console.error("handleBuzzerWrong error:", e);
       setNotice("Erreur lors du traitement de la mauvaise réponse");
@@ -2719,31 +2938,72 @@ function AdminInner() {
     }
   }
 
+  // Sauvegarder un score modifié manuellement
+  async function savePlayerScore(playerId, field, value) {
+    try {
+      const numValue = Number(value);
+      if (isNaN(numValue)) {
+        setNotice("Valeur invalide");
+        setTimeout(() => setNotice(null), 2000);
+        return;
+      }
+      
+      const playerRef = doc(db, "quiz", "state", "players", playerId);
+      await updateDoc(playerRef, {
+        [field]: numValue,
+      }, { merge: true });
+      
+      setNotice(`Score ${field === "score" ? "Quiz" : "EleyBuzz"} mis à jour ✔`);
+      setTimeout(() => setNotice(null), 1500);
+      setEditingScore({ playerId: null, field: null });
+      setEditingValue("");
+    } catch (e) {
+      console.error("savePlayerScore error:", e);
+      setNotice("Erreur lors de la sauvegarde");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
   // Remettre tous les scores à 0 (onglet Joueurs)
   async function resetAllScores() {
     const ok = window.confirm(
-      "Remettre tous les scores (quiz + EleyBuzz) à 0 pour tous les joueurs ?"
+      "Remettre tous les scores (quiz + EleyBuzz) à 0 pour tous les joueurs et toutes les équipes ?"
     );
     if (!ok) return;
 
     try {
+      // Reset des scores joueurs
       const playersCol = collection(db, "quiz", "state", "players");
-      const snap = await getDocs(playersCol);
-      const ids = snap.docs.map((d) => d.id);
+      const playersSnap = await getDocs(playersCol);
+      const playerIds = playersSnap.docs.map((d) => d.id);
 
-      while (ids.length) {
-        const chunk = ids.splice(0, 400);
+      // Reset des scores équipes
+      const teamsCol = collection(db, "quiz", "state", "teams");
+      const teamsSnap = await getDocs(teamsCol);
+      const teamIds = teamsSnap.docs.map((d) => d.id);
+
+      // Traiter par batch (400 max par batch Firestore)
+      const allIds = [...playerIds, ...teamIds];
+      while (allIds.length) {
+        const chunk = allIds.splice(0, 400);
         const batch = writeBatch(db);
         chunk.forEach((id) => {
-          batch.update(doc(playersCol, id), {
-            score: 0,
-            buzzScore: 0,
-          });
+          // Vérifier si c'est un joueur ou une équipe
+          if (playerIds.includes(id)) {
+            batch.update(doc(playersCol, id), {
+              score: 0,
+              buzzScore: 0,
+            });
+          } else if (teamIds.includes(id)) {
+            batch.update(doc(teamsCol, id), {
+              teamQuizScore: 0,
+            });
+          }
         });
         await batch.commit();
       }
 
-      setNotice("Tous les scores ont été remis à 0 ✔");
+      setNotice("Tous les scores (joueurs et équipes) ont été remis à 0 ✔");
       setTimeout(() => setNotice(null), 1800);
     } catch (e) {
       console.error("resetAllScores error:", e);
@@ -2756,8 +3016,58 @@ function AdminInner() {
   async function showFinalScore() {
     try {
       const stateRef = doc(db, "quiz", "state");
+      const playersCol = collection(stateRef, "players");
+      const teamsCol = collection(stateRef, "teams");
+      
+      // Lire tous les joueurs
+      const playersSnap = await getDocs(playersCol);
+      const players = playersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      
+      // Lire toutes les équipes
+      const teamsSnap = await getDocs(teamsCol);
+      const teams = teamsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      
+      // Créer un batch pour toutes les mises à jour
+      const batch = writeBatch(db);
+      
+      // Pour chaque joueur : additionner buzzScore au score
+      for (const player of players) {
+        const buzzScore = Number(player.buzzScore || 0);
+        if (buzzScore > 0) {
+          const playerRef = doc(playersCol, player.id);
+          batch.update(playerRef, {
+            score: increment(buzzScore),
+          });
+        }
+      }
+      
+      // Pour chaque équipe : additionner le buzzScore de tous ses membres au teamQuizScore
+      for (const team of teams) {
+        const memberIds = team.memberIds || [];
+        let totalBuzzScore = 0;
+        
+        // Calculer la somme des buzzScore de tous les membres de l'équipe
+        for (const memberId of memberIds) {
+          const member = players.find(p => p.id === memberId);
+          if (member) {
+            totalBuzzScore += Number(member.buzzScore || 0);
+          }
+        }
+        
+        if (totalBuzzScore > 0) {
+          const teamRef = doc(teamsCol, team.id);
+          batch.update(teamRef, {
+            teamQuizScore: increment(totalBuzzScore),
+          });
+        }
+      }
+      
+      // Appliquer toutes les mises à jour
+      await batch.commit();
+      
+      // Afficher le score final
       await updateDoc(stateRef, { showFinalScore: true });
-      setNotice("Score final affiché sur Screen et Player");
+      setNotice("Score final affiché sur Screen et Player (scores EleyBuzz ajoutés)");
       setTimeout(() => setNotice(null), 2000);
     } catch (e) {
       console.error("showFinalScore error:", e);
@@ -2766,23 +3076,6 @@ function AdminInner() {
     }
   }
 
-  // Débloquer manuellement tous les joueurs EleyBuzz (en cas d'erreur)
-  async function manualUnlockAllPlayers() {
-    try {
-      setNotice("Déblocage des joueurs...");
-      const result = await resetAllPlayerBuzzLocks(db, []);
-      if (result.ok) {
-        setNotice(`Tous les joueurs débloqués ✔ ${result.retries > 0 ? `(${result.retries + 1} tentative(s))` : ""}`);
-      } else {
-        setNotice("⚠️ Échec du déblocage - Réessayez");
-      }
-      setTimeout(() => setNotice(null), 3000);
-    } catch (e) {
-      console.error("manualUnlockAllPlayers error:", e);
-      setNotice("Erreur lors du déblocage");
-      setTimeout(() => setNotice(null), 2000);
-    }
-  }
 
   // ============================================================================
   // /pages/admin.js — Partie 6/6
@@ -2906,15 +3199,23 @@ function AdminInner() {
     return new Map(rows.map((r) => [r.id, r._rank]));
   }, [players]);
 
-  // Tri des joueurs : OK → Refusé → Kické, puis alphabétique dans chaque groupe
-  const sortedPlayers = useMemo(() => {
-    const getStatusPriority = (p) => {
-      if (p.isKicked) return 2; // Kické en dernier
-      if (p.nameStatus === "rejected") return 1; // Refusé au milieu
+  // Tri des équipes : OK → Refusé → Kické, puis alphabétique dans chaque groupe
+  // Avec filtrage selon showRejected et showKicked
+  const sortedTeams = useMemo(() => {
+    const getStatusPriority = (t) => {
+      if (t.isKicked) return 2; // Kické en dernier
+      if (t.nameStatus === "rejected") return 1; // Refusé au milieu
       return 0; // OK en premier
     };
 
-    return [...players].sort((a, b) => {
+    // Filtrer selon les préférences d'affichage
+    const filtered = teams.filter((t) => {
+      if (t.isKicked && !showKicked) return false;
+      if (t.nameStatus === "rejected" && !showRejected) return false;
+      return true;
+    });
+
+    return filtered.sort((a, b) => {
       // D'abord par statut
       const statusA = getStatusPriority(a);
       const statusB = getStatusPriority(b);
@@ -2927,7 +3228,48 @@ function AdminInner() {
       const nameB = normalizeNameAlpha(b.name || "");
       return nameA.localeCompare(nameB, "fr", { sensitivity: "base" });
     });
-  }, [players]);
+  }, [teams, showRejected, showKicked]);
+
+  // Tri des joueurs : OK → Refusé → Kické, puis alphabétique dans chaque groupe
+  // Avec filtrage selon showRejected et showKicked
+  // IMPORTANT: Filtrer les joueurs qui n'ont pas d'équipe (ils ne doivent pas apparaître dans les scores)
+  const sortedPlayers = useMemo(() => {
+    const getStatusPriority = (p) => {
+      if (p.isKicked) return 2; // Kické en dernier
+      if (p.nameStatus === "rejected") return 1; // Refusé au milieu
+      return 0; // OK en premier
+    };
+
+    // Filtrer : seulement les joueurs qui ont une équipe
+    // Filtrer selon les préférences d'affichage
+    const filtered = players.filter((p) => {
+      // Un joueur doit avoir une équipe pour apparaître
+      if (!p.teamId) return false;
+      
+      if (p.isKicked && !showKicked) return false;
+      if (p.nameStatus === "rejected" && !showRejected) return false;
+      return true;
+    });
+
+    return filtered.sort((a, b) => {
+      // D'abord par statut
+      const statusA = getStatusPriority(a);
+      const statusB = getStatusPriority(b);
+      if (statusA !== statusB) {
+        return statusA - statusB;
+      }
+
+      // Puis par ordre alphabétique (nom normalisé)
+      const nameA = normalizeNameAlpha(a.name || "");
+      const nameB = normalizeNameAlpha(b.name || "");
+      return nameA.localeCompare(nameB, "fr", { sensitivity: "base" });
+    });
+  }, [players, showRejected, showKicked]);
+
+  // Helper : obtenir les membres d'une équipe
+  const getTeamMembers = (teamId) => {
+    return players.filter((p) => p.teamId === teamId);
+  };
 
   // === Actions Quiz (créer / activer / dupliquer / supprimer) ===
   const handleCreateQuiz = async () => {
@@ -3902,13 +4244,13 @@ function AdminInner() {
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #1f2a44",
-            background: adminTab === "players" ? "#2c5d8bff" : "transparent",
+            background: adminTab === "players" ? "#c97326" : "transparent", // Orange terne pour différencier des onglets quiz
             color: "#e6eeff",
             cursor: "pointer",
             fontWeight: adminTab === "players" ? 700 : 500,
           }}
         >
-          Joueurs
+          Joueurs/Équipes
         </button>
 
 
@@ -3975,7 +4317,7 @@ function AdminInner() {
                 padding: "6px 12px",
                 borderRadius: 6,
                 border: "1px solid #2a2a2a",
-                background: "#fde68a",
+                background: "#c4b5fd",
                 color: "#111827",
                 fontWeight: 600,
                 cursor: canResetScores ? "pointer" : "not-allowed",
@@ -4000,26 +4342,110 @@ function AdminInner() {
             >
               Score final
             </button>
-            {isBuzzerMode && (
-              <button
-                onClick={manualUnlockAllPlayers}
-                style={{
-                  padding: "6px 12px",
-                  borderRadius: 6,
-                  border: "1px solid #2a2a2a",
-                  background: "#a78bfa",
-                  color: "#fff",
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-                title="Débloquer manuellement tous les joueurs (en cas de problème)"
-              >
-                🔓 Débloquer joueurs
-              </button>
-            )}
+            <button
+              onClick={() => setShowRejected(!showRejected)}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: showRejected ? "#fde68a" : "#4b5563",
+                color: showRejected ? "#111827" : "#fff",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title={showRejected ? "Masquer les noms refusés" : "Afficher les noms refusés"}
+            >
+              Noms refusés
+            </button>
+            <button
+              onClick={() => setShowKicked(!showKicked)}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: showKicked ? "#fca5a5" : "#4b5563",
+                color: showKicked ? "#111827" : "#fff",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title={showKicked ? "Masquer les joueurs kickés" : "Afficher les joueurs kickés"}
+            >
+              Joueurs kickés
+            </button>
+            <button
+              onClick={async () => {
+                const newView = leaderboardView === "teams" ? "players" : "teams";
+                setLeaderboardView(newView);
+                // Sauvegarder dans Firestore
+                try {
+                  await updateDoc(doc(db, "quiz", "config"), {
+                    leaderboardView: newView
+                  }, { merge: true });
+                } catch (e) {
+                  console.error("Error saving leaderboardView:", e);
+                }
+              }}
+              style={{
+                padding: "6px 12px",
+                borderRadius: 6,
+                border: "1px solid #2a2a2a",
+                background: leaderboardView === "teams" ? "#3b82f6" : "#8b5cf6",
+                color: "#fff",
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+              title={`Afficher le classement par ${leaderboardView === "teams" ? "joueurs" : "équipes"} sur Screen`}
+            >
+              Screen: {leaderboardView === "teams" ? "Équipes" : "Joueurs"}
+            </button>
           </div>
 
-          {/* Tableau joueurs */}
+          {/* Liste des noms refusés */}
+          {globalRejectedNames.length > 0 && (
+            <div style={{ marginTop: 16, padding: 12, background: "#1f2937", borderRadius: 8, border: "1px solid #374151" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: "#fde68a" }}>
+                  Noms refusés ({globalRejectedNames.length})
+                </h3>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {globalRejectedNames.map((nameNorm, idx) => (
+                  <div
+                    key={idx}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "4px 8px",
+                      background: "#374151",
+                      borderRadius: 4,
+                      border: "1px solid #4b5563",
+                    }}
+                  >
+                    <span style={{ color: "#e5e7eb", fontSize: 13 }}>{nameNorm}</span>
+                    <button
+                      onClick={() => removeRejectedName(nameNorm)}
+                      style={{
+                        padding: "2px 6px",
+                        borderRadius: 4,
+                        border: "1px solid #6b7280",
+                        background: "#dc2626",
+                        color: "#fff",
+                        fontSize: 11,
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                      title="Retirer ce nom de la liste"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Tableau équipes */}
           <div style={{ marginTop: 12, overflowX: "auto" }}>
             <table
               style={{
@@ -4031,172 +4457,447 @@ function AdminInner() {
             >
               <thead>
                 <tr style={{ background: "#2c5d8bff" }}>
-                  <th style={{ textAlign: "left", padding: "10px 8px" }}>Joueurs</th>
-                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score Quiz</th>
-                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score Bonus<br/><span style={{ fontSize: "0.85em", opacity: 0.9 }}>EleyBuzz</span></th>
+                  <th style={{ textAlign: "left", padding: "10px 8px" }}>Équipes</th>
+                  <th style={{ textAlign: "center", padding: "10px 8px", width: 120 }}>Score Équipe Quiz</th>
                   <th style={{ textAlign: "center", padding: "10px 8px", width: 140 }}>Statut</th>
                   <th style={{ textAlign: "left", padding: "10px 8px", width: 360 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {sortedPlayers.map((p) => {
-                  const status = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
-                  const statusBg =
-                    p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
-                  const statusColor =
-                    p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
-
-                  const isAliased = !!p.nameLocked || p.nameStatus === "locked";
-                  // Rang (égalité) + médaille
-                  const rank = rankingForAdmin.get(p.id) ?? null;
-                  const s = Number(p.score || 0);
-                  const medal = s > 0 && (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : "");
+                {sortedTeams.map((t) => {
+                  const status = t.isKicked ? "Kické" : (t.nameStatus === "rejected" ? "Refusé" : "OK");
+                  const statusBg = t.isKicked ? "#4b5563" : t.nameStatus === "rejected" ? "#fde68a" : "#86efac";
+                  const statusColor = t.isKicked ? "#e5e7eb" : t.nameStatus === "rejected" ? "#111827" : "#064e3b";
+                  const members = getTeamMembers(t.id);
+                  const isExpanded = expandedTeamIds.has(t.id);
 
                   return (
-                    <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
-                      <td style={{ padding: "8px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                    <Fragment key={t.id}>
+                      <tr 
+                        style={{ borderTop: "1px solid #1f2a44", cursor: "pointer" }}
+                        onClick={() => {
+                          const newSet = new Set(expandedTeamIds);
+                          if (isExpanded) {
+                            newSet.delete(t.id);
+                          } else {
+                            newSet.add(t.id);
+                          }
+                          setExpandedTeamIds(newSet);
+                        }}
+                      >
+                        <td style={{ padding: "8px" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                            <span
+                              title={t.color || ""}
+                              style={{
+                                width: 14,
+                                height: 14,
+                                borderRadius: 4,
+                                background: t.color || "#6b7280",
+                                display: "inline-block",
+                                border: "1px solid rgba(255,255,255,0.2)",
+                                flex: "0 0 auto",
+                              }}
+                            />
+                            <span
+                              title={t.name || "(sans nom)"}
+                              style={{
+                                fontWeight: 600,
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                maxWidth: "100%",
+                                display: "block",
+                              }}
+                            >
+                              {t.name || "(sans nom)"} ({members.length} membre{members.length > 1 ? "s" : ""})
+                            </span>
+                            <span style={{ marginLeft: "auto", opacity: 0.7 }}>
+                              {isExpanded ? "▼" : "▶"}
+                            </span>
+                          </div>
+                        </td>
+
+                        <td style={{ padding: "8px", textAlign: "center" }}>
+                          {editingScore.playerId === t.id && editingScore.field === "teamQuizScore" ? (
+                            <input
+                              type="number"
+                              value={editingValue}
+                              onChange={(e) => setEditingValue(e.target.value)}
+                              onBlur={() => {
+                                if (editingValue !== "") {
+                                  saveTeamScore(t.id, "teamQuizScore", editingValue);
+                                } else {
+                                  setEditingScore({ playerId: null, field: null });
+                                  setEditingValue("");
+                                }
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  if (editingValue !== "") {
+                                    saveTeamScore(t.id, "teamQuizScore", editingValue);
+                                  }
+                                } else if (e.key === "Escape") {
+                                  setEditingScore({ playerId: null, field: null });
+                                  setEditingValue("");
+                                }
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                              autoFocus
+                              style={{
+                                width: 80,
+                                padding: "4px 8px",
+                                borderRadius: 4,
+                                border: "1px solid #3b82f6",
+                                background: "#111",
+                                color: "#fff",
+                                fontSize: 16,
+                                fontWeight: 800,
+                                textAlign: "center",
+                                fontVariantNumeric: "tabular-nums",
+                              }}
+                            />
+                          ) : (
+                            <span
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setEditingScore({ playerId: t.id, field: "teamQuizScore" });
+                                setEditingValue(String(Number(t.teamQuizScore || 0)));
+                              }}
+                              style={{
+                                fontVariantNumeric: "tabular-nums",
+                                fontWeight: 800,
+                                letterSpacing: 0.2,
+                                cursor: "pointer",
+                                padding: "4px 8px",
+                                borderRadius: 4,
+                                transition: "background 150ms ease",
+                                color: t.color || "#e5e7eb",
+                              }}
+                              onMouseEnter={(e) => {
+                                e.currentTarget.style.background = "rgba(59, 130, 246, 0.2)";
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.style.background = "transparent";
+                              }}
+                              title="Cliquez pour modifier le score Équipe Quiz"
+                            >
+                              {Number(t.teamQuizScore || 0)}
+                            </span>
+                          )}
+                        </td>
+
+                        <td style={{ padding: "8px", textAlign: "center" }}>
                           <span
-                            title={p.color || ""}
                             style={{
-                              width: 14,
-                              height: 14,
-                              borderRadius: 4,
-                              background: p.color || "#6b7280",
                               display: "inline-block",
-                              border: "1px solid rgba(255,255,255,0.2)",
-                              flex: "0 0 auto",
-                            }}
-                          />
-                          <span
-                            title={p.name || "(sans nom)"}
-                            style={{
-                              fontWeight: 600,
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              maxWidth: "100%",
-                              display: "block",
+                              padding: "4px 8px",
+                              borderRadius: 6,
+                              background: statusBg,
+                              color: statusColor,
+                              fontWeight: 700,
                             }}
                           >
-                            {p.name || "(sans nom)"}
+                            {status}
                           </span>
-                        </div>
-                      </td>
+                        </td>
 
-                      <td style={{ padding: "8px", textAlign: "center" }} title={rank != null ? `Rang #${rank}` : undefined}>
-                        <span
-                          style={{
-                            fontVariantNumeric: "tabular-nums",
-                            fontWeight: 800,
-                            letterSpacing: 0.2,
-                          }}
-                        >
-                          {Number(p.score || 0)}
-                        </span>
-                        {medal && <span style={{ marginLeft: 6 }}>{medal}</span>}
-                      </td>
+                        <td style={{ padding: "8px" }} onClick={(e) => e.stopPropagation()}>
+                          <button
+                            onClick={() => rejectTeam(t.id, t.name)}
+                            disabled={t.isKicked || t.nameStatus === "rejected"}
+                            style={{
+                              padding: "6px 10px",
+                              borderRadius: 6,
+                              border: "1px solid #2a2a2a",
+                              background: "#fde68a",
+                              color: "#111827",
+                              fontWeight: 600,
+                              marginRight: 8,
+                              opacity: t.isKicked || t.nameStatus === "rejected" ? 0.6 : 1,
+                              cursor: t.isKicked || t.nameStatus === "rejected" ? "not-allowed" : "pointer",
+                            }}
+                            title="Refuser ce nom d'équipe"
+                          >
+                            Refuser
+                          </button>
 
-                      <td style={{ padding: "8px", textAlign: "center" }}>
-                        <span
-                          style={{
-                            fontVariantNumeric: "tabular-nums",
-                            fontWeight: 800,
-                            letterSpacing: 0.2,
-                            color: "#facc15",
-                          }}
-                        >
-                          {Number(p.buzzScore || 0)}
-                        </span>
-                      </td>
-
-                      <td style={{ padding: "8px", textAlign: "center" }}>
-                        <span
-                          style={{
-                            display: "inline-block",
-                            padding: "4px 8px",
-                            borderRadius: 6,
-                            background: statusBg,
-                            color: statusColor,
-                            fontWeight: 700,
-                          }}
-                        >
-                          {status}
-                        </span>
-                      </td>
-
-                      <td style={{ padding: "8px" }}>
-                        <button
-                          onClick={() => rejectPlayer(p.id, p.name)}
-                          disabled={p.isKicked || p.nameStatus === "rejected"}
-                          style={{
-                            padding: "6px 10px",
-                            borderRadius: 6,
-                            border: "1px solid #2a2a2a",
-                            background: "#fde68a",
-                            color: "#111827",
-                            fontWeight: 600,
-                            marginRight: 8,
-                            opacity: p.isKicked || p.nameStatus === "rejected" ? 0.6 : 1,
-                            cursor:
-                              p.isKicked || p.nameStatus === "rejected" ? "not-allowed" : "pointer",
-                          }}
-                          title="Refuser ce nom (le joueur devra en choisir un autre)"
-                        >
-                          Refuser
-                        </button>
-
-                        <button
-                          onClick={() => renameToAlias(p.id)}
-                          disabled={!isRunning || isAliased}
-                          title={
-                            !isRunning
-                              ? "Disponible une fois le quiz lancé"
-                              : isAliased
-                                ? "Nom modéré (verrouillé)"
-                                : "Fixer le nom sur « Player N »"
-                          }
-                          style={{
-                            padding: "6px 10px",
-                            borderRadius: 6,
-                            border: "1px solid #2a2a2a",
-                            background: isAliased ? "#e5e7eb" : "#c7d2fe",
-                            color: "#111827",
-                            fontWeight: 600,
-                            opacity: !isRunning || isAliased ? 0.6 : 1,
-                            cursor: !isRunning || isAliased ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {isAliased ? "Owned :)" : "Player N"}
-                        </button>
-
-                        <button
-                          onClick={() => kickPlayer(p.id)}
-                          disabled={p.isKicked}
-                          style={{
-                            marginLeft: 8,
-                            padding: "6px 10px",
-                            borderRadius: 6,
-                            border: "1px solid #2a2a2a",
-                            background: "#fecaca",
-                            color: "#111827",
-                            fontWeight: 600,
-                            opacity: p.isKicked ? 0.6 : 1,
-                            cursor: p.isKicked ? "not-allowed" : "pointer",
-                          }}
-                          title="Retirer ce joueur de la partie"
-                        >
-                          Kick
-                        </button>
-                      </td>
-                    </tr>
+                          {t.isKicked ? (
+                            <button
+                              onClick={() => unkickTeam(t.id)}
+                              style={{
+                                marginLeft: 8,
+                                padding: "6px 10px",
+                                borderRadius: 6,
+                                border: "1px solid #2a2a2a",
+                                background: "#86efac",
+                                color: "#064e3b",
+                                fontWeight: 600,
+                                cursor: "pointer",
+                              }}
+                              title="Réaccepter cette équipe (conserve les scores)"
+                            >
+                              Réaccepter
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => kickTeam(t.id)}
+                              style={{
+                                marginLeft: 8,
+                                padding: "6px 10px",
+                                borderRadius: 6,
+                                border: "1px solid #2a2a2a",
+                                background: "#fecaca",
+                                color: "#111827",
+                                fontWeight: 600,
+                                cursor: "pointer",
+                              }}
+                              title="Retirer cette équipe de la partie (kick tous les membres)"
+                            >
+                              Kick
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                      {/* Menu déroulant avec les membres */}
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={4} style={{ padding: 0, background: "#1a1f2e" }}>
+                            <div style={{ padding: "12px 8px" }}>
+                              <div style={{ fontWeight: 600, marginBottom: 8, opacity: 0.9 }}>
+                                Membres de l'équipe ({members.length})
+                              </div>
+                              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                <thead>
+                                  <tr style={{ background: "#2c5d8bff", opacity: 0.8 }}>
+                                    <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 12 }}>Joueur</th>
+                                    <th style={{ textAlign: "center", padding: "6px 8px", fontSize: 12, width: 100 }}>Score Quiz</th>
+                                    <th style={{ textAlign: "center", padding: "6px 8px", fontSize: 12, width: 100 }}>Score Bonus</th>
+                                    <th style={{ textAlign: "center", padding: "6px 8px", fontSize: 12, width: 100 }}>Statut</th>
+                                    <th style={{ textAlign: "left", padding: "6px 8px", fontSize: 12, width: 200 }}>Actions</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {members.map((p) => {
+                                    const pStatus = p.isKicked ? "Kické" : (p.nameStatus === "rejected" ? "Refusé" : "OK");
+                                    const pStatusBg = p.isKicked ? "#4b5563" : p.nameStatus === "rejected" ? "#fde68a" : "#86efac";
+                                    const pStatusColor = p.isKicked ? "#e5e7eb" : p.nameStatus === "rejected" ? "#111827" : "#064e3b";
+                                    const isAliased = !!p.nameLocked || p.nameStatus === "locked";
+                                    
+                                    // Obtenir la couleur : depuis l'équipe si le joueur en a une, sinon depuis le joueur
+                                    const playerColor = p.teamId ? t.color : (p.color || "#6b7280");
+                                    
+                                    return (
+                                      <tr key={p.id} style={{ borderTop: "1px solid #1f2a44" }}>
+                                        <td style={{ padding: "6px 8px" }}>
+                                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                            <span
+                                              style={{
+                                                width: 12,
+                                                height: 12,
+                                                borderRadius: 3,
+                                                background: playerColor,
+                                                display: "inline-block",
+                                                border: "1px solid rgba(255,255,255,0.2)",
+                                              }}
+                                            />
+                                            <span style={{ fontSize: 13 }}>{p.name || "(sans nom)"}</span>
+                                          </div>
+                                        </td>
+                                        <td style={{ padding: "6px 8px", textAlign: "center", fontSize: 13, fontVariantNumeric: "tabular-nums" }}>
+                                          {editingScore.playerId === p.id && editingScore.field === "score" ? (
+                                            <input
+                                              type="number"
+                                              value={editingValue}
+                                              onChange={(e) => setEditingValue(e.target.value)}
+                                              onBlur={() => {
+                                                if (editingValue !== "") {
+                                                  savePlayerScore(p.id, "score", editingValue);
+                                                } else {
+                                                  setEditingScore({ playerId: null, field: null });
+                                                  setEditingValue("");
+                                                }
+                                              }}
+                                              onKeyDown={(e) => {
+                                                if (e.key === "Enter") {
+                                                  if (editingValue !== "") {
+                                                    savePlayerScore(p.id, "score", editingValue);
+                                                  }
+                                                } else if (e.key === "Escape") {
+                                                  setEditingScore({ playerId: null, field: null });
+                                                  setEditingValue("");
+                                                }
+                                              }}
+                                              autoFocus
+                                              style={{
+                                                width: 60,
+                                                padding: "2px 4px",
+                                                textAlign: "center",
+                                                fontSize: 13,
+                                                border: "1px solid #3b82f6",
+                                                borderRadius: 4,
+                                                background: "#0b1220",
+                                                color: "#fff",
+                                              }}
+                                            />
+                                          ) : (
+                                            <span
+                                              onClick={() => {
+                                                setEditingScore({ playerId: p.id, field: "score" });
+                                                setEditingValue(String(p.score || 0));
+                                              }}
+                                              style={{ cursor: "pointer", padding: "2px 4px", borderRadius: 4 }}
+                                              title="Cliquer pour modifier"
+                                            >
+                                              {Number(p.score || 0)}
+                                            </span>
+                                          )}
+                                        </td>
+                                        <td style={{ padding: "6px 8px", textAlign: "center", fontSize: 13, fontVariantNumeric: "tabular-nums", color: "#facc15" }}>
+                                          {editingScore.playerId === p.id && editingScore.field === "buzzScore" ? (
+                                            <input
+                                              type="number"
+                                              value={editingValue}
+                                              onChange={(e) => setEditingValue(e.target.value)}
+                                              onBlur={() => {
+                                                if (editingValue !== "") {
+                                                  savePlayerScore(p.id, "buzzScore", editingValue);
+                                                } else {
+                                                  setEditingScore({ playerId: null, field: null });
+                                                  setEditingValue("");
+                                                }
+                                              }}
+                                              onKeyDown={(e) => {
+                                                if (e.key === "Enter") {
+                                                  if (editingValue !== "") {
+                                                    savePlayerScore(p.id, "buzzScore", editingValue);
+                                                  }
+                                                } else if (e.key === "Escape") {
+                                                  setEditingScore({ playerId: null, field: null });
+                                                  setEditingValue("");
+                                                }
+                                              }}
+                                              autoFocus
+                                              style={{
+                                                width: 60,
+                                                padding: "2px 4px",
+                                                textAlign: "center",
+                                                fontSize: 13,
+                                                border: "1px solid #3b82f6",
+                                                borderRadius: 4,
+                                                background: "#0b1220",
+                                                color: "#facc15",
+                                              }}
+                                            />
+                                          ) : (
+                                            <span
+                                              onClick={() => {
+                                                setEditingScore({ playerId: p.id, field: "buzzScore" });
+                                                setEditingValue(String(p.buzzScore || 0));
+                                              }}
+                                              style={{ cursor: "pointer", padding: "2px 4px", borderRadius: 4 }}
+                                              title="Cliquer pour modifier"
+                                            >
+                                              {Number(p.buzzScore || 0)}
+                                            </span>
+                                          )}
+                                        </td>
+                                        <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                                          <span
+                                            style={{
+                                              display: "inline-block",
+                                              padding: "2px 6px",
+                                              borderRadius: 4,
+                                              background: pStatusBg,
+                                              color: pStatusColor,
+                                              fontWeight: 600,
+                                              fontSize: 11,
+                                            }}
+                                          >
+                                            {pStatus}
+                                          </span>
+                                        </td>
+                                        <td style={{ padding: "6px 8px" }}>
+                                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                            <button
+                                              onClick={() => rejectPlayer(p.id, p.name)}
+                                              disabled={p.isKicked || p.nameStatus === "rejected"}
+                                              style={{
+                                                padding: "4px 8px",
+                                                borderRadius: 4,
+                                                border: "1px solid #2a2a2a",
+                                                background: "#fde68a",
+                                                color: "#111827",
+                                                fontWeight: 600,
+                                                fontSize: 11,
+                                                opacity: p.isKicked || p.nameStatus === "rejected" ? 0.6 : 1,
+                                                cursor: p.isKicked || p.nameStatus === "rejected" ? "not-allowed" : "pointer",
+                                              }}
+                                              title="Refuser ce nom (le joueur devra en choisir un autre)"
+                                            >
+                                              Refuser
+                                            </button>
+                                            {p.isKicked ? (
+                                              <button
+                                                onClick={() => unkickPlayer(p.id)}
+                                                style={{
+                                                  padding: "4px 8px",
+                                                  borderRadius: 4,
+                                                  border: "1px solid #2a2a2a",
+                                                  background: "#86efac",
+                                                  color: "#064e3b",
+                                                  fontWeight: 600,
+                                                  fontSize: 11,
+                                                  cursor: "pointer",
+                                                }}
+                                                title="Réaccepter ce joueur (conserve ses scores)"
+                                              >
+                                                Réaccepter
+                                              </button>
+                                            ) : (
+                                              <button
+                                                onClick={() => kickPlayer(p.id)}
+                                                style={{
+                                                  padding: "4px 8px",
+                                                  borderRadius: 4,
+                                                  border: "1px solid #2a2a2a",
+                                                  background: "#fecaca",
+                                                  color: "#111827",
+                                                  fontWeight: 600,
+                                                  fontSize: 11,
+                                                  cursor: "pointer",
+                                                }}
+                                                title="Retirer ce joueur de la partie"
+                                              >
+                                                Kick
+                                              </button>
+                                            )}
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                  {members.length === 0 && (
+                                    <tr>
+                                      <td colSpan={5} style={{ padding: 8, opacity: 0.7, fontSize: 12 }}>
+                                        Aucun membre dans cette équipe.
+                                      </td>
+                                    </tr>
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })}
 
-                {players.length === 0 && !playersLoading && (
+                {sortedTeams.length === 0 && !teamsLoading && (
                   <tr>
-                    <td colSpan={5} style={{ padding: 12, opacity: 0.7 }}>
-                      Aucun joueur pour l'instant.
+                    <td colSpan={4} style={{ padding: 12, opacity: 0.7 }}>
+                      Aucune équipe pour l'instant.
                     </td>
                   </tr>
                 )}

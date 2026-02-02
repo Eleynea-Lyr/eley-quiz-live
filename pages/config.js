@@ -12,7 +12,6 @@ import {
   COUNTDOWN_START_SEC,
   ROUND_START_INTRO_SEC,
   COOLDOWN_MS,
-  BUZZER_COOLDOWN_MS,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_WRONG_MESSAGE_DURATION_MS,
   DEFAULT_BUZZER_WRONG_PENALTY,
@@ -88,7 +87,6 @@ export default function Config() {
     countdownStartSec: COUNTDOWN_START_SEC,
     roundStartIntroSec: ROUND_START_INTRO_SEC,
     cooldownMs: COOLDOWN_MS,
-    buzzerCooldownMs: BUZZER_COOLDOWN_MS,
     buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
     buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
     buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
@@ -111,7 +109,6 @@ export default function Config() {
             countdownStartSec: data.countdownStartSec ?? COUNTDOWN_START_SEC,
             roundStartIntroSec: data.roundStartIntroSec ?? ROUND_START_INTRO_SEC,
             cooldownMs: data.cooldownMs ?? COOLDOWN_MS,
-            buzzerCooldownMs: data.buzzerCooldownMs ?? BUZZER_COOLDOWN_MS,
             buzzerCorrectMessageDurationMs: data.buzzerCorrectMessageDurationMs ?? BUZZER_CORRECT_MESSAGE_DURATION_MS,
             buzzerWrongMessageDurationMs: data.buzzerWrongMessageDurationMs ?? BUZZER_WRONG_MESSAGE_DURATION_MS,
             buzzerWrongPenalty: data.buzzerWrongPenalty ?? DEFAULT_BUZZER_WRONG_PENALTY,
@@ -176,7 +173,6 @@ export default function Config() {
       countdownStartSec: COUNTDOWN_START_SEC,
       roundStartIntroSec: ROUND_START_INTRO_SEC,
       cooldownMs: COOLDOWN_MS,
-      buzzerCooldownMs: BUZZER_COOLDOWN_MS,
       buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
       buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
       buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
@@ -304,16 +300,6 @@ export default function Config() {
             </h2>
 
             <div style={{ display: "grid", gap: 16 }}>
-              <ConfigField
-                label="Cooldown après mauvaise réponse (millisecondes)"
-                value={config.buzzerCooldownMs}
-                onChange={(val) => setConfig({ ...config, buzzerCooldownMs: val })}
-                min={5000}
-                max={60000}
-                step={1000}
-                unit="ms"
-                description="Temps d'attente avant de pouvoir rebuzzer après une mauvaise réponse (défaut: 20000ms = 20s)"
-              />
 
               <ConfigField
                 label="Durée message 'Bonne réponse' (millisecondes)"
