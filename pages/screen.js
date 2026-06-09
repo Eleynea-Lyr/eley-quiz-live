@@ -42,18 +42,19 @@ import {
   useMobileVH,
   ensureAwardsForQuestionTx,
 } from "../lib/firebase-helpers";
+import AuthGate from "../lib/AuthGate";
 
 import { SCREEN_MESSAGES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
 
 // ====== Constantes spécifiques à screen.js ======
 
 // JOIN (DEV)
-//const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-//const JOIN_QR_SRC = "/qr-join-dev.png";
+const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
+const JOIN_QR_SRC = "/qr-join-dev.png";
 
 // JOIN (PUBLIC OK)
-const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
-const JOIN_QR_SRC = "/qr-code-public-OK.png";
+// const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
+// const JOIN_QR_SRC = "/qr-code-public-OK.png";
 
 // Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
@@ -2584,112 +2585,13 @@ function ScreenInner() {
 }
 
 export default function Screen() {
-  const SCREEN_PASSWORD = "ChoupiEleyBoxScreen";
-
-  const [screenUnlocked, setScreenUnlocked] = useState(false);
-  const [screenPasswordInput, setScreenPasswordInput] = useState("");
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const ok = window.localStorage.getItem("eley_screen_unlocked") === "1";
-      if (ok) {
-        setScreenUnlocked(true);
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  if (!screenUnlocked) {
-    return (
-      <div
-        style={{
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "#000814",
-          color: "#e5e7eb",
-          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-          padding: 16,
-        }}
-      >
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (screenPasswordInput === SCREEN_PASSWORD) {
-              setScreenUnlocked(true);
-              try {
-                if (typeof window !== "undefined") {
-                  window.localStorage.setItem("eley_screen_unlocked", "1");
-                }
-              } catch {
-                // ignore
-              }
-            } else {
-              alert("Mot de passe incorrect");
-            }
-          }}
-          style={{
-            padding: 24,
-            borderRadius: 12,
-            border: "1px solid #1f2937",
-            background: "#020617",
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-            minWidth: 260,
-            maxWidth: 360,
-            boxShadow: "0 20px 40px rgba(0,0,0,0.45)",
-          }}
-        >
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, textAlign: "center" }}>
-            Accès écran scène
-          </h1>
-          <p style={{ margin: 0, fontSize: 13, opacity: 0.8, textAlign: "center" }}>
-            Réservé à l&apos;écran de projection du quiz.
-          </p>
-
-          <label style={{ fontSize: 14, marginTop: 8 }}>
-            Mot de passe :
-            <input
-              type="password"
-              value={screenPasswordInput}
-              onChange={(e) => setScreenPasswordInput(e.target.value)}
-              style={{
-                marginTop: 4,
-                width: "100%",
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: "1px solid #4b5563",
-                background: "#020617",
-                color: "#e5e7eb",
-                outline: "none",
-              }}
-            />
-          </label>
-
-          <button
-            type="submit"
-            style={{
-              marginTop: 8,
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "none",
-              background: "#3b82f6",
-              color: "#0b1120",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            Afficher l&apos;écran
-          </button>
-        </form>
-      </div>
-    );
-  }
-
-  // Une fois déverrouillé → on rend ton vrai écran public
-  return <ScreenInner />;
+  return (
+    <AuthGate
+      title="Accès écran scène"
+      subtitle="Réservé à l'écran de projection du quiz."
+      accent="#3b82f6"
+    >
+      <ScreenInner />
+    </AuthGate>
+  );
 }

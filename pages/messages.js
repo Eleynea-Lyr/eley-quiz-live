@@ -14,6 +14,7 @@ import {
   LOCK_MESSAGES,
   DEFAULT_REVEAL_PHRASES,
 } from "../lib/messages";
+import AuthGate from "../lib/AuthGate";
 
 // Composant pour un champ de message
 function MessageField({ label, value, onChange, placeholder, description, multiline = false }) {
@@ -49,7 +50,7 @@ function MessageField({ label, value, onChange, placeholder, description, multil
   );
 }
 
-export default function Messages() {
+function MessagesInner() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -777,5 +778,17 @@ export default function Messages() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function Messages() {
+  return (
+    <AuthGate
+      title="Accès messages"
+      subtitle="Réservé à l'organisation du quiz."
+      accent="#22c55e"
+    >
+      <MessagesInner />
+    </AuthGate>
   );
 }

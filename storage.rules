@@ -1,8 +1,17 @@
 rules_version = '2';
+
+// ============================================================================
+// Règles de sécurité Storage — Quiz d'Eley
+//  - LECTURE : publique (les images des questions s'affichent pour tous).
+//  - ÉCRITURE : ADMIN uniquement (upload des images depuis la régie).
+// ============================================================================
+
 service firebase.storage {
   match /b/{bucket}/o {
     match /{allPaths=**} {
-      allow read, write: if true; // DEV UNIQUEMENT (on resserrera ensuite)
+      allow read: if true;
+      allow write: if request.auth != null
+                   && request.auth.uid == 'tzwjCg8m42ZZaWTmvQDzXZi9E7q1';
     }
   }
 }

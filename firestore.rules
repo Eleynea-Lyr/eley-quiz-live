@@ -1,0 +1,105 @@
+rules_version = '2';
+
+// ============================================================================
+// Règles de sécurité Firestore — Quiz d'Eley
+//
+// Modèle "Option B" (pragmatique) :
+//  - LECTURE : publique (le contenu du quiz n'est pas secret ; il est de toute
+//    façon déjà chargé côté navigateur). Ça évite tout blocage au démarrage.
+//  - ÉCRITURE : protégée.
+//      * Contenu sensible (questions, config) = ADMIN uniquement.
+//      * Un joueur ne peut écrire QUE son propre document et sa propre réponse.
+//      * Le buzzer (écriture joueur sur quiz/state) est limité à quelques champs.
+//  - L'ADMIN est identifié par son UID (pas un mot de passe livré au navigateur).
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.uid == 'tzwjCg8m42ZZaWTmvQDzXZi9E7q1';
+    }
+
+    // Un joueur ne peut toucher au buzzer que via ces champs précis
+    function onlyBuzzerFields() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['buzzerState', 'firstPlayerId', 'firstPlayerName', 'buzzerPressedAt']);
+    }
+
+    // ===== Banque de questions : lecture libre, écriture admin =====
+    match /LesQuestions/{qid} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ===== Configuration du quiz (barèmes, timings, messages) =====
+    match /quiz/config {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // ===== État du quiz =====
+    match /quiz/state {
+      allow read: if true;
+      // Création / suppression / changements généraux : admin only
+      allow create, delete: if isAdmin();
+      // Mise à jour : admin, OU un joueur connecté mais uniquement pour buzzer
+      allow update: if isAdmin() || (isSignedIn() && onlyBuzzerFields());
+
+      // --- Joueurs : un joueur ne gère QUE son propre document (id == son uid) ---
+      match /players/{pid} {
+        allow read: if true;
+        allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == pid);
+        allow delete:         if isAdmin() || (isSignedIn() && request.auth.uid == pid);
+      }
+
+      // --- Équipes : créer / rejoindre / quitter par un joueur connecté ---
+      match /teams/{tid} {
+        allow read:  if true;
+        allow write: if isAdmin() || isSignedIn();
+      }
+
+      // --- Collection temporaire (legacy) des tentatives de buzz ---
+      match /buzzerAttempts/{aid} {
+        allow read:  if true;
+        allow write: if isAdmin() || isSignedIn();
+      }
+    }
+
+    // ===== Réponses & scoring =====
+    match /answers/{qid} {
+      allow read:  if true;
+      // Compteurs (correctCount, awardedCount) écrits par joueur + admin
+      allow write: if isAdmin() || isSignedIn();
+
+      // Soumission d'un joueur : seulement la sienne (id == son uid)
+      match /submissions/{pid} {
+        allow read:           if true;
+        allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == pid);
+        allow delete:         if isAdmin();
+      }
+
+      // Attribution de points individuels : la sienne (id == son uid) ; admin = tout
+      match /awards/{pid} {
+        allow read:           if true;
+        allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == pid);
+        allow delete:         if isAdmin();
+      }
+
+      // Attribution de points d'équipe : joueur connecté (optimiste) + admin
+      match /teamAwards/{tid} {
+        allow read:  if true;
+        allow write: if isAdmin() || isSignedIn();
+      }
+    }
+
+    // ===== Tout le reste : refusé par défaut =====
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

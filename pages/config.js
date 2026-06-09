@@ -7,6 +7,7 @@ import { useState, useEffect } from "react";
 import { db } from "../lib/firebase";
 import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
 import { resetTimingConfigCache } from "../lib/firebase-helpers";
+import AuthGate from "../lib/AuthGate";
 import {
   REVEAL_DURATION_SEC,
   COUNTDOWN_START_SEC,
@@ -75,7 +76,7 @@ function ConfigField({ label, value, onChange, min, max, step = 1, unit, descrip
   );
 }
 
-export default function Config() {
+function ConfigInner() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -532,6 +533,18 @@ export default function Config() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function Config() {
+  return (
+    <AuthGate
+      title="Accès configuration"
+      subtitle="Réservé à l'organisation du quiz."
+      accent="#22c55e"
+    >
+      <ConfigInner />
+    </AuthGate>
   );
 }
 

@@ -28,6 +28,7 @@ import {
   deleteField,
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
+import AuthGate from "../lib/AuthGate";
 
 // Imports depuis les fichiers utilitaires
 import {
@@ -5194,113 +5195,16 @@ function AdminInner() {
   );
 }
 
-// ===================== PARTIE 6.3/6 — Wrapper protégé par mot de passe =====================
+// ===================== PARTIE 6.3/6 — Wrapper protégé par authentification =====================
 
 export default function Admin() {
-  const ADMIN_PASSWORD = "ChoupiEleyBoxAdmin";
-
-  const [adminUnlocked, setAdminUnlocked] = useState(false);
-  const [adminPasswordInput, setAdminPasswordInput] = useState("");
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const ok = window.localStorage.getItem("eley_admin_unlocked") === "1";
-      if (ok) {
-        setAdminUnlocked(true);
-      }
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  if (!adminUnlocked) {
-    return (
-      <div
-        style={{
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "#020617",
-          color: "#e5e7eb",
-          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-        }}
-      >
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (adminPasswordInput === ADMIN_PASSWORD) {
-              setAdminUnlocked(true);
-              try {
-                if (typeof window !== "undefined") {
-                  window.localStorage.setItem("eley_admin_unlocked", "1");
-                }
-              } catch {
-                // ignore
-              }
-            } else {
-              alert("Mot de passe incorrect");
-            }
-          }}
-          style={{
-            padding: 24,
-            borderRadius: 12,
-            border: "1px solid #1f2937",
-            background: "#030712",
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-            minWidth: 260,
-            boxShadow: "0 20px 40px rgba(0,0,0,0.45)",
-          }}
-        >
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>
-            Accès admin
-          </h1>
-          <p style={{ margin: 0, fontSize: 13, opacity: 0.8 }}>
-            Cette page est réservée à l&apos;organisation du quiz.
-          </p>
-
-          <label style={{ fontSize: 14, marginTop: 8 }}>
-            Mot de passe :
-            <input
-              type="password"
-              value={adminPasswordInput}
-              onChange={(e) => setAdminPasswordInput(e.target.value)}
-              style={{
-                marginTop: 4,
-                width: "100%",
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: "1px solid #4b5563",
-                background: "#020617",
-                color: "#e5e7eb",
-                outline: "none",
-              }}
-            />
-          </label>
-
-          <button
-            type="submit"
-            style={{
-              marginTop: 8,
-              padding: "8px 12px",
-              borderRadius: 8,
-              border: "none",
-              background: "#22c55e",
-              color: "#022c22",
-              fontWeight: 700,
-              cursor: "pointer",
-            }}
-          >
-            Entrer
-          </button>
-        </form>
-      </div>
-    );
-  }
-
-  // Une fois déverrouillé → on rend ton vrai admin
-  return <AdminInner />;
+  return (
+    <AuthGate
+      title="Accès régie"
+      subtitle="Réservé à l'organisation du quiz."
+      accent="#22c55e"
+    >
+      <AdminInner />
+    </AuthGate>
+  );
 }

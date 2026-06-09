@@ -4,7 +4,8 @@
 // ============================================================================
 
 import { useEffect, useMemo, useRef, useState, startTransition } from "react";
-import { db } from "../lib/firebase";
+import { db, auth } from "../lib/firebase";
+import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import {
   collection,
   doc,
@@ -13,7 +14,6 @@ import {
   setDoc,
   onSnapshot,
   query,
-  addDoc,
   updateDoc,
   where,
   serverTimestamp,
@@ -163,6 +163,47 @@ export default function Player() {
         localStorage.getItem("player_id") ||
         null;
     } catch { }
+  }, []);
+
+  // Identité Firebase (connexion anonyme) — sert d'identifiant fiable pour le joueur.
+  // L'uid devient l'id du document joueur, ce qui permet aux règles Firestore de
+  // garantir qu'un joueur ne modifie QUE son propre document.
+  const authUidRef = useRef(null);
+  const authReadyRef = useRef(null);
+
+  // Attend que Firebase ait fini de restaurer une éventuelle session persistée
+  // (IMPORTANT : évite de se connecter en anonyme trop tôt et d'écraser une
+  // session existante — ex. l'admin connecté dans le même navigateur).
+  const waitForAuthReady = () => {
+    if (!authReadyRef.current) {
+      authReadyRef.current = new Promise((resolve) => {
+        const unsub = onAuthStateChanged(auth, (u) => {
+          unsub();
+          resolve(u);
+        });
+      });
+    }
+    return authReadyRef.current;
+  };
+
+  const ensureAuth = async () => {
+    const restored = await waitForAuthReady();
+    if (restored?.uid) {
+      authUidRef.current = restored.uid;
+      return restored.uid;
+    }
+    if (auth.currentUser?.uid) {
+      authUidRef.current = auth.currentUser.uid;
+      return auth.currentUser.uid;
+    }
+    const cred = await signInAnonymously(auth);
+    authUidRef.current = cred.user.uid;
+    return cred.user.uid;
+  };
+  useEffect(() => {
+    ensureAuth().catch((e) =>
+      console.error("[Player] Connexion anonyme échouée :", e)
+    );
   }, []);
 
   // Instant win (affichage immédiat + anti double-appel)
@@ -1352,7 +1393,11 @@ export default function Player() {
 
 
   // Splash : relâcher après boot initial
-  const initialBootReady = hydrated && stateLoaded && (!playerId || playerDocLoaded);
+  // Nouveau joueur : pas besoin d'attendre Firestore (écran d'inscription seulement).
+  // Joueur déjà inscrit : attendre l'état quiz + son document.
+  const initialBootReady = hydrated && (
+    playerId ? (stateLoaded && playerDocLoaded) : true
+  );
   useEffect(() => {
     if (initialBootReady) setSplashReleased(true);
   }, [initialBootReady]);
@@ -1998,7 +2043,9 @@ export default function Player() {
       const playersCol = collection(doc(db, "quiz", "state"), "players");
 
       if (!playerId) {
-        const ref = await addDoc(playersCol, {
+        // Identité fiable : on crée le document joueur sous l'uid Firebase.
+        const uid = await ensureAuth();
+        await setDoc(doc(playersCol, uid), {
           name: v.value,
           nameNorm,
           createdAt: serverTimestamp(),
@@ -2009,9 +2056,10 @@ export default function Player() {
           rejectedNames: Array.isArray(rejectedNames) ? rejectedNames : [],
           canBuzz: true, // Initialiser canBuzz à true pour permettre le buzzer
           teamId: null, // Pas d'équipe au départ
+          ownerUid: uid, // Propriétaire du document (cohérent avec l'id)
         });
-        setPlayerId(ref.id);
-        localStorage.setItem("playerId", ref.id);
+        setPlayerId(uid);
+        localStorage.setItem("playerId", uid);
         localStorage.setItem("playerName", v.value);
         setPlayerName(v.value);
         setInputName("");

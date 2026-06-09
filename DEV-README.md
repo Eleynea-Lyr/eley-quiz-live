@@ -1,72 +1,54 @@
-# Guide de développement - Hot Reload
+# Guide de développement
 
-## Problème résolu
+## Scripts npm disponibles
 
-Le problème de page blanche / erreur 404 après chaque modification a été corrigé en améliorant la configuration Next.js pour mieux gérer le hot-reload.
+Définis dans `package.json` :
 
-## Améliorations apportées
-
-1. **Configuration Next.js améliorée** (`next.config.js`)
-   - Ajout de `watchOptions` avec polling pour mieux détecter les changements de fichiers (utile sur Windows)
-   - Configuration optimisée pour le développement
-
-2. **Nouveaux scripts npm**
-   - `npm run dev:clean` : Nettoie le cache et démarre le serveur de développement
-   - `npm run clean` : Nettoie uniquement le cache `.next`
-
-## Utilisation
-
-### Démarrage normal
 ```bash
-npm run dev
+npm run dev     # Démarre le serveur de développement (Next.js)
+npm run build   # Build de production
+npm run start   # Démarre le serveur en mode production (après build)
 ```
 
-### Si vous rencontrez des problèmes (page blanche, 404)
+## Variables d'environnement
+
+Les pages `/admin` et `/screen` sont protégées par un mot de passe lu depuis
+des variables d'environnement. Il faut un fichier `.env.local` à la racine
+(voir `docs/ENV.md`) :
+
 ```bash
-npm run dev:clean
+NEXT_PUBLIC_SCREEN_PASSWORD=ton-mot-de-passe-screen
+NEXT_PUBLIC_ADMIN_PASSWORD=ton-mot-de-passe-admin
 ```
 
-Ce script nettoie automatiquement le cache `.next` et redémarre le serveur.
+> Important : les variables `NEXT_PUBLIC_*` sont injectées à la **compilation**.
+> Après toute modification de `.env.local`, **redémarre** le serveur (`npm run dev`).
 
-### Nettoyage manuel du cache
-```bash
-npm run clean
-```
+## En cas de problème (page blanche, 404, hot-reload bloqué)
 
-Puis redémarrez avec `npm run dev`.
-
-## Scripts PowerShell (Windows)
-
-Si vous préférez utiliser un script PowerShell :
+Sous Windows, un script PowerShell est fourni pour nettoyer le cache `.next`
+et relancer le serveur :
 
 ```powershell
 .\clean-dev.ps1
 ```
 
 Ce script :
-- Nettoie le cache `.next`
-- Vérifie les processus Node.js
-- Redémarre le serveur de développement
+- supprime le dossier de cache `.next` s'il existe ;
+- signale les éventuels processus Node.js encore actifs (sans les tuer) ;
+- relance `npm run dev`.
+
+### Nettoyage manuel équivalent
+
+```powershell
+Remove-Item -Recurse -Force .next
+npm run dev
+```
 
 ## Conseils
 
-1. **Si le hot-reload ne fonctionne toujours pas** :
-   - Arrêtez le serveur (Ctrl+C)
-   - Exécutez `npm run dev:clean`
-   - Attendez que la compilation soit terminée avant d'ouvrir la page
-
-2. **Si plusieurs processus Node.js tournent** :
-   - Fermez tous les terminaux qui exécutent `npm run dev`
-   - Vérifiez avec le Gestionnaire des tâches Windows
-   - Redémarrez avec `npm run dev:clean`
-
-3. **En cas de problème persistant** :
-   - Supprimez manuellement le dossier `.next`
-   - Supprimez `node_modules` et réinstallez avec `npm install`
-   - Redémarrez votre ordinateur si nécessaire
-
-## Notes techniques
-
-- Le polling est activé à 1000ms pour mieux détecter les changements sur Windows
-- Le cache est automatiquement invalidé lors des modifications
-- Les fichiers sont surveillés en temps réel avec un délai d'agrégation de 300ms
+1. Attends la fin de la compilation avant d'ouvrir/recharger la page.
+2. Si plusieurs serveurs tournent en parallèle, ferme les terminaux `npm run dev`
+   en trop (le port 3000 doit être libre).
+3. En cas de problème persistant : supprime `.next`, puis `node_modules`,
+   réinstalle avec `npm install`, et relance.
