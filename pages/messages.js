@@ -80,8 +80,6 @@ function MessagesInner() {
       yourTurn: ELEYBUZZ_PLAYER_MESSAGES.yourTurn,
       correctAnswer: ELEYBUZZ_PLAYER_MESSAGES.correctAnswer,
       wrongAnswer: ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer,
-      waitNextQuestion: ELEYBUZZ_PLAYER_MESSAGES.waitNextQuestion,
-      tryYourChance: ELEYBUZZ_PLAYER_MESSAGES.tryYourChance,
       punishment: ELEYBUZZ_PLAYER_MESSAGES.punishment,
     },
     // Screen - Quiz
@@ -141,8 +139,6 @@ function MessagesInner() {
               yourTurn: data.playerEleyBuzz?.yourTurn ?? ELEYBUZZ_PLAYER_MESSAGES.yourTurn,
               correctAnswer: data.playerEleyBuzz?.correctAnswer ?? ELEYBUZZ_PLAYER_MESSAGES.correctAnswer,
               wrongAnswer: data.playerEleyBuzz?.wrongAnswer ?? ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer,
-              waitNextQuestion: data.playerEleyBuzz?.waitNextQuestion ?? ELEYBUZZ_PLAYER_MESSAGES.waitNextQuestion,
-              tryYourChance: data.playerEleyBuzz?.tryYourChance ?? ELEYBUZZ_PLAYER_MESSAGES.tryYourChance,
               punishment: data.playerEleyBuzz?.punishment ?? ELEYBUZZ_PLAYER_MESSAGES.punishment,
             },
             screenQuiz: {
@@ -246,8 +242,6 @@ function MessagesInner() {
         yourTurn: ELEYBUZZ_PLAYER_MESSAGES.yourTurn,
         correctAnswer: ELEYBUZZ_PLAYER_MESSAGES.correctAnswer,
         wrongAnswer: ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer,
-        waitNextQuestion: ELEYBUZZ_PLAYER_MESSAGES.waitNextQuestion,
-        tryYourChance: ELEYBUZZ_PLAYER_MESSAGES.tryYourChance,
         punishment: ELEYBUZZ_PLAYER_MESSAGES.punishment,
       },
       screenQuiz: {
@@ -459,20 +453,6 @@ function MessagesInner() {
                 value={messages.playerEleyBuzz.wrongAnswer}
                 onChange={(val) => setMessages({ ...messages, playerEleyBuzz: { ...messages.playerEleyBuzz, wrongAnswer: val } })}
                 placeholder={ELEYBUZZ_PLAYER_MESSAGES.wrongAnswer}
-              />
-              <MessageField
-                label="Message 'Attends la prochaine question'"
-                value={messages.playerEleyBuzz.waitNextQuestion}
-                onChange={(val) => setMessages({ ...messages, playerEleyBuzz: { ...messages.playerEleyBuzz, waitNextQuestion: val } })}
-                placeholder={ELEYBUZZ_PLAYER_MESSAGES.waitNextQuestion}
-                description="Message affiché aux autres joueurs après une bonne réponse"
-              />
-              <MessageField
-                label="Message 'À toi de tenter ta chance'"
-                value={messages.playerEleyBuzz.tryYourChance}
-                onChange={(val) => setMessages({ ...messages, playerEleyBuzz: { ...messages.playerEleyBuzz, tryYourChance: val } })}
-                placeholder={ELEYBUZZ_PLAYER_MESSAGES.tryYourChance}
-                description="Message affiché aux autres joueurs après une mauvaise réponse"
               />
               <MessageField
                 label="Message de punition"

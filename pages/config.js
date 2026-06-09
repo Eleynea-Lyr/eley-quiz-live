@@ -6,7 +6,6 @@
 import { useState, useEffect } from "react";
 import { db } from "../lib/firebase";
 import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
-import { resetTimingConfigCache } from "../lib/firebase-helpers";
 import AuthGate from "../lib/AuthGate";
 import {
   REVEAL_DURATION_SEC,
@@ -14,10 +13,7 @@ import {
   ROUND_START_INTRO_SEC,
   COOLDOWN_MS,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
-  BUZZER_WRONG_MESSAGE_DURATION_MS,
-  DEFAULT_BUZZER_WRONG_PENALTY,
   DEFAULT_TIME_MUSIC_SEC,
-  DEFAULT_BUZZER_COLLECT_WINDOW_MS,
 } from "../lib/constants";
 
 // Composant pour un champ de configuration
@@ -89,9 +85,6 @@ function ConfigInner() {
     roundStartIntroSec: ROUND_START_INTRO_SEC,
     cooldownMs: COOLDOWN_MS,
     buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
-    buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
-    buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
-    buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
     defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
     archivesFolderPath: "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
   });
@@ -111,9 +104,6 @@ function ConfigInner() {
             roundStartIntroSec: data.roundStartIntroSec ?? ROUND_START_INTRO_SEC,
             cooldownMs: data.cooldownMs ?? COOLDOWN_MS,
             buzzerCorrectMessageDurationMs: data.buzzerCorrectMessageDurationMs ?? BUZZER_CORRECT_MESSAGE_DURATION_MS,
-            buzzerWrongMessageDurationMs: data.buzzerWrongMessageDurationMs ?? BUZZER_WRONG_MESSAGE_DURATION_MS,
-            buzzerWrongPenalty: data.buzzerWrongPenalty ?? DEFAULT_BUZZER_WRONG_PENALTY,
-            buzzerCollectWindowMs: data.buzzerCollectWindowMs ?? DEFAULT_BUZZER_COLLECT_WINDOW_MS,
             defaultTimeMusicSec: data.defaultTimeMusicSec ?? DEFAULT_TIME_MUSIC_SEC,
             archivesFolderPath: data.archivesFolderPath ?? "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
           });
@@ -147,7 +137,6 @@ function ConfigInner() {
         { merge: true }
       );
 
-      resetTimingConfigCache(); // Réinitialiser le cache pour que les autres pages utilisent les nouvelles valeurs
       setNotice("Configuration sauvegardée avec succès ✔");
       setSaved(true);
       setTimeout(() => {
@@ -175,9 +164,6 @@ function ConfigInner() {
       roundStartIntroSec: ROUND_START_INTRO_SEC,
       cooldownMs: COOLDOWN_MS,
       buzzerCorrectMessageDurationMs: BUZZER_CORRECT_MESSAGE_DURATION_MS,
-      buzzerWrongMessageDurationMs: BUZZER_WRONG_MESSAGE_DURATION_MS,
-      buzzerWrongPenalty: DEFAULT_BUZZER_WRONG_PENALTY,
-      buzzerCollectWindowMs: DEFAULT_BUZZER_COLLECT_WINDOW_MS,
       defaultTimeMusicSec: DEFAULT_TIME_MUSIC_SEC,
       archivesFolderPath: "D:\\Musique\\_EleyBox\\QuizLive Appli\\Archives-Quizz",
     });
@@ -313,38 +299,6 @@ function ConfigInner() {
                 description="Temps d'affichage du message de bonne réponse (défaut: 5000ms = 5s)"
               />
 
-              <ConfigField
-                label="Durée message 'Mauvaise réponse' (millisecondes)"
-                value={config.buzzerWrongMessageDurationMs}
-                onChange={(val) => setConfig({ ...config, buzzerWrongMessageDurationMs: val })}
-                min={1000}
-                max={10000}
-                step={500}
-                unit="ms"
-                description="Temps d'affichage du message de mauvaise réponse (défaut: 3000ms = 3s)"
-              />
-
-              <ConfigField
-                label="Pénalité pour mauvaise réponse (points)"
-                value={config.buzzerWrongPenalty}
-                onChange={(val) => setConfig({ ...config, buzzerWrongPenalty: val })}
-                min={1}
-                max={20}
-                step={1}
-                unit="pts"
-                description="Nombre de points perdus pour une mauvaise réponse (défaut: 3 pts)"
-              />
-
-              <ConfigField
-                label="Durée de la fenêtre de collecte des buzz (millisecondes)"
-                value={config.buzzerCollectWindowMs}
-                onChange={(val) => setConfig({ ...config, buzzerCollectWindowMs: val })}
-                min={500}
-                max={5000}
-                step={100}
-                unit="ms"
-                description="Temps pendant lequel les buzz sont collectés avant sélection aléatoire pondérée (défaut: 1500ms = 1,5s)"
-              />
             </div>
           </section>
 

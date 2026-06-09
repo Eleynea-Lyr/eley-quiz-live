@@ -17,7 +17,6 @@ import {
   updateDoc,
   where,
   serverTimestamp,
-  deleteDoc,
 } from "firebase/firestore";
 
 // Imports depuis les fichiers utilitaires
@@ -39,19 +38,13 @@ import {
   SAFE_TOP,
   TOP_GUTTER_RUNNING,
   TOP_GUTTER_IDLE,
-  BUZZER_COOLDOWN_MS,
   BUZZER_STATES,
-  BUZZER_CORRECT_MESSAGE_DURATION_MS,
-  BUZZER_WRONG_MESSAGE_DURATION_MS,
-  DEFAULT_BUZZER_WRONG_PENALTY,
   DEFAULT_BUZZER_POINTS,
 } from "../lib/constants";
 
 import {
   getTimeSec,
   formatHMS,
-  normalize,
-  normalizeBasic,
   normalizeName,
   normalizeNameAlpha,
   pickRevealPhrase,
@@ -64,9 +57,6 @@ import {
   validateTeamName,
   normalizeTeamName,
   messageForRank,
-  finalScoreMessageForRank,
-  medalForRank,
-  IS_IOS,
   addSmartLineBreaks,
 } from "../lib/utils";
 
@@ -80,11 +70,6 @@ import {
 } from "../lib/firebase-helpers";
 
 import { ELEYBUZZ_PLAYER_MESSAGES, SCREEN_MESSAGES } from "../lib/messages";
-
-// ---------------------------------------------------------------------------
-// Constante locale spécifique au player
-// ---------------------------------------------------------------------------
-const BOUNDARY_HYST_MS = 120;   // marge autour des frontières de manche
 
 // ---------------------------------------------------------------------------
 // Splash (écran neutre, plein écran, fond homogène)
@@ -230,10 +215,6 @@ export default function Player() {
   const [countdownStartSec, setCountdownStartSec] = useState(COUNTDOWN_START_SEC);
   const [roundStartIntroSec, setRoundStartIntroSec] = useState(ROUND_START_INTRO_SEC);
   const [cooldownMs, setCooldownMs] = useState(COOLDOWN_MS);
-  const [buzzerCooldownMs, setBuzzerCooldownMs] = useState(BUZZER_COOLDOWN_MS);
-  const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
-  const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
-  const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [activeQuizKey, setActiveQuizKey] = useState(null);
 
@@ -314,6 +295,8 @@ export default function Player() {
   const [optimisticFirstPlayerId, setOptimisticFirstPlayerId] = useState(null);
   // État local pour empêcher les doubles buzz (désactive le bouton immédiatement)
   const [isBuzzing, setIsBuzzing] = useState(false);
+  const buzzerOpenSeqRef = useRef(0);
+  const buzzerStateRef = useRef("idle");
 
   // Score Final state
   const [showFinalScore, setShowFinalScore] = useState(false);
@@ -622,6 +605,17 @@ export default function Player() {
         setIsBuzzerMode(newIsBuzzerMode);
         const newBuzzerState = typeof d.buzzerState === "string" ? d.buzzerState : "idle";
         const newFirstPlayerId = typeof d.firstPlayerId === "string" ? d.firstPlayerId : null;
+        const newOpenSeq = Number.isFinite(d.buzzerOpenSeq) ? Number(d.buzzerOpenSeq) : 0;
+        
+        buzzerStateRef.current = newBuzzerState;
+
+        // Nouvelle session d'ouverture → invalider tout état optimiste / tap en retard
+        if (newOpenSeq !== buzzerOpenSeqRef.current) {
+          buzzerOpenSeqRef.current = newOpenSeq;
+          setOptimisticBuzzerState(null);
+          setOptimisticFirstPlayerId(null);
+          setIsBuzzing(false);
+        }
         
         setBuzzerState(newBuzzerState);
         setFirstPlayerId(newFirstPlayerId);
@@ -836,14 +830,6 @@ export default function Player() {
         setRoundStartIntroSec(ris);
         const cm = Number.isFinite(d?.cooldownMs) ? d.cooldownMs : COOLDOWN_MS;
         setCooldownMs(cm);
-        const bcm = Number.isFinite(d?.buzzerCooldownMs) ? d.buzzerCooldownMs : BUZZER_COOLDOWN_MS;
-        setBuzzerCooldownMs(bcm);
-        const bcmd = Number.isFinite(d?.buzzerCorrectMessageDurationMs) ? d.buzzerCorrectMessageDurationMs : BUZZER_CORRECT_MESSAGE_DURATION_MS;
-        setBuzzerCorrectMessageDurationMs(bcmd);
-        const bwmd = Number.isFinite(d?.buzzerWrongMessageDurationMs) ? d.buzzerWrongMessageDurationMs : BUZZER_WRONG_MESSAGE_DURATION_MS;
-        setBuzzerWrongMessageDurationMs(bwmd);
-        const bwp = Number.isFinite(d?.buzzerWrongPenalty) ? d.buzzerWrongPenalty : DEFAULT_BUZZER_WRONG_PENALTY;
-        setBuzzerWrongPenalty(bwp);
 
         // Messages personnalisables depuis Firestore
         const customFinalPodiumTitle = typeof d?.screenQuiz?.finalPodiumTitle === "string" && d.screenQuiz.finalPodiumTitle.trim() !== ""
@@ -1570,51 +1556,14 @@ export default function Player() {
   // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
   useEffect(() => {
     if (!isBuzzerMode) {
-      // Quand EleyBuzz est désactivé, réinitialiser tous les états locaux
       startTransition(() => {
         setOptimisticBuzzerState(null);
         setOptimisticFirstPlayerId(null);
-        setIsBuzzing(false); // Réactiver le bouton
-        // Forcer canBuzz à true localement (sera synchronisé depuis Firestore)
+        setIsBuzzing(false);
         setCanBuzz(true);
       });
     }
   }, [isBuzzerMode]);
-
-  // Rafraîchissement automatique pendant les phases LOCKED et IDLE pour éviter les blocages
-  // Nettoie les états optimistes et force un re-render périodique
-  // - Pendant LOCKED : quand la personne répond
-  // - Pendant IDLE : pendant l'attente ("écoute attentivement la question de Eley")
-  useEffect(() => {
-    if (!isBuzzerMode) return;
-    
-    // Activer le rafraîchissement pendant LOCKED (personne répond) ou IDLE (attente)
-    const shouldRefresh = buzzerState === BUZZER_STATES.LOCKED || buzzerState === BUZZER_STATES.IDLE;
-    if (!shouldRefresh) return;
-
-    // Nettoyer immédiatement les états optimistes qui ne sont plus nécessaires
-    // Une fois que Firestore confirme LOCKED, on n'a plus besoin de l'optimiste
-    if (optimisticBuzzerState && firstPlayerId) {
-      // Firestore a confirmé, on peut nettoyer l'optimiste
-      setOptimisticBuzzerState(null);
-      setOptimisticFirstPlayerId(null);
-    }
-
-    // Rafraîchissement périodique toutes les 500ms pendant LOCKED ou IDLE
-    // Cela force un re-render et nettoie les états qui pourraient s'accumuler
-    const refreshInterval = setInterval(() => {
-      // Forcer un petit re-render pour nettoyer les états
-      // Cela évite l'accumulation de mémoire et les blocages
-      if (optimisticBuzzerState && firstPlayerId) {
-        // Nettoyer l'optimiste si Firestore a confirmé
-        setOptimisticBuzzerState(null);
-        setOptimisticFirstPlayerId(null);
-      }
-    }, 500); // Rafraîchissement toutes les 500ms
-
-    return () => clearInterval(refreshInterval);
-  }, [isBuzzerMode, buzzerState, optimisticBuzzerState, firstPlayerId]);
-
 
   /* ============================ Vérification & Handlers ============================ */
 
@@ -1718,10 +1667,20 @@ export default function Player() {
 
   // Handler EleyBuzz - premier qui buzz = gagnant
   const handleBuzzerPress = async () => {
-    if (!playerId || !isBuzzerMode || buzzerState !== BUZZER_STATES.OPEN) return;
+    if (!playerId || !isBuzzerMode || buzzerStateRef.current !== BUZZER_STATES.OPEN) return;
     
     // Vérifier canBuzz (si le joueur a donné une mauvaise réponse, il ne peut plus buzzer)
     if (!canBuzz) return;
+
+    const attemptOpenSeq = buzzerOpenSeqRef.current;
+
+    const clearBuzzOptimistic = () => {
+      startTransition(() => {
+        setOptimisticBuzzerState(null);
+        setOptimisticFirstPlayerId(null);
+      });
+      setIsBuzzing(false);
+    };
 
     // Mise à jour optimiste immédiate
     if (!isBuzzing) {
@@ -1732,42 +1691,35 @@ export default function Player() {
       });
     }
 
-    // Appel Firestore en arrière-plan (non-bloquant)
     try {
-      const result = await registerBuzzerPress(db, playerId);
-      // Si le buzz a échoué, réinitialiser l'état optimiste
-      if (!result.ok && result.reason === "already-buzzed") {
-        // Déjà buzzé, garder l'état optimiste pour l'animation visuelle
-        // Ne pas réinitialiser isBuzzing pour permettre les clics suivants
+      const result = await registerBuzzerPress(db, playerId, attemptOpenSeq);
+
+      // Réponse arrivée trop tard (buzzer refermé, rouvert, ou autre session)
+      if (
+        buzzerOpenSeqRef.current !== attemptOpenSeq ||
+        buzzerStateRef.current !== BUZZER_STATES.OPEN
+      ) {
+        clearBuzzOptimistic();
         return;
       }
-      // Si le buzz a échoué (déjà verrouillé par un autre joueur), réinitialiser l'état optimiste
-      if (!result.ok && result.reason === "already-locked") {
-        startTransition(() => {
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
-        });
-        // Réactiver le bouton si le buzz a échoué
-        setIsBuzzing(false);
-      } else if (result.ok) {
-        // Le buzz a réussi, garder isBuzzing à true jusqu'à ce que Firestore confirme
-        // (sera réinitialisé par le useEffect qui écoute firstPlayerId)
-      } else {
-        // Autre erreur (buzzer-not-open, player-not-found, player-cannot-buzz)
-        startTransition(() => {
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
-        });
-        setIsBuzzing(false);
+
+      if (result.ok) {
+        return;
       }
+
+      if (
+        result.reason === "already-taken" ||
+        result.reason === "stale-open-seq" ||
+        result.reason === "buzzer-not-open"
+      ) {
+        clearBuzzOptimistic();
+        return;
+      }
+
+      clearBuzzOptimistic();
     } catch (e) {
       console.error("[Player] handleBuzzerPress error:", e);
-      // En cas d'erreur, réinitialiser l'état optimiste et réactiver le bouton
-      startTransition(() => {
-        setOptimisticBuzzerState(null);
-        setOptimisticFirstPlayerId(null);
-      });
-      setIsBuzzing(false);
+      clearBuzzOptimistic();
     }
   };
 
@@ -2933,16 +2885,9 @@ export default function Player() {
     // 1. canBuzz est false (verrouillé par l'admin après mauvaise réponse)
     // 2. Le buzzer n'est pas en IDLE (nouvelle question - tous débloqués)
     // 3. Le joueur n'est PAS en train de buzzer (sinon c'est jaune, pas rouge)
-    // 4. Il n'y a PAS de message "wrong" actif pour un autre joueur (pour éviter les faux positifs)
-    // Note : canBuzz reste false pour un joueur qui a donné une mauvaise réponse, même après réouverture du buzzer
-    // Il sera réinitialisé à true seulement quand le buzzer reviendra à IDLE (nouvelle question)
-    // IMPORTANT : Si le joueur vient de buzzer (isCurrentlyBuzzing), on ne le considère JAMAIS comme puni
-    // car dans ce cas, le buzzer est jaune (en attente de réponse de l'admin)
-    const hasActiveWrongMessage = buzzerMessageType === "wrong" && effectiveFirstPlayerId && effectiveFirstPlayerId !== playerId;
-    const isPunished = !canBuzz && 
-                       effectiveBuzzerState !== BUZZER_STATES.IDLE && 
-                       !isCurrentlyBuzzing &&
-                       !hasActiveWrongMessage; // Ne pas considérer comme puni si le message "wrong" est pour un autre joueur
+    const isPunished = !canBuzz &&
+                       effectiveBuzzerState !== BUZZER_STATES.IDLE &&
+                       !isCurrentlyBuzzing;
     
     // Utiliser l'état optimiste pour firstPlayerId (affichage immédiat)
     // Cela permet d'afficher immédiatement "À toi de répondre !" pour le joueur qui buzz
@@ -2997,6 +2942,42 @@ export default function Player() {
 
         {/* BLOC PRINCIPAL ELEYBUZZ : Gère Punition OU Buzzer de manière exclusive */}
         {(() => {
+          // Message « bravo » partagé (gagnant + autres) — priorité sur punition / buzzer
+          if (buzzerMessageType === "correct" && firstPlayerId) {
+            const winner = (playersLB || []).find((p) => p.id === firstPlayerId);
+            const winnerName = winner?.name || "Un joueur";
+            const isWinner = playerId === firstPlayerId;
+            const celebrationText = isWinner
+              ? `${playerEleyBuzzMessages.correctAnswer}, ${playerEleyBuzzMessages.youWin} ${buzzerPoints} ${playerEleyBuzzMessages.pts}`
+              : `${winnerName} ${playerEleyBuzzMessages.otherScored} ${buzzerPoints} ${playerEleyBuzzMessages.pts}`;
+
+            return (
+              <div
+                style={{
+                  fontSize: "clamp(1.25rem, 4vw, 1.75rem)",
+                  fontWeight: 800,
+                  padding: "20px 28px",
+                  borderRadius: 12,
+                  maxWidth: "min(600px, 95%)",
+                  lineHeight: 1.5,
+                  ...(isWinner
+                    ? {
+                        background: "#0b3a1e",
+                        border: "2px solid #22c55e",
+                        color: "#86efac",
+                      }
+                    : {
+                        background: "#0f172a",
+                        border: "2px solid #3b82f6",
+                        color: "#93c5fd",
+                      }),
+                }}
+              >
+                {celebrationText}
+              </div>
+            );
+          }
+
           // 1. DÉTECTION STRICTE DE LA PUNITION - PRIORITÉ ABSOLUE
           // isPunished est déjà calculé AVANT ce bloc (ligne ~2041)
           // Cela garantit qu'on ne regarde même pas l'état du buzzer si le joueur est puni
@@ -3111,29 +3092,8 @@ export default function Player() {
               // Premier joueur confirmé par le serveur : jaune par défaut, vert si bonne réponse, rouge si mauvaise réponse
               // Garde-fou pour la production : vérifier que les valeurs sont valides
               if (firstPlayerId && playerId && firstPlayerId === playerId) {
-                // Si c'est une bonne réponse, afficher en vert
-                if (buzzerMessageType === "correct") {
-                  return {
-                    background: "#10b981", // Vert pour bonne réponse
-                    border: "#fff",
-                    shadow: "0 8px 24px rgba(16, 185, 129, 0.4)",
-                    isClickable: false,
-                    isAnimating: false,
-                  };
-                }
-                // Si c'est une mauvaise réponse, afficher en rouge
-                if (buzzerMessageType === "wrong") {
-                  return {
-                    background: "#ef4444", // Rouge pour mauvaise réponse
-                    border: "#fff",
-                    shadow: "0 8px 24px rgba(239, 68, 68, 0.4)",
-                    isClickable: false,
-                    isAnimating: false,
-                  };
-                }
-                // Sinon, jaune par défaut (en attente de réponse)
                 return {
-                  background: "#facc15", // Jaune par défaut
+                  background: "#facc15",
                   border: "#fff",
                   shadow: "0 8px 24px rgba(250, 204, 21, 0.4)",
                   isClickable: false,
@@ -3276,43 +3236,16 @@ export default function Player() {
                     marginTop: 24,
                     opacity: 0.9, 
                     fontSize: 18,
-                    color: (() => {
-                      // Garde-fou pour la production : vérifier que les valeurs sont valides
-                      if (playerId && firstPlayerId && playerId === firstPlayerId && buzzerMessageType === "correct") return "#10b981";
-                      if (playerId && firstPlayerId && playerId === firstPlayerId && buzzerMessageType === "wrong") return "#ef4444";
-                      return undefined;
-                    })(),
                     fontWeight: (playerId && firstPlayerId && playerId === firstPlayerId) ? 700 : 400,
                     lineHeight: 1.6,
                   }}
-                  dangerouslySetInnerHTML={{ 
-                    __html: (() => {
-                      // Garde-fou pour la production : vérifier que les valeurs sont valides
-                      const isFirstPlayer = playerId && firstPlayerId && playerId === firstPlayerId;
-                      if (isFirstPlayer && buzzerMessageType === "correct") {
-                        return `Bravo, tu gagnes ${buzzerPoints} point${buzzerPoints > 1 ? 's' : ''} bonus⚡`;
-                      }
-                      if (isFirstPlayer && buzzerMessageType === "wrong") {
-                        return `Mauvaise réponse${lastWrongPenalty ? `, tu perds ${lastWrongPenalty} point${lastWrongPenalty > 1 ? 's' : ''}` : ''}. Attends la prochaine question pour rejouer !`;
-                      }
-                      if (isFirstPlayer) {
-                        return playerEleyBuzzMessages.yourTurn;
-                      }
-                      if (buzzerMessageType === "correct") {
-                        return playerEleyBuzzMessages.waitNextQuestion;
-                      }
-                      if (buzzerMessageType === "wrong") {
-                        return playerEleyBuzzMessages.tryYourChance;
-                      }
-                      // Si le buzzer est gris (pas le premier joueur), afficher le message "trop lent"
-                      // Garde-fou pour la production : vérifier que les valeurs sont valides
-                      if (firstPlayerId && firstPlayerId !== null && playerId && firstPlayerId !== playerId) {
-                        return playerEleyBuzzMessages.tooSlow || playerEleyBuzzMessages.locked;
-                      }
-                      return null; // Pas de message si rien de spécial
-                    })()
-                  }}
-                />
+                >
+                  {playerId && firstPlayerId && playerId === firstPlayerId
+                    ? playerEleyBuzzMessages.yourTurn
+                    : (firstPlayerId && playerId && firstPlayerId !== playerId
+                        ? (playerEleyBuzzMessages.tooSlow || playerEleyBuzzMessages.locked)
+                        : null)}
+                </div>
               )}
             </>
           );

@@ -24,8 +24,6 @@ import {
   DEFAULT_LEADERBOARD_TOP_N,
   DEFAULT_SCORING_TABLE,
   BUZZER_STATES,
-  BUZZER_CORRECT_MESSAGE_DURATION_MS,
-  BUZZER_WRONG_MESSAGE_DURATION_MS,
 } from "../lib/constants";
 
 import {
@@ -41,6 +39,7 @@ import {
 import {
   useMobileVH,
   ensureAwardsForQuestionTx,
+  getScoringTable,
 } from "../lib/firebase-helpers";
 import AuthGate from "../lib/AuthGate";
 
@@ -51,10 +50,6 @@ import { SCREEN_MESSAGES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
 // JOIN (DEV)
 const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
 const JOIN_QR_SRC = "/qr-join-dev.png";
-
-// JOIN (PUBLIC OK)
-// const DEV_JOIN_URL = "https://eley-quiz-live.vercel.app/player";
-// const JOIN_QR_SRC = "/qr-code-public-OK.png";
 
 // Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
@@ -94,24 +89,6 @@ function JoinPanelInline({ size = "md" }) {
           height: "auto",
         }}
       />
-    </div>
-  );
-}
-
-// Panneau "Rejoindre" fixé en bas-gauche pendant le quiz
-function JoinPanelFixedBottom() {
-  return (
-    <div
-      style={{
-        position: "fixed",
-        left: 18,
-        bottom: 18,
-        zIndex: 10,
-        pointerEvents: "none",
-      }}
-      aria-hidden="true"
-    >
-      <JoinPanelInline size="lg" />
     </div>
   );
 }
@@ -189,9 +166,6 @@ function ScreenInner() {
   // Dernier reset global des joueurs (playersResetAt) déjà pris en compte
   const lastPlayersResetAtRef = useRef(0);
 
-  // Préchargement images (réponse + question) pour éviter le flash
-  const [preloadedAnswerImage, setPreloadedAnswerImage] = useState(null);
-  const [preloadedQuestionImage, setPreloadedQuestionImage] = useState(null);
   const [syncHoleSince, setSyncHoleSince] = useState(null);
 
 
@@ -220,12 +194,21 @@ function ScreenInner() {
     return map;
   }, [playersLB]);
 
+  // Nom du gagnant EleyBuzz : résolu via la liste joueurs (firstPlayerName Firestore = legacy)
+  const buzzerWinnerName = useMemo(() => {
+    if (firstPlayerId) {
+      const name = playersById[firstPlayerId]?.name;
+      if (name) return name;
+    }
+    return firstPlayerName || null;
+  }, [firstPlayerId, firstPlayerName, playersById]);
+
   // Charger la table de scoring une fois
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const t = await getScoringTableScreen();
+        const t = await getScoringTable(db);
         if (mounted && Array.isArray(t)) setScoringTable(t);
       } catch {
         // fallback déjà en place via DEFAULT_SCORING_TABLE
@@ -406,11 +389,9 @@ function ScreenInner() {
         if (ms > lastPlayersResetAtRef.current) {
           lastPlayersResetAtRef.current = ms;
 
-          // Gardes TX (awards), top live, images et timer local
+          // Gardes TX (awards), top live et timer local
           awardGuardRef.current = {};
           setLiveFirsts([]);
-          setPreloadedAnswerImage(null);
-          setPreloadedQuestionImage(null);
           setElapsedSec(0);
         }
       }
@@ -1321,44 +1302,26 @@ function ScreenInner() {
 
   // Préchargement image RÉPONSE (anti-flicker au reveal)
   useEffect(() => {
-    setPreloadedAnswerImage(null);
     const url = answerImgUrl;
     if (!url) return;
 
-    let cancelled = false;
     const img = new Image();
     img.src = url;
-
-    const markReady = () => { if (!cancelled) setPreloadedAnswerImage(url); };
-
     if (typeof img.decode === "function") {
-      img.decode().then(markReady).catch(markReady);
-    } else {
-      img.onload = markReady;
-      img.onerror = () => { if (!cancelled) setPreloadedAnswerImage(null); };
+      img.decode().catch(() => {});
     }
-    return () => { cancelled = true; };
   }, [answerImgUrl, currentQuestionId]);
 
   // Préchargement image QUESTION (anti-flicker pendant la phase question)
   useEffect(() => {
-    setPreloadedQuestionImage(null);
     const url = questionImgUrl;
     if (!url) return;
 
-    let cancelled = false;
     const img = new Image();
     img.src = url;
-
-    const markReady = () => { if (!cancelled) setPreloadedQuestionImage(url); };
-
     if (typeof img.decode === "function") {
-      img.decode().then(markReady).catch(markReady);
-    } else {
-      img.onload = markReady;
-      img.onerror = () => { if (!cancelled) setPreloadedQuestionImage(null); };
+      img.decode().catch(() => {});
     }
-    return () => { cancelled = true; };
   }, [questionImgUrl, currentQuestionId]);
 
 
@@ -1374,30 +1337,13 @@ function ScreenInner() {
   }, [uiMasked]);
 
   // ============================================================================
-  // EleyBuzz Mode — Gestion des messages temporaires et leaderboard
+  // EleyBuzz Mode — Leaderboard (messages gérés côté Firestore par l'admin)
   // IMPORTANT: Ces hooks doivent être AVANT tous les early returns conditionnels
   // ============================================================================
-  
-  // Gestion des messages temporaires avec auto-dismiss
-  useEffect(() => {
-    if (!isBuzzerMode || !buzzerMessage || !buzzerMessageType) return;
-
-    const duration = buzzerMessageType === "correct"
-      ? BUZZER_CORRECT_MESSAGE_DURATION_MS
-      : BUZZER_WRONG_MESSAGE_DURATION_MS;
-
-    const timer = setTimeout(() => {
-      setBuzzerMessage(null);
-      setBuzzerMessageType(null);
-    }, duration);
-
-    return () => clearTimeout(timer);
-  }, [isBuzzerMode, buzzerMessage, buzzerMessageType]);
 
   // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
   useEffect(() => {
     if (!isBuzzerMode) {
-      // Quand EleyBuzz est désactivé, réinitialiser tous les états locaux
       setBuzzerMessage(null);
       setBuzzerMessageType(null);
     }
@@ -1476,6 +1422,11 @@ function ScreenInner() {
   // EleyBuzz Mode — Early return si mode buzzer actif (priorité sur showPreStart)
   // ============================================================================
   if (isBuzzerMode) {
+    // Priorité d'affichage : message « bravo » > états buzzer (idle/open/locked)
+    const showingCorrectMessage = Boolean(
+      buzzerMessage && buzzerMessageType === "correct"
+    );
+
     return (
       <div
         style={{
@@ -1554,8 +1505,8 @@ function ScreenInner() {
             ⚡ EleyBuzz ⚡
           </h1>
 
-          {/* État du buzzer */}
-          {buzzerState === BUZZER_STATES.IDLE && !buzzerMessage && (
+          {/* État du buzzer — masqué pendant le message « bravo » */}
+          {!showingCorrectMessage && buzzerState === BUZZER_STATES.IDLE && (
             <div 
               style={{ fontSize: "1.5rem", opacity: 0.85, maxWidth: "min(800px, 90%)" }}
               dangerouslySetInnerHTML={{ 
@@ -1565,16 +1516,16 @@ function ScreenInner() {
             />
           )}
 
-          {buzzerState === BUZZER_STATES.OPEN && !buzzerMessage && (
+          {!showingCorrectMessage && buzzerState === BUZZER_STATES.OPEN && (
             <div style={{ fontSize: "1.5rem", opacity: 0.85, color: "#3b82f6", fontWeight: 700 }}>
               Le buzzer est ouvert, préparez-vous à buzzer !
             </div>
           )}
 
-          {buzzerState === BUZZER_STATES.LOCKED && firstPlayerName && !buzzerMessage && (
+          {!showingCorrectMessage && buzzerState === BUZZER_STATES.LOCKED && buzzerWinnerName && (
             <div>
               <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
-                {firstPlayerName} {screenEleyBuzzMessages.locked}
+                {buzzerWinnerName} {screenEleyBuzzMessages.locked}
               </div>
               <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
                 {screenEleyBuzzMessages.waitingAnswer}
@@ -1582,8 +1533,8 @@ function ScreenInner() {
             </div>
           )}
 
-          {/* Messages temporaires - seulement pour "correct", pas pour "wrong" */}
-          {buzzerMessage && buzzerMessageType === "correct" && (
+          {/* Message « bravo » — priorité absolue */}
+          {showingCorrectMessage && (
             <div
               style={{
                 fontSize: "2.5rem",

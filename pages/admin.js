@@ -19,7 +19,6 @@ import {
   setDoc,
   serverTimestamp,
   onSnapshot,
-  Timestamp,
   arrayUnion,
   arrayRemove,
   runTransaction,
@@ -40,9 +39,7 @@ import {
   DEFAULT_TIME_MUSIC_SEC,
   PLAYER_COLORS,
   DEFAULT_BUZZER_POINTS,
-  DEFAULT_BUZZER_WRONG_PENALTY,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
-  BUZZER_WRONG_MESSAGE_DURATION_MS,
   BUZZER_STATES,
 } from "../lib/constants";
 import { DEFAULT_REVEAL_PHRASES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
@@ -50,7 +47,6 @@ import { DEFAULT_REVEAL_PHRASES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/message
 import {
   parseHMS,
   formatHMS,
-  formatHMSForInput,
   parseCSV,
   toCSV,
   clampTimeMusicSec,
@@ -65,16 +61,11 @@ import {
 import {
   deleteTeamTx,
   ensureAwardsForQuestionTx,
-  resetScoringCache,
-  resetTeamScoringCache,
-  registerBuzzerPress,
   awardBuzzerPoints,
   resetBuzzerState,
-  clearBuzzerAttempts,
+  openBuzzerForNewRound,
   lockPlayerBuzz,
-  resetPlayerBuzzLock,
   resetAllPlayerBuzzLocks,
-  getTimingConfig,
 } from "../lib/firebase-helpers";
 
 // ============================================================================
@@ -144,13 +135,6 @@ async function ensureConfigDefaults() {
 
   if (Object.keys(patch).length > 0) {
     await setDoc(cfgRef, patch, { merge: true });
-    // Si on a mis à jour la table de scoring, réinitialiser le cache
-    if (patch.scoringTable) {
-      resetScoringCache();
-    }
-    if (patch.teamScoringTable) {
-      resetTeamScoringCache();
-    }
   }
 
   // Backfill des questions existantes : leur attribuer quizKey = defaultQuizKey si manquant
@@ -235,45 +219,6 @@ async function backfillQuestionsQuizKey(defaultQuizKey) {
     console.error("backfillQuestionsQuizKey error:", e);
   }
 }
-
-/**
- * Backfill : ajoute buzzScore = 0 aux joueurs existants qui n'ont pas ce champ
- * (Optionnel, peut être appelé une fois au besoin)
- */
-async function backfillPlayersBuzzScore() {
-  try {
-    const playersCol = collection(doc(db, "quiz", "state"), "players");
-    const snap = await getDocs(playersCol);
-
-    const docsToFix = snap.docs.filter((d) => {
-      const data = d.data() || {};
-      return !("buzzScore" in data);
-    });
-
-    if (!docsToFix.length) return;
-
-    console.log(
-      "[Admin] backfill buzzScore on",
-      docsToFix.length,
-      "players"
-    );
-
-    // Batch par blocs de 400
-    while (docsToFix.length) {
-      const chunk = docsToFix.splice(0, 400);
-      const batch = writeBatch(db);
-
-      chunk.forEach((docSnap) => {
-        batch.update(doc(playersCol, docSnap.id), { buzzScore: 0 });
-      });
-
-      await batch.commit();
-    }
-  } catch (e) {
-    console.error("backfillPlayersBuzzScore error:", e);
-  }
-}
-
 
 // ============================================================================
 // [1.7] Toggle Pause / Reprendre — même logique que Back/Next/Start
@@ -500,8 +445,6 @@ function AdminInner() {
 
   // Intro / fin de manche
   const [isIntro, setIsIntro] = useState(false);
-  const [introEndsAtMs, setIntroEndsAtMs] = useState(null);
-  const [introRoundIndex, setIntroRoundIndex] = useState(null);
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] =
     useState(null);
 
@@ -523,10 +466,7 @@ function AdminInner() {
   const [firstPlayerName, setFirstPlayerName] = useState(null);
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [buzzerMessage, setBuzzerMessage] = useState(null);
-  const [buzzerMessageType, setBuzzerMessageType] = useState(null);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
-  const [buzzerWrongMessageDurationMs, setBuzzerWrongMessageDurationMs] = useState(BUZZER_WRONG_MESSAGE_DURATION_MS);
-  const [buzzerWrongPenalty, setBuzzerWrongPenalty] = useState(DEFAULT_BUZZER_WRONG_PENALTY);
   const [defaultTimeMusicSec, setDefaultTimeMusicSec] = useState(DEFAULT_TIME_MUSIC_SEC);
   
   // Messages personnalisables EleyBuzz Screen
@@ -535,6 +475,15 @@ function AdminInner() {
   // États pour l'édition des scores
   const [editingScore, setEditingScore] = useState({ playerId: null, field: null }); // { playerId: "xxx", field: "score" ou "buzzScore" }
   const [editingValue, setEditingValue] = useState("");
+
+  // Nom du gagnant EleyBuzz : résolu via la liste joueurs (firstPlayerName Firestore = legacy)
+  const buzzerWinnerName = useMemo(() => {
+    if (firstPlayerId) {
+      const p = players.find((x) => x.id === firstPlayerId);
+      if (p?.name) return p.name;
+    }
+    return firstPlayerName || null;
+  }, [firstPlayerId, firstPlayerName, players]);
 
   // Refs pour connaître la phase courante sans dépendance d'ordre
   const isCountdownRef = useRef(false);
@@ -621,10 +570,6 @@ function AdminInner() {
         // Timing EleyBuzz
         const bcmd = Number.isFinite(d?.buzzerCorrectMessageDurationMs) ? d.buzzerCorrectMessageDurationMs : BUZZER_CORRECT_MESSAGE_DURATION_MS;
         setBuzzerCorrectMessageDurationMs(bcmd);
-        const bwmd = Number.isFinite(d?.buzzerWrongMessageDurationMs) ? d.buzzerWrongMessageDurationMs : BUZZER_WRONG_MESSAGE_DURATION_MS;
-        setBuzzerWrongMessageDurationMs(bwmd);
-        const bwp = Number.isFinite(d?.buzzerWrongPenalty) ? d.buzzerWrongPenalty : DEFAULT_BUZZER_WRONG_PENALTY;
-        setBuzzerWrongPenalty(bwp);
 
         // Default TimeMusic
         const dtms = Number.isFinite(d?.defaultTimeMusicSec) ? d.defaultTimeMusicSec : DEFAULT_TIME_MUSIC_SEC;
@@ -821,12 +766,6 @@ function AdminInner() {
         }
 
         setIsIntro(!!d.isIntro);
-        setIntroEndsAtMs(
-          typeof d.introEndsAtMs === "number" ? d.introEndsAtMs : null
-        );
-        setIntroRoundIndex(
-          Number.isInteger(d.introRoundIndex) ? d.introRoundIndex : null
-        );
         setLastAutoPausedRoundIndex(
           Number.isInteger(d.lastAutoPausedRoundIndex)
             ? d.lastAutoPausedRoundIndex
@@ -840,7 +779,6 @@ function AdminInner() {
         setFirstPlayerName(typeof d.firstPlayerName === "string" ? d.firstPlayerName : null);
         setBuzzerPoints(Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS);
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
-        setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
       },
       (e) => console.error("onSnapshot state error:", e)
     );
@@ -1271,9 +1209,6 @@ function AdminInner() {
     isRevealRef.current = !!isRevealAnswerPhase;
   }, [isRevealAnswerPhase]);
 
-
-  /* === Contrôle clavier EleyBuzz (désactivé - les raccourcis seront gérés via Stream Deck) === */
-  // Les raccourcis clavier 1, 2, 3 ont été désactivés pour permettre l'utilisation normale du clavier numérique
 
   /* === Watcher attribution auto (début du reveal) — transactionnel/idempotent === */
   useEffect(() => {
@@ -2325,40 +2260,6 @@ function AdminInner() {
     }
   };
 
-  async function goToRoundEndPaused() {
-    const prevIdx = roundIndexOfTime(
-      Math.max(0, elapsedSec - 1),
-      roundOffsetsSec
-    );
-    const nextStart =
-      typeof roundOffsetsSec[prevIdx + 1] === "number"
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
-    if (!Number.isFinite(nextStart)) return;
-
-    const targetSec = Math.max(0, Math.floor(nextStart));
-    try {
-      await setDoc(
-        doc(db, "quiz", "state"),
-        {
-          isRunning: true,
-          isPaused: true,
-          startAt: serverTimestamp(),
-          pauseAt: serverTimestamp(),
-          anchorAt: serverTimestamp(),
-          anchorOffsetSec: targetSec,
-          startEpochMs: null,
-          navSeq: increment(1),
-          hbBoost: true,
-          lastAutoPausedRoundIndex: prevIdx,
-        },
-        { merge: true }
-      );
-    } catch (e) {
-      console.error("goToRoundEndPaused error:", e);
-    }
-  }
-
   /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
 
   // [5.1] Alias "Player N"
@@ -2669,7 +2570,6 @@ function AdminInner() {
     try {
       // Réinitialiser l'état EleyBuzz en premier
       await resetBuzzerState(db, "idle");
-      await clearBuzzerAttempts(db);
 
       await setDoc(
         doc(db, "quiz", "state"),
@@ -2739,7 +2639,6 @@ function AdminInner() {
     try {
       // Réinitialiser l'état EleyBuzz
       await resetBuzzerState(db, "idle");
-      await clearBuzzerAttempts(db);
       
       await setDoc(
         doc(db, "quiz", "state"),
@@ -2808,8 +2707,6 @@ function AdminInner() {
         });
         // Réinitialiser tous les canBuzz des joueurs à true (pour débloquer ceux qui étaient en punition)
         await resetAllPlayerBuzzLocks(db, []);
-        // Nettoyer la collection temporaire des tentatives (au cas où)
-        await clearBuzzerAttempts(db);
         setNotice("EleyBuzz activé");
       } else {
         // Désactivation : débloquer tous les joueurs et nettoyer la collection temporaire
@@ -2829,25 +2726,23 @@ function AdminInner() {
   }
 
   // Toggle buzzer state (idle ↔ open)
-  // Ne peut pas changer d'état si on est en COLLECTING ou LOCKED
   async function toggleBuzzerState() {
     if (!isBuzzerMode) return;
     
-    // Ne pas permettre de changer d'état si on est en collecte ou verrouillé
-    if (buzzerState === BUZZER_STATES.COLLECTING || buzzerState === BUZZER_STATES.LOCKED) {
-      setNotice("Le buzzer est en cours d'utilisation, attendez la fin de la sélection");
+    if (buzzerState === BUZZER_STATES.LOCKED) {
+      setNotice("Le buzzer est verrouillé, attendez la fin de la manche");
       setTimeout(() => setNotice(null), 2000);
       return;
     }
     
     try {
-      const stateRef = doc(db, "quiz", "state");
-      const nextState = buzzerState === "idle" ? "open" : "idle";
-      await resetBuzzerState(db, nextState);
-      
-      // Note : On ne débloque PAS les joueurs punis quand on ouvre le buzzer
-      // Les joueurs punis restent verrouillés jusqu'à la prochaine question (quand le buzzer revient à IDLE)
-      // resetBuzzerState débloque automatiquement tous les joueurs quand nextState === "idle"
+      if (buzzerState === "idle") {
+        // Nouvelle question : tous les buzzers redeviennent bleus
+        await openBuzzerForNewRound(db);
+      } else {
+        // Pause : IDLE + réinitialisation de tous les joueurs
+        await resetBuzzerState(db, "idle");
+      }
     } catch (e) {
       console.error("toggleBuzzerState error:", e);
       setNotice("Erreur lors du changement d'état du buzzer");
@@ -2859,30 +2754,29 @@ function AdminInner() {
   async function handleBuzzerCorrect() {
     if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
     try {
-      const correctPlayerId = firstPlayerId; // Sauvegarder l'ID avant le reset
-      
-      // Attribuer les points
-      await awardBuzzerPoints(db, correctPlayerId, buzzerPoints);
-      
-      // Débloquer le joueur qui a donné la bonne réponse (pour qu'il puisse rebuzzer)
-      await resetPlayerBuzzLock(db, correctPlayerId);
-      
-      // Afficher message temporaire (géré côté Screen via Firestore)
+      const correctPlayerId = firstPlayerId;
+      const correctPlayerName = buzzerWinnerName;
       const stateRef = doc(db, "quiz", "state");
-      const correctMessage = `${screenEleyBuzzMessages.correctAnswer} ${firstPlayerName || "Joueur"}, ${screenEleyBuzzMessages.youWin} ${buzzerPoints} ${screenEleyBuzzMessages.pts}`;
+      const correctMessage = `${screenEleyBuzzMessages.correctAnswer} ${correctPlayerName || "Joueur"}, ${screenEleyBuzzMessages.youWin} ${buzzerPoints} ${screenEleyBuzzMessages.pts}`;
+
+      // 1) Message « bravo » (Screen + Player) — on garde firstPlayerId pour les textes joueurs
       await updateDoc(stateRef, {
         buzzerMessage: correctMessage,
         buzzerMessageType: "correct",
+        buzzerState: BUZZER_STATES.LOCKED,
+        firstPlayerId: correctPlayerId,
+        firstPlayerName: null,
       });
 
-      // Reset après 5 secondes
-      setTimeout(async () => {
-        await resetBuzzerState(db, "idle");
-        await updateDoc(stateRef, {
-          buzzerMessage: null,
-          buzzerMessageType: null,
-        });
-      }, 5000); // 5 secondes
+      // 2) Points
+      await awardBuzzerPoints(db, correctPlayerId, buzzerPoints);
+
+      // 3) Fin du message → buzzer rouvert, tous les joueurs bleus (nouvelle manche)
+      setTimeout(() => {
+        openBuzzerForNewRound(db).catch((e) =>
+          console.error("[handleBuzzerCorrect] openBuzzerForNewRound:", e)
+        );
+      }, buzzerCorrectMessageDurationMs);
     } catch (e) {
       console.error("handleBuzzerCorrect error:", e);
       setNotice("Erreur lors de l'attribution des points");
@@ -2922,7 +2816,7 @@ function AdminInner() {
       
       // Lock le joueur qui s'est trompé jusqu'à la prochaine question (pas de cooldown)
       // Le joueur ne pourra plus buzzer jusqu'à ce que le buzzer revienne à IDLE (nouvelle question)
-      await lockPlayerBuzz(db, wrongPlayerId, null);
+      await lockPlayerBuzz(db, wrongPlayerId);
 
       // DÉBLOQUER les autres joueurs et réouvrir le buzzer
       // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
@@ -3916,9 +3810,9 @@ function AdminInner() {
                 {buzzerState === "open" ? "Buzzer OUVERT" : buzzerState === "locked" ? "Buzzer VERROUILLÉ" : "Buzzer FERMÉ"}
               </button>
 
-              {buzzerState === "locked" && firstPlayerName && (
+              {buzzerState === "locked" && buzzerWinnerName && (
                 <span style={{ color: "#facc15", fontWeight: 700 }}>
-                  {firstPlayerName} a buzzé !
+                  {buzzerWinnerName} a buzzé !
                 </span>
               )}
 
