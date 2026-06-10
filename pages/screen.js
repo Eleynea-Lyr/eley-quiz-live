@@ -44,19 +44,15 @@ import {
 import AuthGate from "../lib/AuthGate";
 
 import { SCREEN_MESSAGES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
-
-// ====== Constantes spécifiques à screen.js ======
-
-// JOIN (DEV)
-const DEV_JOIN_URL = "http://192.168.1.118:3000/player";
-const JOIN_QR_SRC = "/qr-join-dev.png";
+import { isQcmQuestion, getQcmOptionsForDisplay } from "../lib/qcm";
+import { resolvePlayerJoinUrl, getJoinQrImageUrl } from "../lib/join-url";
 
 // Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
 
 
 // Panneau "Rejoindre" (inline)
-function JoinPanelInline({ size = "md" }) {
+function JoinPanelInline({ size = "md", joinUrl }) {
   const imgSize = size === "lg" ? 320 : 160;
   const panelStyle = {
     marginTop: 0, // évite le décalage dans le cadre
@@ -76,10 +72,10 @@ function JoinPanelInline({ size = "md" }) {
     <div style={panelStyle} aria-hidden="true">
       <div style={{ fontWeight: 700, marginBottom: 6 }}>Rejoindre :</div>
       <div style={{ fontFamily: "monospace", fontSize: 16, userSelect: "all" }}>
-        {DEV_JOIN_URL}
+        {joinUrl}
       </div>
       <img
-        src={JOIN_QR_SRC}
+        src={getJoinQrImageUrl(joinUrl)}
         alt=""
         style={{
           display: "block",
@@ -115,6 +111,16 @@ function Splash() {
 
 function ScreenInner() {
   useMobileVH();
+
+  const [playerJoinUrl, setPlayerJoinUrl] = useState(() =>
+    typeof window !== "undefined"
+      ? resolvePlayerJoinUrl(window.location)
+      : resolvePlayerJoinUrl(null)
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setPlayerJoinUrl(resolvePlayerJoinUrl(window.location));
+  }, []);
 
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
@@ -1484,7 +1490,7 @@ function ScreenInner() {
             </div>
           )}
           <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-            <JoinPanelInline size="lg" />
+            <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
           </div>
         </aside>
 
@@ -1724,7 +1730,7 @@ function ScreenInner() {
             </div>
           )}
           <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-            <JoinPanelInline size="lg" />
+            <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
           </div>
         </aside>
 
@@ -1836,7 +1842,7 @@ function ScreenInner() {
           <p style={{ opacity: 0.8, marginTop: 12 }}>
             Le quiz n'a pas encore commencé.<br />Préparez-vous…
           </p>
-          <JoinPanelInline size="lg" />
+          <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
         </div>
       </div>
     );
@@ -1933,7 +1939,7 @@ function ScreenInner() {
           </div>
         )}
         <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-          <JoinPanelInline size="lg" />
+          <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
         </div>
       </aside>
 
@@ -2118,10 +2124,43 @@ function ScreenInner() {
                 </div>
               </div>
             ) : isQuestionPhase ? (
+              <>
               <h1 
                 style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}
                 dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
               />
+              {isQcmQuestion(currentQuestion) ? (
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr",
+                    gap: "clamp(12px, 2vw, 20px)",
+                    maxWidth: "min(920px, 92%)",
+                    margin: "16px auto 8px",
+                    fontSize: "clamp(1rem, 2.5vw, 1.25rem)",
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {getQcmOptionsForDisplay(currentQuestion).map((opt, idx) =>
+                    opt ? (
+                      <div
+                        key={idx}
+                        style={{
+                          padding: "clamp(12px, 2vw, 18px)",
+                          borderRadius: 10,
+                          border: "1px solid rgba(148, 163, 184, 0.35)",
+                          background: "rgba(15, 35, 74, 0.55)",
+                          textAlign: "center",
+                          opacity: 0.95,
+                        }}
+                      >
+                        {opt}
+                      </div>
+                    ) : null
+                  )}
+                </div>
+              ) : null}
+              </>
             ) : isRevealAnswerPhase ? (
               <div style={{ marginTop: 8, marginBottom: 4 }}>
                 <div style={{ 
@@ -2341,7 +2380,7 @@ function ScreenInner() {
         )}
 
         {/* QR — écran d’attente : juste sous le texte d’attente */}
-        {!isRunning && <JoinPanelInline size="md" />}
+        {!isRunning && <JoinPanelInline size="md" joinUrl={playerJoinUrl} />}
       </div>
 
       {/* ===== Colonne scores (droite) ===== */}

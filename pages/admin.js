@@ -59,6 +59,16 @@ import {
 } from "../lib/utils";
 
 import {
+  QUESTION_TYPE_OPEN,
+  QUESTION_TYPE_QCM,
+  getQuestionType,
+  normalizeQcmOptions,
+  getQcmCorrectIndex,
+  qcmAnswersFromOptions,
+  validateQcmOptions,
+} from "../lib/qcm";
+
+import {
   deleteTeamTx,
   ensureAwardsForQuestionTx,
   awardBuzzerPoints,
@@ -499,8 +509,10 @@ function AdminInner() {
     imageQuestionLarge: false, // afficher l'image question en plus grand (+30px)
   });
 
-  // Matching — champs création
-  // matchingMode: "strict" | "relaxed" | "numeric"
+  // Type de question + matching (réponse libre) ou QCM
+  const [newQuestionType, setNewQuestionType] = useState(QUESTION_TYPE_OPEN);
+  const [newQcmOptions, setNewQcmOptions] = useState(["", "", "", ""]);
+  const [newQcmCorrectIndex, setNewQcmCorrectIndex] = useState(0);
   const [newMatchingMode, setNewMatchingMode] = useState("strict");
 
   // Phrases de révélation (chargées depuis Firestore)
@@ -1286,7 +1298,24 @@ function AdminInner() {
         if (it.id !== id) return it;
         const next = { ...it, [field]: value };
 
-        // 🔎 Patch Matching — mapping CSV -> arrays
+        if (field === "questionType") {
+          next.questionType = value;
+          if (value === QUESTION_TYPE_QCM) {
+            next.qcmOptions = normalizeQcmOptions(next.qcmOptions?.length ? next.qcmOptions : next.answers);
+            if (!Number.isInteger(next.qcmCorrectIndex)) next.qcmCorrectIndex = 0;
+          }
+        }
+        if (field.startsWith("qcmOption_")) {
+          const idx = parseInt(field.split("_")[1], 10);
+          const opts = normalizeQcmOptions(next.qcmOptions);
+          if (idx >= 0 && idx <= 3) opts[idx] = value;
+          next.qcmOptions = opts;
+        }
+        if (field === "qcmCorrectIndex") {
+          next.qcmCorrectIndex = Number(value);
+        }
+
+        // mapping CSV -> arrays (réponse libre)
         if (field === "answersCsv") {
           next.answers = parseCSV(value);
         }
@@ -1297,6 +1326,33 @@ function AdminInner() {
       })
     );
   };
+
+  function buildAnswerPayload(it, hasAnswersCsv) {
+    const qType = getQuestionType(it);
+    if (qType === QUESTION_TYPE_QCM) {
+      const correctIndex = getQcmCorrectIndex(it);
+      const validation = validateQcmOptions(it.qcmOptions, correctIndex);
+      if (!validation.ok) throw new Error(validation.reason);
+      return {
+        questionType: QUESTION_TYPE_QCM,
+        qcmOptions: validation.options,
+        qcmCorrectIndex: correctIndex,
+        answers: qcmAnswersFromOptions(validation.options, correctIndex),
+      };
+    }
+    return {
+      questionType: QUESTION_TYPE_OPEN,
+      answers: hasAnswersCsv
+        ? parseCSV(it.answersCsv)
+        : Array.isArray(it.answers)
+          ? it.answers
+          : [],
+      matchingMode:
+        typeof it.matchingMode === "string" && it.matchingMode
+          ? it.matchingMode
+          : "strict",
+    };
+  }
 
   // [4.3] Saisie des offsets de manches (UI) + sauvegarde
   const handleRoundOffsetChange = (i, value) => {
@@ -1507,6 +1563,9 @@ function AdminInner() {
           order: data.order || 0,
           revealPhrases: Array.isArray(data.revealPhrases) ? data.revealPhrases : [],
           matchingMode: data.matchingMode || "strict",
+          questionType: data.questionType || QUESTION_TYPE_OPEN,
+          qcmOptions: normalizeQcmOptions(data.qcmOptions),
+          qcmCorrectIndex: getQcmCorrectIndex(data),
         };
       });
 
@@ -1596,6 +1655,9 @@ function AdminInner() {
           await addDoc(colRef, {
             text: q.text || "",
             answers: Array.isArray(q.answers) ? q.answers : [],
+            questionType: q.questionType === QUESTION_TYPE_QCM ? QUESTION_TYPE_QCM : QUESTION_TYPE_OPEN,
+            qcmOptions: normalizeQcmOptions(q.qcmOptions),
+            qcmCorrectIndex: getQcmCorrectIndex(q),
             imageQuestionUrl: imageQuestionUrl,
             imageReponseUrl: imageReponseUrl,
             imageQuestionLarge: q.imageQuestionLarge || false,
@@ -1691,19 +1753,10 @@ function AdminInner() {
           : DEFAULT_TIME_MUSIC_SEC;
 
       // Base payload (sans deleteField)
+      const answerFields = buildAnswerPayload(it, hasAnswersCsv);
       const payload = {
         text: it.text ?? "",
-        answers: hasAnswersCsv
-          ? parseCSV(it.answersCsv)
-          : Array.isArray(it.answers)
-            ? it.answers
-            : [],
-
-        matchingMode:
-          typeof it.matchingMode === "string" && it.matchingMode
-            ? it.matchingMode
-            : "strict",
-
+        ...answerFields,
         timeMusicSec: nextTimeMusicSec,
         timecodeSec:
           typeof it.timecodeSec === "number" ? it.timecodeSec : null,
@@ -1721,6 +1774,13 @@ function AdminInner() {
 
       // Construire l’objet d’update final (avec deleteField)
       const updates = { ...payload };
+
+      if (getQuestionType(it) === QUESTION_TYPE_OPEN) {
+        updates.qcmOptions = deleteField();
+        updates.qcmCorrectIndex = deleteField();
+      } else {
+        updates.matchingMode = deleteField();
+      }
 
       // QUESTION : suppression demandée ou URL vide → deleteField + nettoyage legacy éventuel
       if (it._deleteImageQuestion || !payload.imageQuestionUrl) {
@@ -1846,7 +1906,20 @@ function AdminInner() {
       if (newQ.imageReponseFile)
         imageReponseUrl = (await uploadImage(newQ.imageReponseFile)) || "";
 
-      const answers = parseCSV(newQ.answersCsv);
+      const answers =
+        newQuestionType === QUESTION_TYPE_QCM
+          ? qcmAnswersFromOptions(newQcmOptions, newQcmCorrectIndex)
+          : parseCSV(newQ.answersCsv);
+
+      if (newQuestionType === QUESTION_TYPE_QCM) {
+        const validation = validateQcmOptions(newQcmOptions, newQcmCorrectIndex);
+        if (!validation.ok) {
+          alert(validation.reason);
+          setCreating(false);
+          return;
+        }
+      }
+
       const timeMusicSec = clampTimeMusicSec(parseHMS(newQ.timeMusicStr));
       const order =
         items.length > 0
@@ -1861,9 +1934,15 @@ function AdminInner() {
       await addDoc(collection(db, "LesQuestions"), {
         text: newQ.text || "",
         answers,
-
-        // Champs persistant pour le matching
-        matchingMode: newMatchingMode || "strict",
+        questionType: newQuestionType,
+        ...(newQuestionType === QUESTION_TYPE_QCM
+          ? {
+              qcmOptions: normalizeQcmOptions(newQcmOptions),
+              qcmCorrectIndex: newQcmCorrectIndex,
+            }
+          : {
+              matchingMode: newMatchingMode || "strict",
+            }),
 
         timeMusicSec,
         timecodeSec: null, // recalculé par recalcAllTimecodesFromOrder
@@ -1889,6 +1968,9 @@ function AdminInner() {
         imageReponseFile: null,
         imageQuestionLarge: false,
       });
+      setNewQuestionType(QUESTION_TYPE_OPEN);
+      setNewQcmOptions(["", "", "", ""]);
+      setNewQcmCorrectIndex(0);
       setNewMatchingMode("strict");
     } catch (err) {
       console.error("createOne error:", err);
@@ -3397,6 +3479,9 @@ function AdminInner() {
           <tbody>
             {items.map((it, i) => {
               const answersCsv = it.answersCsv ?? toCSV(it.answers || []);
+              const qType = getQuestionType(it);
+              const qcmOpts = normalizeQcmOptions(it.qcmOptions);
+              const qcmCorrect = getQcmCorrectIndex(it);
               const timecodeStr =
                 typeof it.timecodeStr === "string"
                   ? it.timecodeStr
@@ -3500,29 +3585,76 @@ function AdminInner() {
                   </td>
 
                   <td style={{ width: "30%", verticalAlign: "top", padding: "12px" }}>
-                    <input
-                      type="text"
-                      value={answersCsv}
-                      onChange={(e) => handleFieldChange(it.id, "answersCsv", e.target.value)}
-                      placeholder="ex: Goku, Son Goku"
-                      style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
-                    />
-                    <div style={{ fontSize: 12, opacity: 0.7 }}>Sépare par des virgules</div>
-                    {/* 🔎 Patch Matching — édition par ligne */}
-                    <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
-                      <label style={{ fontSize: 12, opacity: 0.9 }}>
-                        Mode d’appariement
-                        <select
-                          value={it.matchingMode || "strict"}
-                          onChange={(e) => handleFieldChange(it.id, "matchingMode", e.target.value)}
-                          style={{ width: "100%", boxSizing: "border-box", marginTop: 4 }}
-                        >
-                          <option value="strict">strict (exact après normalisation)</option>
-                          <option value="relaxed">relaxed (tolérance relative)</option>
-                          <option value="numeric">numeric (strict numérique)</option>
-                        </select>
-                      </label>
-                    </div>
+                    <label style={{ fontSize: 12, opacity: 0.9, display: "block", marginBottom: 8 }}>
+                      Type de réponse
+                      <select
+                        value={qType}
+                        onChange={(e) => handleFieldChange(it.id, "questionType", e.target.value)}
+                        style={{ width: "100%", boxSizing: "border-box", marginTop: 4 }}
+                      >
+                        <option value={QUESTION_TYPE_OPEN}>Réponse libre (texte)</option>
+                        <option value={QUESTION_TYPE_QCM}>QCM (4 propositions)</option>
+                      </select>
+                    </label>
+
+                    {qType === QUESTION_TYPE_QCM ? (
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {qcmOpts.map((opt, optIdx) => (
+                          <label
+                            key={optIdx}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              fontSize: 12,
+                            }}
+                          >
+                            <input
+                              type="radio"
+                              name={`qcm-correct-${it.id}`}
+                              checked={qcmCorrect === optIdx}
+                              onChange={() => handleFieldChange(it.id, "qcmCorrectIndex", optIdx)}
+                              title="Bonne réponse"
+                            />
+                            <input
+                              type="text"
+                              value={opt}
+                              onChange={(e) => handleFieldChange(it.id, `qcmOption_${optIdx}`, e.target.value)}
+                              placeholder={`Proposition ${optIdx + 1}`}
+                              style={{ flex: 1, boxSizing: "border-box", padding: "4px 6px" }}
+                            />
+                          </label>
+                        ))}
+                        <div style={{ fontSize: 11, opacity: 0.65 }}>
+                          Coche la bonne réponse (radio).
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <input
+                          type="text"
+                          value={answersCsv}
+                          onChange={(e) => handleFieldChange(it.id, "answersCsv", e.target.value)}
+                          placeholder="ex: Goku, Son Goku"
+                          style={{ width: "100%", boxSizing: "border-box", margin: "4px 0" }}
+                        />
+                        <div style={{ fontSize: 12, opacity: 0.7 }}>Sépare par des virgules</div>
+                        <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+                          <label style={{ fontSize: 12, opacity: 0.9 }}>
+                            Mode d’appariement
+                            <select
+                              value={it.matchingMode || "strict"}
+                              onChange={(e) => handleFieldChange(it.id, "matchingMode", e.target.value)}
+                              style={{ width: "100%", boxSizing: "border-box", marginTop: 4 }}
+                            >
+                              <option value="strict">strict (exact après normalisation)</option>
+                              <option value="relaxed">relaxed (tolérance relative)</option>
+                              <option value="numeric">numeric (strict numérique)</option>
+                            </select>
+                          </label>
+                        </div>
+                      </>
+                    )}
                   </td>
 
                   <td style={{ width: "8%", verticalAlign: "top", padding: "12px" }}>
@@ -5019,30 +5151,73 @@ function AdminInner() {
               </label>
 
               <label>
-                Réponses acceptées (séparées par des virgules)
-                <input
-                  type="text"
-                  value={newQ.answersCsv}
-                  onChange={(e) =>
-                    setNewQ((p) => ({ ...p, answersCsv: e.target.value }))
-                  }
-                  placeholder="ex: Mario, Super Mario"
-                  style={{ width: "100%", boxSizing: "border-box" }}
-                />
-              </label>
-              {/* 🔎 Patch Matching — options de tolérance par question */}
-              <label>
-                Mode d'appariement (tolérance)
+                Type de réponse
                 <select
-                  value={newMatchingMode}
-                  onChange={(e) => setNewMatchingMode(e.target.value)}
+                  value={newQuestionType}
+                  onChange={(e) => setNewQuestionType(e.target.value)}
                   style={{ width: "100%", boxSizing: "border-box" }}
                 >
-                  <option value="strict">strict (exact après normalisation)</option>
-                  <option value="relaxed">relaxed (tolérance relative)</option>
-                  <option value="numeric">numeric (strict numérique)</option>
+                  <option value={QUESTION_TYPE_OPEN}>Réponse libre (texte)</option>
+                  <option value={QUESTION_TYPE_QCM}>QCM (4 propositions)</option>
                 </select>
               </label>
+
+              {newQuestionType === QUESTION_TYPE_QCM ? (
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ fontSize: 13, opacity: 0.85 }}>4 propositions — coche la bonne réponse :</div>
+                  {newQcmOptions.map((opt, optIdx) => (
+                    <label
+                      key={optIdx}
+                      style={{ display: "flex", alignItems: "center", gap: 8 }}
+                    >
+                      <input
+                        type="radio"
+                        name="new-qcm-correct"
+                        checked={newQcmCorrectIndex === optIdx}
+                        onChange={() => setNewQcmCorrectIndex(optIdx)}
+                      />
+                      <input
+                        type="text"
+                        value={opt}
+                        onChange={(e) => {
+                          const next = [...newQcmOptions];
+                          next[optIdx] = e.target.value;
+                          setNewQcmOptions(next);
+                        }}
+                        placeholder={`Proposition ${optIdx + 1}`}
+                        style={{ flex: 1, boxSizing: "border-box" }}
+                      />
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <>
+                  <label>
+                    Réponses acceptées (séparées par des virgules)
+                    <input
+                      type="text"
+                      value={newQ.answersCsv}
+                      onChange={(e) =>
+                        setNewQ((p) => ({ ...p, answersCsv: e.target.value }))
+                      }
+                      placeholder="ex: Mario, Super Mario"
+                      style={{ width: "100%", boxSizing: "border-box" }}
+                    />
+                  </label>
+                  <label>
+                    Mode d&apos;appariement (tolérance)
+                    <select
+                      value={newMatchingMode}
+                      onChange={(e) => setNewMatchingMode(e.target.value)}
+                      style={{ width: "100%", boxSizing: "border-box" }}
+                    >
+                      <option value="strict">strict (exact après normalisation)</option>
+                      <option value="relaxed">relaxed (tolérance relative)</option>
+                      <option value="numeric">numeric (strict numérique)</option>
+                    </select>
+                  </label>
+                </>
+              )}
 
               <label>
                 TimeMusic (hh:mm:ss)

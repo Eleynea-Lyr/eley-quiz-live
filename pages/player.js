@@ -64,12 +64,20 @@ import {
   useMobileVH,
   recordFirstCorrectAndPredict,
   registerBuzzerPress,
+  recordQcmWrongChoice,
   createTeamTx,
   joinTeamTx,
   leaveTeamTx,
 } from "../lib/firebase-helpers";
 
 import { ELEYBUZZ_PLAYER_MESSAGES, SCREEN_MESSAGES } from "../lib/messages";
+
+import {
+  isQcmQuestion,
+  getQcmCorrectIndex,
+  getQcmOptionsForDisplay,
+  getShuffledQcmIndices,
+} from "../lib/qcm";
 
 // ---------------------------------------------------------------------------
 // Splash (écran neutre, plein écran, fond homogène)
@@ -247,6 +255,8 @@ export default function Player() {
   // Réponse / saisie
   const [answer, setAnswer] = useState("");
   const [result, setResult] = useState(null);
+  const [qcmFailed, setQcmFailed] = useState(false);
+  const [qcmBusy, setQcmBusy] = useState(false);
   const answerInputRef = useRef(null);
   const lastAnswerQidRef = useRef(null); // sécurité anti-stale
 
@@ -274,6 +284,7 @@ export default function Player() {
 
     // Forcer un petit "tick" pour invalider les dérivés éventuels du Back
     setBackTick((x) => x + 1);
+    setQcmFailed(false);
   };
 
   // Anti-spam
@@ -1420,6 +1431,10 @@ export default function Player() {
         if (cancelled || !snap.exists()) return;
 
         const data = snap.data() || {};
+        if (data.qcmFailed) {
+          setQcmFailed(true);
+          return;
+        }
         // Si CE joueur n'a pas répondu correctement, on ne marque rien
         // Même si d'autres joueurs de l'équipe ont répondu
         if (!data.isCorrect) return;
@@ -1499,19 +1514,37 @@ export default function Player() {
 
 
 
-  // Ouverture/affichage input
+  // Ouverture/affichage input ou QCM
   const answersOpen = Boolean(isQuestionPhase && !isLocked);
-  const showInput = Boolean(answersOpen && !hadCorrectEver && !justAnsweredAfterBack);
+  const isQcm = isQcmQuestion(currentQuestion);
+  const showTextInput = Boolean(answersOpen && !hadCorrectEver && !justAnsweredAfterBack && !isQcm);
+  const showQcmChoices = Boolean(answersOpen && !hadCorrectEver && !justAnsweredAfterBack && isQcm && !qcmFailed);
+  const showQcmFailed = Boolean(answersOpen && isQcm && qcmFailed && !hadCorrectEver && !justAnsweredAfterBack);
 
-  // Focus auto si input visible et masque levé
+  const qcmOptions = useMemo(
+    () => (isQcm ? getQcmOptionsForDisplay(currentQuestion) : []),
+    [isQcm, currentQuestion]
+  );
+  const qcmCorrectIndex = isQcm ? getQcmCorrectIndex(currentQuestion) : null;
+  const qcmShuffledIndices = useMemo(() => {
+    if (!isQcm || !currentQuestionId) return [0, 1, 2, 3];
+    return getShuffledQcmIndices(currentQuestionId, playerId);
+  }, [isQcm, currentQuestionId, playerId]);
+
   useEffect(() => {
-    if (!uiMasked && showInput) {
+    setQcmFailed(false);
+    setQcmBusy(false);
+  }, [currentQuestionId]);
+
+  // Focus auto si input texte visible et masque levé
+  useEffect(() => {
+    if (!uiMasked && showTextInput) {
       const el = answerInputRef.current;
       if (el && document.activeElement !== el) {
         requestAnimationFrame(() => el.focus());
       }
     }
-  }, [uiMasked, showInput, currentQuestionId]);
+  }, [uiMasked, showTextInput, currentQuestionId]);
 
   // --- Watcher Back : elapsedSec recule sur même qid → Back détecté
   useEffect(() => {
@@ -1662,6 +1695,47 @@ export default function Player() {
       }, 0);
 
       setTimeout(() => setResult(null), 400);
+    }
+  };
+
+  const handleQcmChoice = async (originalIndex) => {
+    if (!currentQuestion || !playerId || qcmBusy) return;
+    if (!showQcmChoices) return;
+
+    const correctIndex = getQcmCorrectIndex(currentQuestion);
+    const qid = currentQuestion.id;
+
+    if (originalIndex === correctIndex) {
+      lastAnswerQidRef.current = qid;
+      setResult("correct");
+
+      if (qid && Number.isFinite(elapsedSec)) {
+        if (answeredAtRef.current[qid] == null) {
+          answeredAtRef.current[qid] = elapsedSec;
+        }
+      }
+      if (
+        backInfoRef.current.lastBackQid === qid &&
+        backInfoRef.current.hadCorrectBeforeBack === false
+      ) {
+        answeredAfterBackRef.current[qid] = true;
+      }
+      return;
+    }
+
+    setQcmBusy(true);
+    try {
+      await recordQcmWrongChoice({
+        db,
+        qid,
+        playerId,
+        selectedIndex: originalIndex,
+      });
+      setQcmFailed(true);
+    } catch (e) {
+      console.error("[Player] handleQcmChoice error:", e);
+    } finally {
+      setQcmBusy(false);
     }
   };
 
@@ -3780,9 +3854,75 @@ export default function Player() {
             </div>
           )}
 
-          {/* -------------------- Saisie + anti-spam / cooldown -------------------- */}
+          {/* -------------------- QCM (4 propositions, ordre mélangé) -------------------- */}
+          {showQcmChoices && (
+            <div
+              style={{
+                marginTop: 16,
+                width: "min(520px, 92vw)",
+                maxWidth: "100%",
+                marginLeft: "auto",
+                marginRight: "auto",
+              }}
+            >
+              <div style={{ display: "grid", gap: 10 }}>
+                {qcmShuffledIndices.map((origIdx) => {
+                  const label = qcmOptions[origIdx] || "";
+                  const isCorrectPick =
+                    result === "correct" && origIdx === qcmCorrectIndex;
+                  const disabled = qcmBusy || hadCorrectEver || isCorrectPick;
+
+                  return (
+                    <button
+                      key={origIdx}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => handleQcmChoice(origIdx)}
+                      style={{
+                        width: "100%",
+                        padding: "14px 16px",
+                        borderRadius: 12,
+                        border: `2px solid ${isCorrectPick ? "#86efac" : "#334155"}`,
+                        background: isCorrectPick ? "#14532d" : "#1e293b",
+                        color: "#f8fafc",
+                        fontSize: "clamp(15px, 4vw, 17px)",
+                        fontWeight: 600,
+                        textAlign: "left",
+                        cursor: disabled ? "not-allowed" : "pointer",
+                        touchAction: "manipulation",
+                        WebkitTapHighlightColor: "transparent",
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Bannière QCM raté (sans propositions — discret pour les voisins) */}
+          {isQuestionPhase && showQcmFailed && (
+            <div style={{ marginTop: 16, textAlign: "center" }}>
+              <div
+                style={{
+                  display: "inline-block",
+                  padding: "8px 16px",
+                  borderRadius: 10,
+                  border: "1px solid #7f1d1d",
+                  background: "#450a0a",
+                  color: "#fca5a5",
+                  fontWeight: 700,
+                }}
+              >
+                Mauvaise réponse
+              </div>
+            </div>
+          )}
+
+          {/* -------------------- Saisie texte + anti-spam / cooldown -------------------- */}
           <form onSubmit={handleAnswerSubmit}>
-            {showInput ? (
+            {showTextInput ? (
               <input
                 ref={answerInputRef}
                 className="answerInput"
@@ -3841,7 +3981,7 @@ export default function Player() {
           </form>
 
           {/* Bouton "Valider" — visible sur toutes plateformes quand l'input est visible */}
-          {showInput && (
+          {showTextInput && (
             <div style={{ marginTop: 10, textAlign: "center" }}>
               <button
                 type="button"
