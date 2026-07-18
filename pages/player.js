@@ -3,7 +3,7 @@
 // Scope : Vue joueur avec inscription, réponses temps réel, scoring instantané
 // ============================================================================
 
-import { useEffect, useMemo, useRef, useState, startTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, startTransition } from "react";
 import { db, auth } from "../lib/firebase";
 import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import {
@@ -24,6 +24,7 @@ import {
   REVEAL_DURATION_SEC,
   COUNTDOWN_START_SEC,
   ROUND_START_INTRO_SEC,
+  ROUND_BOUNDARY_GAP_SEC,
   UI_MASK_MS,
   RATE_LIMIT_ENABLED,
   MAX_WRONG_ATTEMPTS,
@@ -31,15 +32,12 @@ import {
   COOLDOWN_MS,
   LOCK_PHRASES,
   BAR_H,
-  BAR_BLUE,
-  BAR_RED,
-  HANDLE_COLOR,
-  PLAYER_IMG_MAX,
   SAFE_TOP,
   TOP_GUTTER_RUNNING,
   TOP_GUTTER_IDLE,
   BUZZER_STATES,
   DEFAULT_BUZZER_POINTS,
+  DEFAULT_SCORING_TABLE,
 } from "../lib/constants";
 
 import {
@@ -47,7 +45,6 @@ import {
   formatHMS,
   normalizeName,
   normalizeNameAlpha,
-  pickRevealPhrase,
   roundIndexOfTime,
   nextRoundStartAfter,
   matchesWithMode,
@@ -70,7 +67,19 @@ import {
   leaveTeamTx,
 } from "../lib/firebase-helpers";
 
-import { ELEYBUZZ_PLAYER_MESSAGES, SCREEN_MESSAGES } from "../lib/messages";
+import {
+  ELEYBUZZ_PLAYER_MESSAGES,
+  PLAYER_PAGE_CREATION_JOUEUR,
+  PLAYER_PAGE_EQUIPE,
+  PLAYER_PAGE_CREATION_EQUIPE,
+  PLAYER_PAGE_REJOINDRE_EQUIPE,
+  PLAYER_PAGE_ATTENTE,
+  PLAYER_PAGE_FIN,
+  PLAYER_PAGE_QUIZ,
+  SCREEN_MESSAGES,
+  mergePageMessages,
+  formatMsg,
+} from "../lib/messages";
 
 import {
   isQcmQuestion,
@@ -78,20 +87,253 @@ import {
   getQcmOptionsForDisplay,
   getShuffledQcmIndices,
 } from "../lib/qcm";
+import {
+  BRAND,
+  BRAND_PAGE_BOTTOM,
+  IMAGE_FRAME_BG,
+  FONT_FAMILY,
+  BAR_BLUE,
+  BAR_RED,
+  HANDLE_COLOR,
+  badgeSuccess,
+  badgeError,
+  cardStyle,
+  questionTextStyle,
+  BUZZER_BLUE_PRESSED,
+  pageTextSecondary,
+  PAGE_TEXT,
+  btnPrimaryStyle,
+  btnSecondaryStyle,
+  btnDangerStyle,
+  btnGhostDangerStyle,
+  inputFieldStyle,
+} from "../lib/brand-theme";
+import BrandShell from "../lib/BrandShell";
+import { getTeamBadgeStyle } from "../lib/team-color";
+import PlayerScorePanel from "../lib/PlayerScorePanel";
+import PlayerRoundBreakPanel from "../lib/PlayerRoundBreakPanel";
+import PlayerCorrectPointsFeedback from "../lib/PlayerCorrectPointsFeedback";
 
 // ---------------------------------------------------------------------------
 // Splash (écran neutre, plein écran, fond homogène)
 // ---------------------------------------------------------------------------
 function Splash() {
+  return <BrandShell aria-hidden="true" />;
+}
+
+function HudTeamStar({ size, style = {} }) {
+  const dim = size ?? "var(--eley-hud-icon)";
   return (
-    <div
-      style={{
-        minHeight: "calc(var(--vh, 1vh) * 100)",
-        background: "#0a0a1a", // même fond que l'UI Player
-      }}
+    <svg
+      width={dim}
+      height={dim}
+      viewBox="0 0 24 24"
       aria-hidden="true"
-    />
+      style={{ flexShrink: 0, display: "block", ...style }}
+    >
+      <path
+        fill={BRAND.orangeLight}
+        d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"
+      />
+    </svg>
   );
+}
+
+function HudPlayerIcon({ size, style = {} }) {
+  const dim = size ?? "var(--eley-hud-icon)";
+  return (
+    <svg
+      width={dim}
+      height={dim}
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      style={{ flexShrink: 0, display: "block", ...style }}
+    >
+      <path
+        fill={BRAND.yellow}
+        d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"
+      />
+    </svg>
+  );
+}
+
+const PLAYER_SHELL_PAD = {
+  padding: "var(--eley-shell-pad)",
+  paddingTop: `calc(var(--eley-shell-pad) + env(safe-area-inset-top, 0px))`,
+  paddingBottom: `calc(var(--eley-shell-pad) + env(safe-area-inset-bottom, 0px))`,
+  minHeight: "max(100dvh, calc(var(--vh, 1vh) * 100))",
+  overflowX: "hidden",
+};
+
+const PLAYER_TITLE_STYLE = {
+  margin: 0,
+  fontSize: "var(--eley-title-page)",
+  fontWeight: 800,
+  lineHeight: 1.12,
+};
+
+const PLAYER_HINT_STYLE = {
+  opacity: 0.9,
+  margin: "0 0 10px",
+  fontSize: "var(--eley-text-hint)",
+  fontWeight: 600,
+  textAlign: "left",
+};
+
+function PlayerLabelWithIcon({ children }) {
+  return (
+    <p style={{ ...PLAYER_HINT_STYLE }}>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <HudPlayerIcon size="var(--eley-icon-label)" />
+        <span>{children}</span>
+      </span>
+    </p>
+  );
+}
+
+function TitleWithTrailingStar({ text, starSize = "0.78em" }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: "0.35em",
+        flexWrap: "wrap",
+      }}
+    >
+      <span>{text}</span>
+      <HudTeamStar size={starSize} />
+    </span>
+  );
+}
+
+function PlayerPageShell({ titleLine1, titleLine2, titleLine2Icon, children }) {
+  const titleLine2Trimmed = String(titleLine2 ?? "").trim();
+  const showTeamStar = titleLine2Icon === "star";
+
+  const renderTitleText = (text, withStar) => (
+    withStar ? <TitleWithTrailingStar text={text} /> : text
+  );
+
+  return (
+    <BrandShell
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        ...PLAYER_SHELL_PAD,
+      }}
+    >
+      <div
+        style={{
+          position: "relative",
+          zIndex: 3,
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          textAlign: "center",
+          minHeight: 0,
+        }}
+      >
+        <h1 style={PLAYER_TITLE_STYLE}>
+          {titleLine2Trimmed ? (
+            <>
+              {titleLine1}
+              <br />
+              {renderTitleText(titleLine2Trimmed, showTeamStar)}
+            </>
+          ) : (
+            renderTitleText(titleLine1, showTeamStar)
+          )}
+        </h1>
+      </div>
+      <div
+        style={{
+          position: "relative",
+          zIndex: 3,
+          width: "min(var(--eley-content-narrow), 100%)",
+          maxWidth: "100%",
+          margin: "0 auto",
+          flexShrink: 0,
+        }}
+      >
+        {children}
+      </div>
+      <div style={{ flex: 1, minHeight: 0 }} aria-hidden="true" />
+    </BrandShell>
+  );
+}
+
+/** Contenu centré verticalement au milieu de l'écran (pause, comptes à rebours) */
+function PlayerCenterStage({ children }) {
+  return (
+    <>
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          textAlign: "center",
+          width: "100%",
+          minHeight: 0,
+        }}
+      >
+        <div style={{ width: "100%", maxWidth: "min(var(--eley-center-stage-max), 92vw)", margin: "0 auto" }}>
+          {children}
+        </div>
+      </div>
+      <div style={{ flex: 1, minHeight: 0 }} aria-hidden="true" />
+    </>
+  );
+}
+
+const PLAYER_TITLE_HEADER = {
+  width: "100%",
+  textAlign: "center",
+  flexShrink: 0,
+};
+
+/** Podium / scores — centrés, légèrement remontés (fin de manche, fin de quiz) */
+const PLAYER_PODIUM_CENTER = {
+  flex: 1,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  justifyContent: "center",
+  width: "100%",
+  minHeight: 0,
+  paddingBottom: "var(--eley-podium-block-lift)",
+  textAlign: "center",
+};
+
+function teamPrimaryBtnStyle({ busy, disabled }) {
+  return {
+    ...btnPrimaryStyle,
+    width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
+    display: "block",
+    padding: "var(--eley-btn-pad-y) var(--eley-btn-pad-x)",
+    background: busy ? BRAND.yellow : disabled ? BRAND.mauveLight : BRAND.blue,
+    color: busy ? BRAND.mauveDark : "#ffffff",
+    cursor: busy || disabled ? "not-allowed" : "pointer",
+  };
+}
+
+function teamDangerBtnStyle({ busy, disabled }) {
+  return {
+    ...btnDangerStyle,
+    width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
+    display: "block",
+    padding: "var(--eley-btn-pad-y) var(--eley-btn-pad-x)",
+    background: busy ? BRAND.yellow : BRAND.red,
+    color: busy ? BRAND.mauveDark : "#ffffff",
+    cursor: busy || disabled ? "not-allowed" : "pointer",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -201,12 +443,15 @@ export default function Player() {
 
   // Instant win (affichage immédiat + anti double-appel)
   const [instantWin, setInstantWin] = useState(null);
+  const [questionTeamAward, setQuestionTeamAward] = useState(null);
   const lastInstantWinQidRef = useRef(null);
+  const questionCorrectCountRef = useRef({});
 
   // Boot flags
   const [hydrated, setHydrated] = useState(false);              // localStorage lu
   const [stateLoaded, setStateLoaded] = useState(false);        // 1er /quiz/state reçu
   const [playerDocLoaded, setPlayerDocLoaded] = useState(false);// 1er doc joueur reçu
+  const [configLoaded, setConfigLoaded] = useState(false);      // 1er /quiz/config reçu (messages)
   const [splashReleased, setSplashReleased] = useState(false);  // Splash affiché 1x
 
   // Données & timing globaux
@@ -225,6 +470,7 @@ export default function Player() {
   const [cooldownMs, setCooldownMs] = useState(COOLDOWN_MS);
   const [buzzerPoints, setBuzzerPoints] = useState(DEFAULT_BUZZER_POINTS);
   const [activeQuizKey, setActiveQuizKey] = useState(null);
+  const [scoringTable, setScoringTable] = useState(DEFAULT_SCORING_TABLE);
 
   // Joueur / inscription
   const [playerId, setPlayerId] = useState(null);
@@ -236,6 +482,7 @@ export default function Player() {
   const [isKicked, setIsKicked] = useState(false);
   const [rejectedNames, setRejectedNames] = useState([]);
   const selfRenameRef = useRef(false); // true si le joueur a déclenché un renommage
+  const welcomeInputRef = useRef(null);
 
   // Équipe
   const [teamId, setTeamId] = useState(null);
@@ -314,6 +561,13 @@ export default function Player() {
   const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
 
   // Messages personnalisables depuis Firestore
+  const [playerNomJoueurMessages, setPlayerNomJoueurMessages] = useState(PLAYER_PAGE_CREATION_JOUEUR);
+  const [playerEquipeMessages, setPlayerEquipeMessages] = useState(PLAYER_PAGE_EQUIPE);
+  const [playerCreationEquipeMessages, setPlayerCreationEquipeMessages] = useState(PLAYER_PAGE_CREATION_EQUIPE);
+  const [playerRejoindreEquipeMessages, setPlayerRejoindreEquipeMessages] = useState(PLAYER_PAGE_REJOINDRE_EQUIPE);
+  const [playerAttenteMessages, setPlayerAttenteMessages] = useState(PLAYER_PAGE_ATTENTE);
+  const [playerFinMessages, setPlayerFinMessages] = useState(PLAYER_PAGE_FIN);
+  const [playerQuizMessages, setPlayerQuizMessages] = useState(PLAYER_PAGE_QUIZ);
   const [playerEleyBuzzMessages, setPlayerEleyBuzzMessages] = useState(ELEYBUZZ_PLAYER_MESSAGES);
 
   // Reset déclenché via URL ?reset=1 (avant start)
@@ -381,6 +635,9 @@ export default function Player() {
           setError("");
           setIsKicked(false);
         });
+        if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
         if (!selfInitiated) {
           localStorage.removeItem("rejectedNamesCache");
           startTransition(() => setRejectedNames([]));
@@ -769,14 +1026,22 @@ export default function Player() {
     const configRef = doc(db, "quiz", "config");
     const unsub = onSnapshot(configRef, (snap) => {
       const data = snap.data() || {};
-      if (data.playerEleyBuzz) {
-        setPlayerEleyBuzzMessages({
-          ...ELEYBUZZ_PLAYER_MESSAGES,
-          ...data.playerEleyBuzz,
-        });
-      } else {
-        setPlayerEleyBuzzMessages(ELEYBUZZ_PLAYER_MESSAGES);
-      }
+      setPlayerNomJoueurMessages(mergePageMessages(PLAYER_PAGE_CREATION_JOUEUR, data.playerNomJoueur));
+      setPlayerEquipeMessages(mergePageMessages(PLAYER_PAGE_EQUIPE, data.playerEquipe));
+      setPlayerCreationEquipeMessages(mergePageMessages(PLAYER_PAGE_CREATION_EQUIPE, data.playerCreationEquipe));
+      setPlayerRejoindreEquipeMessages(mergePageMessages(PLAYER_PAGE_REJOINDRE_EQUIPE, data.playerRejoindreEquipe));
+      setPlayerAttenteMessages(() => {
+        const merged = mergePageMessages(PLAYER_PAGE_ATTENTE, data.playerAttente);
+        if (data.playerAttente?.titleLine1) return merged;
+        if (typeof data.playerAttente?.title === "string" && data.playerAttente.title.trim()) {
+          return { ...merged, titleLine1: data.playerAttente.title.trim() };
+        }
+        return merged;
+      });
+      setPlayerEleyBuzzMessages(mergePageMessages(ELEYBUZZ_PLAYER_MESSAGES, data.playerEleyBuzz));
+      setPlayerFinMessages(mergePageMessages(PLAYER_PAGE_FIN, data.playerFin));
+      setPlayerQuizMessages(mergePageMessages(PLAYER_PAGE_QUIZ, data.playerQuizPage || data.playerQuiz));
+      setConfigLoaded(true);
     });
     return () => unsub();
   }, []);
@@ -841,6 +1106,11 @@ export default function Player() {
         setRoundStartIntroSec(ris);
         const cm = Number.isFinite(d?.cooldownMs) ? d.cooldownMs : COOLDOWN_MS;
         setCooldownMs(cm);
+        setScoringTable(
+          Array.isArray(d?.scoringTable) && d.scoringTable.length > 0
+            ? d.scoringTable
+            : DEFAULT_SCORING_TABLE
+        );
 
         // Messages personnalisables depuis Firestore
         const customFinalPodiumTitle = typeof d?.screenQuiz?.finalPodiumTitle === "string" && d.screenQuiz.finalPodiumTitle.trim() !== ""
@@ -1014,7 +1284,7 @@ export default function Player() {
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
   const nextRoundBoundary = Number.isFinite(nextRoundStart) ? Math.max(0, nextRoundStart - GAP) : null;
 
-  const ROUND_DEADZONE_SEC = 1;
+  const ROUND_DEADZONE_SEC = ROUND_BOUNDARY_GAP_SEC;
   const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
     !uiMasked &&
@@ -1244,6 +1514,13 @@ export default function Player() {
     countdownLabel = `Fin de la manche ${endingIdx != null ? endingIdx + 1 : ""} dans :`;
   }
 
+  const holdRoundBoundaryCountdown =
+    !uiMasked && inRoundBoundaryWindow && !isRoundBreak && !isPaused;
+  const showCountdownUi = Boolean(isCountdownPhase || holdRoundBoundaryCountdown);
+  const displayCountdownSec = holdRoundBoundaryCountdown
+    ? 1
+    : countdownSec;
+
   // Barre de progression
   const canShowTimeBar = Boolean(
     isQuestionPhase && qStartEffective != null && qEnd != null && qEnd > qStartEffective
@@ -1286,12 +1563,7 @@ export default function Player() {
     }
   }, [currentQuestionId]);
 
-  // Phrase de révélation + réponse primaire
-  const revealPhrase = useMemo(
-    () => (currentQuestion ? pickRevealPhrase(currentQuestion) : ""),
-    [currentQuestionId]
-  );
-
+  // Réponse primaire affichée au reveal
   const primaryAnswer = useMemo(() => {
     const a = currentQuestion?.answers;
     return Array.isArray(a) && a.length ? String(a[0]) : "";
@@ -1363,6 +1635,16 @@ export default function Player() {
     }
   }, [currentQuestionId, sorted]);
 
+  // Compteur de bonnes réponses (pour prédire rang/points sans attendre la transaction)
+  useEffect(() => {
+    if (!currentQuestionId) return;
+    const qRef = doc(db, "answers", currentQuestionId);
+    return onSnapshot(qRef, (snap) => {
+      const c = snap.exists() ? Number(snap.data()?.correctCount) || 0 : 0;
+      questionCorrectCountRef.current[currentQuestionId] = c;
+    });
+  }, [currentQuestionId]);
+
   // Flags globaux + statut joueur courant
   const showPreStart = !(quizStartMs && isRunning);
   const isQuizEnded = typeof quizEndSec === "number" && elapsedSec >= quizEndSec;
@@ -1389,10 +1671,9 @@ export default function Player() {
 
 
 
-  // Splash : relâcher après boot initial
-  // Nouveau joueur : pas besoin d'attendre Firestore (écran d'inscription seulement).
-  // Joueur déjà inscrit : attendre l'état quiz + son document.
-  const initialBootReady = hydrated && (
+  // Splash : relâcher après boot initial (+ messages Firestore pour éviter un flash des défauts)
+  // Nouveau joueur : attendre config. Joueur déjà inscrit : attendre config + état quiz + doc joueur.
+  const initialBootReady = hydrated && configLoaded && (
     playerId ? (stateLoaded && playerDocLoaded) : true
   );
   useEffect(() => {
@@ -1410,6 +1691,85 @@ export default function Player() {
 
   const gainedPoints =
     instantWin && instantWin.qid === currentQuestionId ? instantWin.points : null;
+
+  useEffect(() => {
+    if (!teamId || !currentQuestionId) {
+      setQuestionTeamAward(null);
+      return;
+    }
+    const awardRef = doc(db, "answers", currentQuestionId, "teamAwards", teamId);
+    return onSnapshot(awardRef, (snap) => {
+      if (!snap.exists()) {
+        setQuestionTeamAward(null);
+        return;
+      }
+      const d = snap.data() || {};
+      setQuestionTeamAward({
+        points: Number.isFinite(d.points) ? d.points : 0,
+        rank: Number.isFinite(d.rank) ? d.rank : null,
+        firstPlayerId: typeof d.firstPlayerId === "string" ? d.firstPlayerId : null,
+      });
+    });
+  }, [teamId, currentQuestionId]);
+
+  const teamQuestionPoints =
+    questionTeamAward?.points
+    ?? (instantWin?.qid === currentQuestionId ? instantWin.teamPoints : null);
+  const teamQuestionRank =
+    questionTeamAward?.rank
+    ?? (instantWin?.qid === currentQuestionId ? instantWin.teamRank : null);
+
+  const isTeamScorerForQuestion = Boolean(
+    playerId
+    && Number.isFinite(teamQuestionPoints)
+    && teamQuestionPoints > 0
+    && (
+      questionTeamAward?.firstPlayerId === playerId
+      || (
+        !questionTeamAward?.firstPlayerId
+        && instantWin?.qid === currentQuestionId
+        && Number(instantWin?.teamPoints) > 0
+      )
+    )
+  );
+
+  const showTeamOnReveal = Boolean(
+    teamName
+    && Number.isFinite(teamQuestionPoints)
+    && teamQuestionPoints > 0
+  );
+
+  const questionPointsFeedback =
+    Number.isFinite(gainedPoints) && (hadCorrectEver || showGoodNow) ? (
+      <PlayerCorrectPointsFeedback
+        teamName={teamName}
+        teamColor={teamColor}
+        teamPoints={teamQuestionPoints}
+        teamRank={teamQuestionRank}
+        playerPoints={gainedPoints}
+        playerRank={instantWin?.rank}
+        showTeamBlock={isTeamScorerForQuestion}
+        playerScoredPrefix={playerQuizMessages.playerScored || playerQuizMessages.pointsEarned}
+        pointLabel={playerQuizMessages.point}
+        pointsLabel={playerQuizMessages.points}
+      />
+    ) : null;
+
+  const revealPointsFeedback =
+    Number.isFinite(gainedPoints) && hadCorrectEver ? (
+      <PlayerCorrectPointsFeedback
+        teamName={teamName}
+        teamColor={teamColor}
+        teamPoints={teamQuestionPoints}
+        teamRank={teamQuestionRank}
+        playerPoints={gainedPoints}
+        playerRank={instantWin?.rank}
+        showTeamBlock={showTeamOnReveal}
+        playerScoredPrefix={playerQuizMessages.playerScored || playerQuizMessages.pointsEarned}
+        pointLabel={playerQuizMessages.point}
+        pointsLabel={playerQuizMessages.points}
+      />
+    ) : null;
 
   // 🔁 Recharger l'état "bonne réponse" après un F5
   // IMPORTANT: Cette fonction vérifie UNIQUEMENT la soumission INDIVIDUELLE de CE joueur.
@@ -1471,12 +1831,30 @@ export default function Player() {
         const predictedRank = Number.isFinite(data.predictedRank) ? data.predictedRank : null;
         const predictedPoints = Number.isFinite(data.predictedPoints) ? data.predictedPoints : null;
 
+        let teamPoints = null;
+        let teamRank = null;
+        if (teamId) {
+          try {
+            const teamAwardRef = doc(db, "answers", qid, "teamAwards", teamId);
+            const teamAwardSnap = await getDoc(teamAwardRef);
+            if (teamAwardSnap.exists()) {
+              const ta = teamAwardSnap.data() || {};
+              teamPoints = Number.isFinite(ta.points) ? ta.points : null;
+              teamRank = Number.isFinite(ta.rank) ? ta.rank : null;
+            }
+          } catch (e) {
+            console.error("[Player] reload team award failed:", e);
+          }
+        }
+
         if (Number.isFinite(predictedPoints) && predictedPoints > 0) {
           lastInstantWinQidRef.current = qid;
           setInstantWin({
             qid,
             rank: predictedRank,
             points: predictedPoints,
+            teamPoints,
+            teamRank,
             at: Date.now(),
           });
         }
@@ -1491,7 +1869,7 @@ export default function Player() {
     return () => {
       cancelled = true;
     };
-  }, [currentQuestionId, playerId, currentQuestion, quizStartMs]);
+  }, [currentQuestionId, playerId, currentQuestion, quizStartMs, teamId]);
 
 
   // “Déjà correct” (persiste même après un Back)
@@ -1601,7 +1979,6 @@ export default function Player() {
   /* ============================ Vérification & Handlers ============================ */
 
 
-  // Empêche le transfert de focus de l'input vers le bouton (iOS ferme le clavier sinon)
   const keepInputFocus = (e) => {
     // Empêche toute prise de focus par le bouton (sinon iOS range le clavier)
     if (e && typeof e.preventDefault === "function") e.preventDefault();
@@ -1628,6 +2005,43 @@ export default function Player() {
 
 
 
+  const commitInstantWinForCorrect = useCallback((qid) => {
+    if (!qid || !playerId || lastInstantWinQidRef.current === qid) return;
+
+    const priorCount = questionCorrectCountRef.current[qid] ?? 0;
+    const predictedRank = priorCount + 1;
+    const predictedPoints = scoringTable[predictedRank - 1]
+      ?? scoringTable[scoringTable.length - 1]
+      ?? 0;
+
+    lastInstantWinQidRef.current = qid;
+    setInstantWin({
+      qid,
+      rank: predictedRank,
+      points: predictedPoints,
+      teamPoints: null,
+      teamRank: null,
+      at: Date.now(),
+    });
+
+    recordFirstCorrectAndPredict({ db, qid, playerId })
+      .then(({ predictedRank: rank, predictedPoints: points, teamPoints, teamRank }) => {
+        setInstantWin({
+          qid,
+          rank,
+          points,
+          teamPoints: teamPoints ?? null,
+          teamRank: teamRank ?? null,
+          at: Date.now(),
+        });
+      })
+      .catch((e) => {
+        console.error("[instantWin] error:", e);
+      });
+  }, [playerId, scoringTable]);
+
+
+
   const checkAnswer = () => {
     if (!currentQuestion || !currentQuestion.answers) return;
     const mode = getAnswerMode(currentQuestion);
@@ -1636,19 +2050,20 @@ export default function Player() {
 
 
     if (isCorrect) {
-      lastAnswerQidRef.current = currentQuestion?.id || null;
+      const qid = currentQuestion?.id || null;
+      lastAnswerQidRef.current = qid;
       setResult("correct");
       setAnswer("");
 
+      if (qid) commitInstantWinForCorrect(qid);
+
       // Horodatage de la 1re bonne réponse (robuste aux Back)
-      if (currentQuestion?.id && Number.isFinite(elapsedSec)) {
-        const qid = currentQuestion.id;
+      if (qid && Number.isFinite(elapsedSec)) {
         if (answeredAtRef.current[qid] == null) {
           answeredAtRef.current[qid] = elapsedSec;
         }
       }
 
-      const qid = currentQuestion?.id;
       if (qid) {
         // Marque “réponse après Back” si applicable
         if (
@@ -1708,6 +2123,7 @@ export default function Player() {
     if (originalIndex === correctIndex) {
       lastAnswerQidRef.current = qid;
       setResult("correct");
+      commitInstantWinForCorrect(qid);
 
       if (qid && Number.isFinite(elapsedSec)) {
         if (answeredAtRef.current[qid] == null) {
@@ -1820,40 +2236,7 @@ export default function Player() {
 
 
 
-  // === Instant win (prédiction rang/points dès qu'une réponse correcte survient) ===
-  useEffect(() => {
-    const qid = currentQuestionId;
-    if (!qid) return;
-    if (!(result === "correct" && isQuestionPhase)) return;
-    if (lastAnswerQidRef.current !== qid) return;
-    if (lastInstantWinQidRef.current === qid) return;
-    if (!playerId) return;
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const { predictedRank, predictedPoints } = await recordFirstCorrectAndPredict({
-          db,
-          qid,
-          playerId,
-        });
-        if (cancelled) return;
-        setInstantWin({ qid, rank: predictedRank, points: predictedPoints, at: Date.now() });
-        lastInstantWinQidRef.current = qid;
-
-        // Mémorise aussi l’instant de la 1re bonne réponse (utile pour les Back)
-        if (Number.isFinite(elapsedSec) && answeredAtRef.current[qid] == null) {
-          answeredAtRef.current[qid] = elapsedSec;
-        }
-      } catch (e) {
-        console.error("[instantWin effect] error:", e);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [currentQuestionId, result, isQuestionPhase, playerId, elapsedSec]);
-
-  // ==== Classement (TOP-LEVEL; pas dans une condition) ====
+  // === Classement (TOP-LEVEL; pas dans une condition) ===
   const ranking = useMemo(() => {
     const rows = (playersLB || [])
       .filter((p) => !p.isKicked)
@@ -1907,11 +2290,6 @@ export default function Player() {
   // Score depuis Firestore (mis à jour en temps réel par recordFirstCorrectAndPredict)
   const myScore = useMemo(() => (meRow ? meRow.score : 0), [meRow]);
   const myBuzzScore = useMemo(() => (meRow ? Number(meRow.buzzScore || 0) : 0), [meRow]);
-  // Cœurs colorés pour les joueurs (pas de médailles)
-  const myMedal = useMemo(() => {
-    if (!myRank || myScore <= 0) return "";
-    return myRank === 1 ? "💛" : myRank === 2 ? "🤍" : myRank === 3 ? "🤎" : "";
-  }, [myRank, myScore]);
   const myEndMessage = useMemo(() => {
     return Number(myScore) > 0
       ? messageForRank(myRank)
@@ -2023,11 +2401,7 @@ export default function Player() {
 
   const myFinalScore = useMemo(() => (myFinalRow ? myFinalRow.scoreFinal : 0), [myFinalRow]);
   const myFinalRank = useMemo(() => (myFinalRow ? myFinalRow._rank : null), [myFinalRow]);
-  // Cœurs colorés pour les joueurs (pas de médailles)
-  const myFinalMedal = useMemo(() => {
-    if (!myFinalRank || myFinalScore <= 0) return "";
-    return myFinalRank === 1 ? "💛" : myFinalRank === 2 ? "🤍" : myFinalRank === 3 ? "🤎" : "";
-  }, [myFinalRank, myFinalScore]);
+  const showPlayerFinalRankCircle = myFinalRank != null && myFinalRank <= 3 && Number(myFinalScore) > 0;
 
   /* ===== Helpers Firestore pour le nom ===== */
   async function nameExists(nameNorm, excludeId = null) {
@@ -2043,7 +2417,7 @@ export default function Player() {
 
     const v = validateName(inputName);
     if (!v.ok) {
-      if (v.reason === "length") setError("Le nom doit faire entre 1 et 30 caractères.");
+      if (v.reason === "length") setError("Le nom doit faire entre 1 et 12 caractères.");
       else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (' ') et tirets.");
       else if (v.reason === "politics") setError("Évite les noms à caractère politique. Merci !");
       else if (v.reason === "moderation") setError("Nom inadapté au tout public.");
@@ -2136,9 +2510,16 @@ export default function Player() {
     e?.preventDefault?.();
     setError("");
 
+    if (teamId) {
+      setTeamSelectionMode(null);
+      setTeamInputName("");
+      setError(playerEquipeMessages.mustLeaveBeforeCreate);
+      return;
+    }
+
     const v = validateTeamName(teamInputName);
     if (!v.ok) {
-      if (v.reason === "length") setError("Le nom doit faire entre 1 et 20 caractères.");
+      if (v.reason === "length") setError("Le nom doit faire entre 1 et 18 caractères.");
       else if (v.reason === "charset") setError("Utilise uniquement lettres FR, chiffres, espaces, apostrophes (' ') et tirets.");
       else if (v.reason === "politics") setError("Évite les noms à caractère politique. Merci !");
       else if (v.reason === "moderation") setError("Nom inadapté au tout public.");
@@ -2171,12 +2552,12 @@ export default function Player() {
         if (result.reason === "name-exists") {
           setError("Ce nom d'équipe est déjà pris.");
         } else {
-          setError("Quitte d'abord ton équipe actuelle avant de créer une nouvelle équipe.");
+          setError("Impossible de créer l'équipe. Réessaie.");
         }
       }
     } catch (err) {
       console.error(err);
-      setError("Quitte d'abord ton équipe actuelle avant de créer une nouvelle équipe.");
+      setError("Impossible de créer l'équipe. Réessaie.");
     } finally {
       setBusy(false);
     }
@@ -2306,8 +2687,25 @@ export default function Player() {
         // Ne pas réinitialiser teamId et teamName - l'équipe est conservée
         // Ne pas mettre needsTeamSelection à false pour permettre la modification du nom
       });
+      if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
     }
   }
+
+  const isWelcomeScreen =
+    !playerId ||
+    !playerName ||
+    (typeof error === "string" && error.startsWith("Nom refusé"));
+
+  // Accueil : pas de clavier auto — ouverture au tap sur le champ uniquement
+  useEffect(() => {
+    if (!isWelcomeScreen) return;
+    welcomeInputRef.current?.blur();
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }, [isWelcomeScreen]);
 
   // Style “no transition” pendant le masque UI
   useEffect(() => {
@@ -2328,20 +2726,43 @@ export default function Player() {
   /* ============================ RENDER (PARTIE 4/4) ============================ */
 
   // Style compact pour la question (évite le chevauchement en haut)
-  const questionH2Style = {
-    fontSize: "clamp(1.1rem, 4.2vw, 1.45rem)",
-    lineHeight: 1.5, // Augmenté pour plus d'espacement entre les lignes
+  const questionH2Style = { ...questionTextStyle, lineBreak: "loose" };
+
+  const countdownLabelStyle = {
+    ...pageTextSecondary,
+    fontSize: "var(--eley-countdown-label)",
+    fontWeight: 600,
+    marginBottom: 8,
+    textAlign: "center",
+    width: "100%",
+    lineHeight: 1.35,
+  };
+
+  const countdownNumberStyle = {
+    fontSize: "var(--eley-countdown-number)",
+    fontWeight: 800,
+    lineHeight: 1,
+    textAlign: "center",
+    width: "100%",
+    color: PAGE_TEXT,
+  };
+
+  const pauseTitleStyle = {
+    fontSize: "var(--eley-pause-title)",
+    fontWeight: 800,
     margin: 0,
-    marginTop: 6,
-    maxWidth: "min(600px, 95%)", // Limite la largeur pour forcer des retours naturels
-    marginLeft: "auto",
-    marginRight: "auto",
-    overflowWrap: "break-word", // Moins agressif que "anywhere"
-    wordBreak: "normal", // Évite de couper les mots au milieu
-    hyphens: "auto",
-    lineBreak: "loose", // Permet des retours à la ligne plus souples
-    textAlign: "center", // Centré comme demandé
-    letterSpacing: "0.01em", // Légère augmentation pour meilleure lisibilité
+    textAlign: "center",
+    width: "100%",
+  };
+
+  const pauseSubtitleStyle = {
+    ...pageTextSecondary,
+    marginTop: 10,
+    fontSize: "var(--eley-pause-subtitle)",
+    fontWeight: 600,
+    textAlign: "center",
+    width: "100%",
+    lineHeight: 1.4,
   };
 
   // Flags d’état pour le bouton d’inscription
@@ -2365,113 +2786,129 @@ export default function Player() {
   // Splash avant 1er boot complet
   if (!splashReleased) return <Splash />;
 
-  // Composant réutilisable pour le bandeau joueur
-  const PlayerBadge = ({ showTimer = false, position = "absolute" }) => {
+  // HUD : équipe en haut à gauche, joueur + buzz en haut à droite
+  const PlayerHud = () => {
     if (!playerName || !teamId) return null;
-    
-    // Tronquer le nom du joueur à 10 caractères maximum
-    const truncatedPlayerName = playerName.length > 10 ? playerName.substring(0, 10) + "…" : playerName;
-    
-    // Tronquer le nom d'équipe à 15 caractères maximum
-    const truncatedTeamName = teamName && teamName.length > 15 ? teamName.substring(0, 15) + "…" : teamName;
-    
+
+    const truncatedPlayerName =
+      playerName.length > 12 ? `${playerName.substring(0, 12)}…` : playerName;
+    const truncatedTeamName =
+      teamName && teamName.length > 18 ? `${teamName.substring(0, 18)}…` : teamName;
+    const teamTint = getTeamBadgeStyle(teamColor);
+    const topOffset = `calc(var(--eley-hud-top) + ${SAFE_TOP})`;
+    const hudBadgeRadius = "var(--eley-hud-radius)";
+    const hudFixed = {
+      position: "fixed",
+      top: topOffset,
+      zIndex: 20,
+    };
+
     return (
-      <div
-        style={{
-          position,
-          top: position === "absolute" ? `calc(12px + ${SAFE_TOP})` : undefined,
-          left: position === "absolute" ? "12px" : undefined,
-          width: "auto",
-          maxWidth: position === "absolute" ? "calc(100vw - 24px)" : "100%",
-          marginBottom: position === "relative" ? 12 : undefined,
-          zIndex: 20,
-          background: "#0b1e3d",
-          border: "1px solid #1f2a44",
-          borderRadius: 9999,
-          padding: "5px 10px",
-          fontSize: 12,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "flex-start",
-          justifyContent: "flex-start",
-          gap: 4,
-          color: "#fff",
-        }}
-        aria-label="Nom du joueur"
-        title={nameLocked ? "Nom verrouillé" : "Nom du joueur"}
-      >
-        {/* Première ligne : nom d'équipe et score équipe (légèrement plus gros) */}
-        {truncatedTeamName && teamId && (
+      <>
+        {truncatedTeamName && (
           <div
             style={{
+              ...hudFixed,
+              left: "var(--eley-hud-side)",
+              maxWidth: "calc(55vw - var(--eley-hud-max-offset))",
+              borderRadius: hudBadgeRadius,
+              padding: "var(--eley-hud-pad-team-y) var(--eley-hud-pad-team-x)",
+              fontFamily: FONT_FAMILY,
+              fontSize: "var(--eley-hud-font-team)",
+              fontWeight: 700,
               display: "flex",
               alignItems: "center",
-              justifyContent: "flex-start",
-              gap: 4,
-              fontSize: 14,
+              gap: "var(--eley-hud-gap)",
+              ...teamTint,
             }}
+            aria-label="Équipe"
+            title={teamName || "Équipe"}
           >
-            <span style={{ fontSize: 14 }}>⭐</span>
-            <span style={{ color: teamColor || "#fff", fontWeight: 600, fontSize: 14 }}>
+            <HudTeamStar />
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
               {truncatedTeamName}
             </span>
-            <span style={{ opacity: 0.9, fontVariantNumeric: "tabular-nums", color: teamColor || "#fff", fontSize: 14 }}>
+            <span style={{ fontVariantNumeric: "tabular-nums", flexShrink: 0, opacity: 0.95 }}>
               • {teamQuizScore}
             </span>
           </div>
         )}
-        
-        {/* Deuxième ligne : avatar, nom, score joueur, score EleyBuzz */}
+
         <div
           style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "flex-start",
-            gap: 5,
-            fontSize: 10,
+            ...hudFixed,
+            right: "var(--eley-hud-side)",
+            maxWidth: "calc(45vw - var(--eley-hud-max-offset))",
+            background: BRAND_PAGE_BOTTOM,
+            border: "1px solid rgba(255, 251, 245, 0.16)",
+            borderRadius: hudBadgeRadius,
+            padding: "var(--eley-hud-pad-player-y) var(--eley-hud-pad-player-x)",
+            fontFamily: FONT_FAMILY,
+            fontSize: "var(--eley-hud-font-player)",
+            color: "#ffffff",
+            textAlign: "right",
           }}
+          aria-label="Joueur"
+          title={nameLocked ? "Nom verrouillé" : playerName}
         >
-          <span style={{ fontSize: 10 }}>👤</span>
-          <b style={{ letterSpacing: 0.2, fontSize: 10 }}>
-            {truncatedPlayerName}
-          </b>
-          <span style={{ marginLeft: 2, opacity: 0.9, fontVariantNumeric: "tabular-nums", fontSize: 10 }}>
-            • {myScore != null ? myScore : 0}
-          </span>
-          <span style={{ marginLeft: 2, opacity: 0.9, fontVariantNumeric: "tabular-nums", color: "#facc15", fontSize: 10 }}>
-            • ⚡ {myBuzzScore != null ? myBuzzScore : 0}
-          </span>
-          {nameLocked && <span style={{ opacity: 0.7, marginLeft: 4, fontSize: 10 }}>🔒</span>}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              flexWrap: "nowrap",
+              gap: 5,
+              fontWeight: 700,
+              fontSize: "var(--eley-hud-font-player-inner)",
+            }}
+          >
+            <span
+              style={{
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                minWidth: 0,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+              }}
+            >
+              <HudPlayerIcon />
+              {truncatedPlayerName}
+            </span>
+            <span style={{ fontVariantNumeric: "tabular-nums", flexShrink: 0 }}>
+              • {myScore != null ? myScore : 0}
+            </span>
+            <span
+              style={{
+                fontVariantNumeric: "tabular-nums",
+                flexShrink: 0,
+                marginLeft: 4,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 3,
+              }}
+            >
+              <span aria-hidden="true" style={{ color: BRAND.yellow }}>⚡</span>
+              {myBuzzScore != null ? myBuzzScore : 0}
+            </span>
+            {nameLocked && <span style={{ opacity: 0.7, flexShrink: 0 }}>🔒</span>}
+          </div>
         </div>
-      </div>
+      </>
     );
   };
 
   // 1) Écran d'inscription (nom refusé ou pas encore inscrit, ou nom réinitialisé)
-  if (!playerId || !playerName || (typeof error === "string" && error.startsWith("Nom refusé"))) {
+  if (isWelcomeScreen) {
+    const nom = playerNomJoueurMessages;
     return (
-      <div
-        style={{
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          background: "#000814",
-          color: "white",
-          display: "grid",
-          placeItems: "center",
-          padding: 24,
-          textAlign: "center",
-          overflowX: "hidden",
-        }}
-      >
-        <div style={{ width: "min(360px, 100%)", margin: "0 auto" }}>
-          <h1 style={{ margin: 0, fontSize: "2rem", fontWeight: 800 }}>
-            Bienvenue dans le quiz d’ELEY
-          </h1>
-          <p style={{ opacity: 0.85, marginTop: 10 }}>
-            Choisis ton nom de joueur / team :
-          </p>
+      <PlayerPageShell titleLine1={nom.welcomeLine1} titleLine2={nom.welcomeLine2}>
+          <PlayerLabelWithIcon>{nom.chooseNameLabel}</PlayerLabelWithIcon>
 
-          <form onSubmit={handleNameSubmit} style={{ marginTop: 12 }}>
+          <form onSubmit={handleNameSubmit}>
             <input
+              ref={welcomeInputRef}
               autoComplete="off"
               autoCorrect="off"
               autoCapitalize="none"
@@ -2481,28 +2918,24 @@ export default function Player() {
               type="text"
               value={inputName}
               onChange={(e) => setInputName(e.target.value)}
-              maxLength={10}
-              placeholder="ex : Les Quichettes (max 10)"
+              maxLength={12}
+              placeholder={nom.namePlaceholder}
               style={{
+                ...inputFieldStyle,
                 width: "100%",
                 maxWidth: "100%",
                 boxSizing: "border-box",
                 display: "block",
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid #334155",
-                background: "#0b1220",
-                color: "white",
-                fontSize: "clamp(14px, 3.9vw, 16px)",
+                padding: "var(--eley-input-pad-y) var(--eley-input-pad-x)",
+                fontSize: "var(--eley-text-input)",
               }}
-              autoFocus
             />
-            <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-              Lettres FR, chiffres, espaces, apostrophes (' '), tirets. Max 10 caractères.
+            <div style={{ fontSize: "var(--eley-text-caption)", opacity: 0.72, marginTop: 6, textAlign: "left" }}>
+              {nom.maxCharsHint}
             </div>
 
             {error && (
-              <div style={{ marginTop: 8, color: "#fecaca" }}>
+              <div style={{ marginTop: 8, color: BRAND.red, fontWeight: 600 }}>
                 {error}
               </div>
             )}
@@ -2511,21 +2944,8 @@ export default function Player() {
               type="submit"
               disabled={isSubmitDisabled}
               style={{
+                ...teamPrimaryBtnStyle({ busy, disabled: isSubmitDisabled }),
                 marginTop: 12,
-                width: "100%",
-                maxWidth: "100%",
-                boxSizing: "border-box",
-                display: "block",
-                padding: "clamp(10px, 2.8vw, 12px) 12px",
-                borderRadius: 10,
-                border: "1px solid #2a2a2a",
-                background: busy ? "#64748b" : "#3b82f6",
-                color: "white",
-                fontWeight: 700,
-                cursor: isSubmitDisabled ? "not-allowed" : "pointer",
-                touchAction: "manipulation",
-                WebkitTapHighlightColor: "transparent",
-                userSelect: "none",
               }}
               title={
                 isRejectedInput || isSameAsRejectedCurrent
@@ -2534,19 +2954,18 @@ export default function Player() {
               }
               aria-disabled={isSubmitDisabled ? "true" : "false"}
             >
-              {busy ? "Inscription…" : "Entrer"}
+              {busy ? nom.enterButtonBusy : nom.enterButton}
             </button>
 
             {Array.isArray(rejectedNames)
               && rejectedNames.includes(normalizeName(inputName))
               && !isAliasName(inputName) && (
-                <div style={{ marginTop: 6, color: "#fbbf24" }}>
-                  Ce nom a été refusé par l’animateur. Choisis-en un autre.
+                <div style={{ marginTop: 6, color: BRAND.orangeDark, fontWeight: 600 }}>
+                  {nom.nameRejectedByAdmin}
                 </div>
               )}
           </form>
-        </div>
-      </div>
+      </PlayerPageShell>
     );
   }
 
@@ -2578,225 +2997,203 @@ export default function Player() {
   // 1.5) Écran de sélection d'équipe (après l'inscription)
   // IMPORTANT: Un joueur DOIT avoir une équipe pour jouer, même si le quiz est en cours
   if ((needsTeamSelection || !teamId) && playerId) {
-    // Vérifier si le joueur est seul dans son équipe
     const isSoloInTeam = teamId && teamMemberCount === 1;
-    
+    const eq = playerEquipeMessages;
+    const cre = playerCreationEquipeMessages;
+    const rej = playerRejoindreEquipeMessages;
+
+    const pageTitle =
+      teamSelectionMode === "create"
+        ? { line1: cre.titleLine1, line2: cre.titleLine2 }
+        : teamSelectionMode === "join"
+          ? { line1: rej.titleLine1, line2: rej.titleLine2 }
+          : { line1: eq.titleLine1, line2: eq.titleLine2 };
+
+    const pageHint =
+      teamSelectionMode === "create"
+        ? cre.hint
+        : teamSelectionMode === "join"
+          ? rej.hint
+          : isSoloInTeam
+            ? null
+            : eq.choiceHint;
+
+    const displayedError =
+      teamSelectionMode === "join" && teamId && (!error || error === eq.mustLeaveBeforeCreate)
+        ? rej.alreadyInTeamWarning
+        : error;
+
     return (
-      <div
-        style={{
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          background: "#000814",
-          color: "white",
-          display: "grid",
-          placeItems: "center",
-          padding: 24,
-          textAlign: "center",
-          overflowX: "hidden",
-        }}
+      <PlayerPageShell
+        titleLine1={pageTitle.line1}
+        titleLine2={pageTitle.line2}
+        titleLine2Icon="star"
       >
-        <div style={{ width: "min(360px, 100%)", margin: "0 auto" }}>
-          {!isSoloInTeam && (
-            <>
-              <h1 style={{ margin: 0, fontSize: "2rem", fontWeight: 800 }}>
-                {teamSelectionMode === "create" ? "Crée ton équipe" : "Choisis ton équipe"}
-              </h1>
-              <p style={{ opacity: 0.85, marginTop: 10 }}>
-                {teamSelectionMode === "create" 
-                  ? "Crée une nouvelle équipe. Attention, si tu es déjà dans une équipe, pense à la quitter avant d'en créer une nouvelle."
-                  : teamSelectionMode === "join"
-                  ? "Rejoins une équipe existante. Attention, si tu fais déjà partie d'une équipe, tu en seras exclu automatiquement."
-                  : "Crée une nouvelle équipe ou rejoins une équipe existante"}
-              </p>
-            </>
-          )}
+        {pageHint && <p style={PLAYER_HINT_STYLE}>{pageHint}</p>}
 
-          {error && (
-            <div style={{ marginTop: 12, color: "#fecaca", fontSize: 14 }}>
-              {error}
+        {displayedError && (
+          <div style={{ marginBottom: 12, color: BRAND.red, fontSize: "var(--eley-text-error)", fontWeight: 600 }}>
+            {displayedError}
+          </div>
+        )}
+
+        {isSoloInTeam && !teamSelectionMode && (
+          <>
+            <p style={{ ...PLAYER_HINT_STYLE, fontWeight: 500, lineHeight: 1.45 }}>
+              {eq.soloIntro}{" "}
+              <b style={{ color: teamColor || BRAND.yellow }}>{teamName}</b>.
+            </p>
+            <p style={{ ...PLAYER_HINT_STYLE, fontWeight: 500, marginTop: 0 }}>
+              {eq.soloHint}
+            </p>
+            <button
+              type="button"
+              onClick={handleDeleteTeam}
+              disabled={busy}
+              style={teamDangerBtnStyle({ busy, disabled: busy })}
+            >
+              {busy
+                ? eq.deleteTeamButtonBusy
+                : formatMsg(eq.deleteTeamButton, { teamName })}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setNeedsTeamSelection(false);
+                setError("");
+              }}
+              disabled={busy}
+              style={{
+                ...btnSecondaryStyle,
+                marginTop: 12,
+                width: "100%",
+                padding: "var(--eley-btn-compact-y) var(--eley-btn-compact-x)",
+              }}
+            >
+              {eq.cancelButton}
+            </button>
+          </>
+        )}
+
+        {teamSelectionMode === "create" && !isSoloInTeam && !teamId && (
+          <form onSubmit={handleCreateTeam}>
+            <input
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              inputMode="text"
+              enterKeyHint="send"
+              type="text"
+              value={teamInputName}
+              onChange={(e) => setTeamInputName(e.target.value)}
+              maxLength={18}
+              placeholder={cre.namePlaceholder}
+              style={{
+                ...inputFieldStyle,
+                width: "100%",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                display: "block",
+                padding: "var(--eley-input-pad-y) var(--eley-input-pad-x)",
+                fontSize: "var(--eley-text-input)",
+                textTransform: "uppercase",
+              }}
+              autoFocus
+            />
+            <div style={{ fontSize: "var(--eley-text-caption)", ...pageTextSecondary, marginTop: 6, textAlign: "left" }}>
+              {cre.maxCharsHint}
             </div>
-          )}
+            <button
+              type="submit"
+              disabled={busy || !teamInputName.trim()}
+              style={{
+                ...btnPrimaryStyle,
+                marginTop: 12,
+                width: "100%",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                display: "block",
+                padding: "var(--eley-btn-pad-y) var(--eley-btn-pad-x)",
+                background: busy ? BRAND.yellow : BRAND.blue,
+                color: busy ? BRAND.mauveDark : "#ffffff",
+                cursor: busy || !teamInputName.trim() ? "not-allowed" : "pointer",
+              }}
+            >
+              {busy ? cre.submitButtonBusy : cre.submitButton}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTeamSelectionMode(null);
+                setTeamInputName("");
+                setError("");
+              }}
+              style={{
+                ...btnSecondaryStyle,
+                marginTop: 12,
+                width: "100%",
+                padding: "var(--eley-btn-compact-y) var(--eley-btn-compact-x)",
+              }}
+            >
+              {cre.cancelButton}
+            </button>
+          </form>
+        )}
 
-          {/* Si le joueur est seul dans son équipe, afficher d'abord le bouton de suppression */}
-          {isSoloInTeam && !teamSelectionMode && (
-            <div style={{ marginTop: 16 }}>
-              <p style={{ opacity: 0.85, marginBottom: 12 }}>
-                Tu es seul dans l'équipe <b style={{ color: teamColor || "#fff" }}>{teamName}</b>.
-                <br />
-                Tu dois d'abord supprimer cette équipe avant de créer ou rejoindre une autre équipe.
-              </p>
-              <button
-                onClick={handleDeleteTeam}
-                disabled={busy}
-                style={{
-                  width: "100%",
-                  padding: "clamp(10px, 2.8vw, 12px) 12px",
-                  borderRadius: 10,
-                  border: "1px solid #dc2626",
-                  background: busy ? "#64748b" : "#dc2626",
-                  color: "white",
-                  fontWeight: 700,
-                  cursor: busy ? "not-allowed" : "pointer",
-                }}
-              >
-                {busy ? "Suppression…" : `Supprimer l'équipe "${teamName}"`}
-              </button>
-              <button
-                onClick={() => {
-                  setNeedsTeamSelection(false);
-                  setError("");
-                }}
-                disabled={busy}
-                style={{
-                  marginTop: 12,
-                  width: "100%",
-                  padding: "8px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "transparent",
-                  color: "white",
-                  fontWeight: 600,
-                  cursor: busy ? "not-allowed" : "pointer",
-                }}
-              >
-                Annuler
-              </button>
-            </div>
-          )}
+        {teamSelectionMode === "join" && !isSoloInTeam && (
+          <>
+            <input
+              type="text"
+              placeholder={rej.searchPlaceholder}
+              value={teamSearchQuery}
+              onChange={(e) => setTeamSearchQuery(e.target.value)}
+              style={{
+                ...inputFieldStyle,
+                width: "100%",
+                padding: "var(--eley-input-pad-y) var(--eley-input-pad-x)",
+                fontSize: "var(--eley-text-input)",
+                marginBottom: 12,
+              }}
+              autoFocus
+            />
 
-          {/* Mode création */}
-          {teamSelectionMode === "create" && !isSoloInTeam && (
-            <form onSubmit={handleCreateTeam} style={{ marginTop: 16 }}>
-              <input
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="characters"
-                spellCheck={false}
-                inputMode="text"
-                enterKeyHint="send"
-                type="text"
-                value={teamInputName}
-                onChange={(e) => setTeamInputName(e.target.value)}
-                maxLength={15}
-                placeholder="ex : LES CHAMPIONS (max 15)"
-                style={{
-                  width: "100%",
-                  maxWidth: "100%",
-                  boxSizing: "border-box",
-                  display: "block",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "#0b1220",
-                  color: "white",
-                  fontSize: "clamp(14px, 3.9vw, 16px)",
-                  textTransform: "uppercase",
-                }}
-                autoFocus
-              />
-              <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-                Max 15 caractères. Le nom sera en majuscules.
-              </div>
-              <button
-                type="submit"
-                disabled={busy || !teamInputName.trim()}
-                style={{
-                  marginTop: 12,
-                  width: "100%",
-                  padding: "clamp(10px, 2.8vw, 12px) 12px",
-                  borderRadius: 10,
-                  border: "1px solid #2a2a2a",
-                  background: busy ? "#64748b" : "#3b82f6",
-                  color: "white",
-                  fontWeight: 700,
-                  cursor: busy || !teamInputName.trim() ? "not-allowed" : "pointer",
-                }}
-              >
-                {busy ? "Création…" : "Créer l'équipe"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setTeamSelectionMode(null);
-                  setTeamInputName("");
-                  setError("");
-                }}
-                style={{
-                  marginTop: 8,
-                  width: "100%",
-                  padding: "8px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "transparent",
-                  color: "white",
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                Annuler
-              </button>
-            </form>
-          )}
+            {(() => {
+              const filteredTeams = teamSearchQuery.trim()
+                ? availableTeams.filter((team) =>
+                    team.name.toLowerCase().includes(teamSearchQuery.toLowerCase())
+                  )
+                : availableTeams;
 
-          {/* Mode rejoindre */}
-          {teamSelectionMode === "join" && !isSoloInTeam && (
-            <div style={{ marginTop: 16 }}>
-              {/* Champ de recherche */}
-              <input
-                type="text"
-                placeholder="Recherche ton équipe"
-                value={teamSearchQuery}
-                onChange={(e) => setTeamSearchQuery(e.target.value)}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "#0b1220",
-                  color: "white",
-                  fontSize: "clamp(14px, 3.9vw, 16px)",
-                  marginBottom: 12,
-                }}
-                autoFocus
-              />
-              
-              {/* Filtrer les équipes selon la recherche */}
-              {(() => {
-                const filteredTeams = teamSearchQuery.trim()
-                  ? availableTeams.filter((team) =>
-                      team.name.toLowerCase().includes(teamSearchQuery.toLowerCase())
-                    )
-                  : availableTeams;
-
-                if (filteredTeams.length === 0) {
-                  return (
-                    <div style={{ opacity: 0.7, marginTop: 12 }}>
-                      {teamSearchQuery.trim()
-                        ? `Aucune équipe trouvée pour "${teamSearchQuery}"`
-                        : "Aucune équipe disponible pour le moment."}
-                    </div>
-                  );
-                }
-
+              if (filteredTeams.length === 0) {
                 return (
-                  <div style={{ maxHeight: "50vh", overflowY: "auto", marginTop: 12 }}>
-                    {filteredTeams.map((team) => (
+                  <div style={{ opacity: 0.7, marginBottom: 12, textAlign: "left" }}>
+                    {teamSearchQuery.trim()
+                      ? formatMsg(rej.noResults, { query: teamSearchQuery })
+                      : rej.noTeamsAvailable}
+                  </div>
+                );
+              }
+
+              return (
+                <div style={{ maxHeight: "40vh", overflowY: "auto", marginBottom: 12 }}>
+                  {filteredTeams.map((team) => (
                     <button
                       key={team.id}
+                      type="button"
                       onClick={() => handleJoinTeam(team.id)}
                       disabled={busy}
                       style={{
+                        ...cardStyle,
                         width: "100%",
                         marginBottom: 8,
-                        padding: "12px",
-                        borderRadius: 10,
-                        border: "1px solid #334155",
-                        background: "#0b1220",
-                        color: "white",
+                        padding: "var(--eley-card-pad-y)",
                         textAlign: "left",
                         cursor: busy ? "not-allowed" : "pointer",
                         display: "flex",
                         alignItems: "center",
                         gap: 12,
+                        opacity: busy ? 0.7 : 1,
                       }}
                     >
                       <span
@@ -2811,129 +3208,117 @@ export default function Player() {
                       />
                       <div style={{ flex: 1 }}>
                         <div style={{ fontWeight: 600 }}>{team.name}</div>
-                        <div style={{ fontSize: 12, opacity: 0.7 }}>
-                          {team.memberCount} membre{team.memberCount > 1 ? "s" : ""}
+                        <div style={{ fontSize: "var(--eley-text-caption)", opacity: 0.7 }}>
+                          {team.memberCount}{" "}
+                          {team.memberCount > 1 ? rej.memberPlural : rej.memberSingular}
                         </div>
                       </div>
                     </button>
-                    ))}
-                  </div>
-                );
-              })()}
+                  ))}
+                </div>
+              );
+            })()}
+
+            <button
+              type="button"
+              onClick={() => {
+                setTeamSelectionMode(null);
+                setTeamSearchQuery("");
+                setError("");
+              }}
+              style={{
+                ...btnSecondaryStyle,
+                width: "100%",
+                padding: "var(--eley-btn-compact-y) var(--eley-btn-compact-x)",
+              }}
+            >
+              {rej.cancelButton}
+            </button>
+          </>
+        )}
+
+        {!teamSelectionMode && !isSoloInTeam && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <button
+              type="button"
+              onClick={() => {
+                if (teamId) {
+                  setTeamSelectionMode(null);
+                  setTeamInputName("");
+                  setError(eq.mustLeaveBeforeCreate);
+                  return;
+                }
+                setError("");
+                setTeamSelectionMode("create");
+              }}
+              disabled={busy}
+              style={teamPrimaryBtnStyle({ busy, disabled: busy })}
+            >
+              {eq.createButton}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTeamSearchQuery("");
+                setTeamSelectionMode("join");
+                setError(teamId ? rej.alreadyInTeamWarning : "");
+              }}
+              disabled={busy}
+              style={{
+                ...btnSecondaryStyle,
+                width: "100%",
+                padding: "var(--eley-btn-pad-y) var(--eley-btn-pad-x)",
+                cursor: busy ? "not-allowed" : "pointer",
+              }}
+            >
+              {eq.joinButton}
+            </button>
+            {teamId && teamName && teamMemberCount > 1 && (
               <button
                 type="button"
-                onClick={() => {
-                  setTeamSelectionMode(null);
-                  setError("");
-                }}
-                style={{
-                  marginTop: 12,
-                  width: "100%",
-                  padding: "8px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "transparent",
-                  color: "white",
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                Annuler
-              </button>
-            </div>
-          )}
-
-          {/* Choix initial */}
-          {!teamSelectionMode && !isSoloInTeam && (
-            <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 12 }}>
-              <button
-                onClick={() => setTeamSelectionMode("create")}
+                onClick={handleLeaveTeam}
                 disabled={busy}
                 style={{
+                  ...btnGhostDangerStyle,
+                  marginTop: 8,
                   width: "100%",
-                  padding: "clamp(10px, 2.8vw, 12px) 12px",
-                  borderRadius: 10,
-                  border: "1px solid #2a2a2a",
-                  background: "#3b82f6",
-                  color: "white",
-                  fontWeight: 700,
+                  padding: "var(--eley-btn-compact-y) var(--eley-btn-compact-x)",
                   cursor: busy ? "not-allowed" : "pointer",
                 }}
               >
-                Créer une équipe
+                {formatMsg(eq.leaveTeamButton, { teamName })}
               </button>
-              <button
-                onClick={() => {
-                  setTeamSelectionMode("join");
-                  // Les équipes sont chargées en temps réel via onSnapshot
-                }}
-                disabled={busy}
-                style={{
-                  width: "100%",
-                  padding: "clamp(10px, 2.8vw, 12px) 12px",
-                  borderRadius: 10,
-                  border: "1px solid #334155",
-                  background: "transparent",
-                  color: "white",
-                  fontWeight: 600,
-                  cursor: busy ? "not-allowed" : "pointer",
-                }}
-              >
-                Rejoindre une équipe
-              </button>
-              {teamId && teamName && teamMemberCount > 1 && (
-                <button
-                  onClick={handleLeaveTeam}
-                  disabled={busy}
-                  style={{
-                    marginTop: 8,
-                    width: "100%",
-                    padding: "8px 12px",
-                    borderRadius: 10,
-                    border: "1px solid #ef4444",
-                    background: "transparent",
-                    color: "#ef4444",
-                    fontWeight: 600,
-                    cursor: busy ? "not-allowed" : "pointer",
-                  }}
-                >
-                  Quitter l'équipe "{teamName}"
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
+            )}
+          </div>
+        )}
+      </PlayerPageShell>
     );
   }
 
   // 2) Écran bloquant si le joueur a été retiré
   if (isKicked && playerId) {
     return (
-      <div
+      <BrandShell
         style={{
-          background: "#0a0a1a",
-          color: "#fff",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
           display: "grid",
           placeItems: "center",
-          padding: "24px",
+          padding: "var(--eley-shell-pad)",
           textAlign: "center",
           overflowX: "hidden",
         }}
       >
         <div style={{ width: "min(380px, 100%)", margin: "0 auto" }}>
-          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
+          <h1 style={{ fontSize: "var(--eley-title-md)", fontWeight: 800, margin: 0 }}>
             ELEY&nbsp;Quiz — Accès retiré
           </h1>
           <p style={{ opacity: 0.85, marginTop: 12 }}>
             Vous avez été retiré de la partie par l'animateur.
           </p>
-          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
+          <div style={{ fontSize: "var(--eley-text-caption)", opacity: 0.7, marginTop: 8 }}>
             (Si c'est une erreur, rapprochez-vous de l'animateur.)
           </div>
         </div>
-      </div>
+      </BrandShell>
     );
   }
 
@@ -2974,43 +3359,21 @@ export default function Player() {
     const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz;
 
     return (
-      <div
+      <BrandShell
           style={{
-            background: "#0a0a1a",
-            color: "#fff",
-            minHeight: "calc(var(--vh, 1vh) * 100)",
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
             justifyContent: "center",
-            padding: "24px",
+            padding: "var(--eley-shell-pad)",
             textAlign: "center",
             position: "relative",
           }}
         >
         {/* Bandeau joueur en haut */}
-        {playerName && teamId && <PlayerBadge showTimer={true} />}
-        
-        {/* Timer sous le bandeau */}
-        {(isRunning || isBuzzerMode) && (
-          <div
-            style={{
-              position: "absolute",
-              top: `calc(60px + ${SAFE_TOP})`,
-              right: 12,
-              background: "#111",
-              padding: "6px 10px",
-              borderRadius: 8,
-              fontFamily: "monospace",
-              letterSpacing: 1,
-              border: "1px solid #2a2a2a",
-            }}
-          >
-            ⏱ {formatHMS(elapsedSec)}
-          </div>
-        )}
+        {playerName && teamId && <PlayerHud />}
 
-        <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
+        <h1 style={{ fontSize: "var(--eley-title-md)", fontWeight: 800, margin: 0, marginBottom: 24 }}>
           ⚡ EleyBuzz ⚡
         </h1>
 
@@ -3028,22 +3391,19 @@ export default function Player() {
             return (
               <div
                 style={{
-                  fontSize: "clamp(1.25rem, 4vw, 1.75rem)",
+                  fontSize: "var(--eley-text-eleybuzz)",
                   fontWeight: 800,
-                  padding: "20px 28px",
+                  padding: "var(--eley-buzz-pad-y) var(--eley-buzz-pad-x)",
                   borderRadius: 12,
                   maxWidth: "min(600px, 95%)",
                   lineHeight: 1.5,
+                  fontFamily: FONT_FAMILY,
                   ...(isWinner
-                    ? {
-                        background: "#0b3a1e",
-                        border: "2px solid #22c55e",
-                        color: "#86efac",
-                      }
+                    ? { ...badgeSuccess, padding: "var(--eley-buzz-pad-y) var(--eley-buzz-pad-x)", borderRadius: 12 }
                     : {
-                        background: "#0f172a",
-                        border: "2px solid #3b82f6",
-                        color: "#93c5fd",
+                        ...cardStyle,
+                        border: `2px solid ${BRAND.blue}`,
+                        padding: "var(--eley-buzz-pad-y) var(--eley-buzz-pad-x)",
                       }),
                 }}
               >
@@ -3072,16 +3432,16 @@ export default function Player() {
                     maxWidth: 300,
                     maxHeight: 300,
                     borderRadius: "50%",
-                    border: "4px solid #fff",
-                    background: "#ef4444", // Rouge pour mauvaise réponse
-                    color: "#fff",
-                    fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
+                    border: `4px solid ${BRAND.mauveDark}`,
+                    background: BRAND.red,
+                    color: "#ffffff",
+                    fontSize: "var(--eley-title-lg)",
                     fontWeight: 800,
                     cursor: "default",
                     touchAction: "manipulation",
                     WebkitTapHighlightColor: "transparent",
                     userSelect: "none",
-                    boxShadow: "0 8px 24px rgba(239, 68, 68, 0.4)",
+                    boxShadow: `0 8px 24px rgba(13, 5, 37, 0.35)`,
                     marginBottom: 24,
                   }}
                 >
@@ -3091,10 +3451,11 @@ export default function Player() {
                 {/* Message de mauvaise réponse */}
                 <div 
                   style={{ 
-                    opacity: 0.9, 
-                    fontSize: 18, 
-                    color: "#ef4444",
+                    opacity: 0.95, 
+                    fontSize: "var(--eley-text-body)", 
+                    color: BRAND.red,
                     fontWeight: 700,
+                    textShadow: `0 0 1px ${BRAND.mauveDark}`,
                     lineHeight: 1.6,
                   }}
                 >
@@ -3110,7 +3471,7 @@ export default function Player() {
           if (effectiveBuzzerState === BUZZER_STATES.IDLE) {
             return (
               <div 
-                style={{ opacity: 0.85, fontSize: 16, lineHeight: 1.6 }}
+                style={{ opacity: 0.85, fontSize: "var(--eley-text-body)", lineHeight: 1.6 }}
                 dangerouslySetInnerHTML={{ 
                   __html: addSmartLineBreaks(playerEleyBuzzMessages.idle)
                 }}
@@ -3125,9 +3486,9 @@ export default function Player() {
             if (!effectiveBuzzerState || typeof effectiveBuzzerState !== 'string') {
               // Fallback si l'état n'est pas valide (peut arriver en production)
               return {
-                background: "#0f172a", // Presque noir avec teinte bleue, presque fondu avec le fond
-                border: "#1e293b", // Bordure très foncée
-                shadow: "0 8px 24px rgba(10, 10, 26, 0.6)", // Ombre très foncée, presque invisible
+                background: BRAND.mauveLight,
+                border: BRAND.mauveDark,
+                shadow: "0 8px 24px rgba(13, 5, 37, 0.25)",
                 isClickable: false,
                 isAnimating: false,
               };
@@ -3136,9 +3497,9 @@ export default function Player() {
             // Si OPEN : bleu (actif)
             if (effectiveBuzzerState === BUZZER_STATES.OPEN) {
               return {
-                background: "#3b82f6",
-                border: "#fff",
-                shadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
+                background: BRAND.blue,
+                border: BRAND.mauveDark,
+                shadow: "0 8px 24px rgba(16, 170, 209, 0.4)",
                 isClickable: canPressBuzzer,
                 isAnimating: false,
               };
@@ -3146,41 +3507,32 @@ export default function Player() {
             
             // Si LOCKED : déterminer selon qui a buzzé
             if (effectiveBuzzerState === BUZZER_STATES.LOCKED) {
-              // Pendant la vérification : bleu pour TOUS ceux qui ont buzzé
-              // On reste en bleu tant que le serveur n'a pas confirmé (firstPlayerId === null)
-              // Pas d'animation automatique, seulement au clic/touch
-              // Garde-fou pour la production : vérifier que les valeurs sont valides
               const isWaitingVerification = (!firstPlayerId || firstPlayerId === null) && (isBuzzing || optimisticFirstPlayerId === playerId);
               
               if (isWaitingVerification) {
                 return {
-                  background: "#3b82f6",
-                  border: "#fff",
-                  shadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
-                  isClickable: false, // Désactivé pendant vérification
-                  isAnimating: false, // Pas d'animation automatique
-                };
-              }
-              
-              // Une fois le serveur a confirmé (firstPlayerId !== null) :
-              // Premier joueur confirmé par le serveur : jaune par défaut, vert si bonne réponse, rouge si mauvaise réponse
-              // Garde-fou pour la production : vérifier que les valeurs sont valides
-              if (firstPlayerId && playerId && firstPlayerId === playerId) {
-                return {
-                  background: "#facc15",
-                  border: "#fff",
-                  shadow: "0 8px 24px rgba(250, 204, 21, 0.4)",
+                  background: BRAND.blue,
+                  border: BRAND.mauveDark,
+                  shadow: "0 8px 24px rgba(16, 170, 209, 0.4)",
                   isClickable: false,
                   isAnimating: false,
                 };
               }
               
-              // Autres joueurs : gris très foncé (même ceux qui avaient buzzé mais ne sont pas premiers)
-              // Couleur très sombre pour bien indiquer qu'on ne peut plus buzzer
+              if (firstPlayerId && playerId && firstPlayerId === playerId) {
+                return {
+                  background: BRAND.yellow,
+                  border: BRAND.mauveDark,
+                  shadow: "0 8px 24px rgba(254, 237, 106, 0.45)",
+                  isClickable: false,
+                  isAnimating: false,
+                };
+              }
+              
               return {
-                background: "#0f172a", // Presque noir avec teinte bleue, presque fondu avec le fond #0a0a1a
-                border: "#1e293b", // Bordure très foncée pour se fondre avec le fond
-                shadow: "0 8px 24px rgba(10, 10, 26, 0.6)", // Ombre très foncée, presque invisible
+                background: BRAND.mauveLight,
+                border: BRAND.mauveDark,
+                shadow: "0 8px 24px rgba(13, 5, 37, 0.25)",
                 isClickable: false,
                 isAnimating: false,
               };
@@ -3188,9 +3540,9 @@ export default function Player() {
             
             // Fallback : bleu
             return {
-              background: "#3b82f6",
-              border: "#fff",
-              shadow: "0 8px 24px rgba(59, 130, 246, 0.4)",
+              background: BRAND.blue,
+              border: BRAND.mauveDark,
+              shadow: "0 8px 24px rgba(16, 170, 209, 0.4)",
               isClickable: false,
               isAnimating: false,
             };
@@ -3213,7 +3565,7 @@ export default function Player() {
                     e.preventDefault();
                     // Animation immédiate
                     e.currentTarget.style.transform = "scale(0.95)";
-                    e.currentTarget.style.background = "#2563eb";
+                    e.currentTarget.style.background = BUZZER_BLUE_PRESSED;
                     
                     // Appeler handleBuzzerPress seulement si cliquable
                     if (buzzerStyle.isClickable) {
@@ -3248,9 +3600,11 @@ export default function Player() {
                     const isGreyedOut = effectiveBuzzerState === BUZZER_STATES.LOCKED && 
                                        firstPlayerId && 
                                        firstPlayerId !== playerId;
-                    return isGreyedOut ? "#334155" : "#fff"; // Gris très foncé (presque invisible) si verrouillé, blanc sinon
+                    if (isGreyedOut) return "rgba(255,251,245,0.5)";
+                    if (buzzerStyle.background === BRAND.yellow) return BRAND.mauveDark;
+                    return "#ffffff";
                   })(),
-                  fontSize: "clamp(1.5rem, 6vw, 2.5rem)",
+                  fontSize: "var(--eley-title-lg)",
                   fontWeight: 800,
                   cursor: effectiveBuzzerState === BUZZER_STATES.OPEN ? "pointer" : "default",
                   touchAction: "manipulation",
@@ -3265,7 +3619,7 @@ export default function Player() {
                   const canAnimate = effectiveBuzzerState === BUZZER_STATES.OPEN;
                   if (canAnimate) {
                     e.currentTarget.style.transform = "scale(0.95)";
-                    e.currentTarget.style.background = "#2563eb";
+                    e.currentTarget.style.background = BUZZER_BLUE_PRESSED;
                   }
                 }}
                 onMouseUp={(e) => {
@@ -3309,7 +3663,7 @@ export default function Player() {
                   style={{ 
                     marginTop: 24,
                     opacity: 0.9, 
-                    fontSize: 18,
+                    fontSize: "var(--eley-icon-label)",
                     fontWeight: (playerId && firstPlayerId && playerId === firstPlayerId) ? 700 : 400,
                     lineHeight: 1.6,
                   }}
@@ -3325,7 +3679,7 @@ export default function Player() {
           );
         })()}
 
-      </div>
+      </BrandShell>
     );
   }
 
@@ -3334,183 +3688,151 @@ export default function Player() {
   // ============================================================================
   if (showFinalScore && playerId) {
     return (
-      <div
+      <BrandShell
         style={{
-          background: "#0a0a1a",
-          color: "#fff",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
-          padding: "24px",
+          padding: "var(--eley-shell-pad)",
           textAlign: "center",
         }}
       >
-        <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0, marginBottom: 24 }}>
+        <h1 style={{ fontSize: "var(--eley-title-md)", fontWeight: 800, margin: 0, marginBottom: 24 }}>
           Fin de la soirée, voici les scores
         </h1>
-        
-        {/* Bloc Score équipe */}
-        {teamId && (
-          <div
-            style={{
-              marginTop: 8,
-              marginBottom: 20,
-              padding: 16,
-              borderRadius: 12,
-              background: "#0b0f1a",
-              border: "1px solid #1f2a44",
-              textAlign: "center",
-              maxWidth: "min(500px, 95%)",
-            }}
-          >
-            <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700 }}>
-              <span style={{ color: "#fff" }}>Ton équipe a </span>
-              <span style={{ color: teamColor || "#fff" }}><b>{teamQuizScore}</b></span>
-              <span style={{ color: "#fff" }}> points</span>
-            </div>
-            {myTeamRank != null && (
-              <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8 }}>
-                {myTeamMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myTeamMedal}</span>}
-                <span style={{ color: "#fff" }}>Classement : </span>
-                <span style={{ color: teamColor || "#fff" }}>{myTeamRank === 1 ? "1er" : myTeamRank === 2 ? "2ème" : myTeamRank === 3 ? "3ème" : `${myTeamRank}ème`}</span>
-                <span style={{ color: "#fff" }}> des équipes</span>
-              </div>
-            )}
+
+        <PlayerScorePanel
+          teamName={teamName}
+          teamColor={teamColor}
+          teamScore={teamQuizScore}
+          teamRank={myTeamRank}
+          teamMedal={myTeamMedal}
+          playerName={playerName}
+          playerScore={myFinalScore}
+          buzzScore={myBuzzScore}
+          showTeam={Boolean(teamId)}
+        />
+        {myFinalRank != null && (
+          <div style={{ marginTop: 10, fontSize: "var(--eley-text-meta)", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6, justifyContent: "center" }}>
+            {showPlayerFinalRankCircle ? <PlayerRankCircle rank={myFinalRank} size={13} /> : null}
+            Classement personnel : {myFinalRank === 1 ? "1er" : myFinalRank === 2 ? "2ème" : myFinalRank === 3 ? "3ème" : `${myFinalRank}ème`}
           </div>
         )}
-
-        {/* Bloc Score personnel */}
-        <div
-          style={{
-            marginTop: teamId ? 0 : 8,
-            padding: 16,
-            borderRadius: 12,
-            background: "#0b0f1a",
-            border: "1px solid #1f2a44",
-            textAlign: "center",
-            maxWidth: "min(500px, 95%)",
-          }}
-        >
-          <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700, marginBottom: 8 }}>
-            Ton score personnel
-          </div>
-          <div style={{ fontSize: "clamp(1.5rem, 6vw, 2rem)", fontWeight: 900, color: "#fff" }}>
-            {myFinalScore} pts
-          </div>
-          {myFinalRank != null && (
-            <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8, opacity: 0.9 }}>
-              {myFinalMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myFinalMedal}</span>}
-              Classement : {myFinalRank === 1 ? "1er" : myFinalRank === 2 ? "2ème" : myFinalRank === 3 ? "3ème" : `${myFinalRank}ème`} des joueurs
-            </div>
-          )}
-        </div>
-      </div>
+      </BrandShell>
     );
   }
 
   // 3) Écran d'attente une fois inscrit (avant lancement par l'Admin)
   // (Affiché seulement si EleyBuzz n'est pas actif)
   if (showPreStart && playerId) {
+    const att = playerAttenteMessages;
+    const attenteLinkStyle = {
+      marginTop: 12,
+      fontSize: "var(--eley-text-attente-link)",
+      fontWeight: 600,
+      opacity: 0.92,
+      textAlign: "center",
+      width: "100%",
+      lineHeight: 1.45,
+      display: "flex",
+      flexWrap: "wrap",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: "0.25em",
+    };
+    const attenteLinkBtnStyle = {
+      color: BRAND.blue,
+      background: "transparent",
+      border: "none",
+      cursor: "pointer",
+      font: "inherit",
+      fontWeight: 700,
+      padding: 0,
+      display: "inline-flex",
+      alignItems: "center",
+      verticalAlign: "middle",
+    };
+
     return (
-      <div
+      <BrandShell
         style={{
-          background: "#0a0a1a",
-          color: "#fff",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
           display: "flex",
           flexDirection: "column",
-          padding: "24px",
-          paddingTop: `calc(12px + ${SAFE_TOP})`,
-          textAlign: "center",
+          ...PLAYER_SHELL_PAD,
           position: "relative",
+          overflowX: "hidden",
         }}
       >
-        {/* Bandeau joueur en haut */}
-        {playerName && teamId && <PlayerBadge position="relative" />}
-        
-        {/* Timer sous le bandeau */}
-        {isRunning && (
-          <div
-            style={{
-              background: "#111",
-              padding: "6px 10px",
-              borderRadius: 8,
-              fontFamily: "monospace",
-              letterSpacing: 1,
-              border: "1px solid #2a2a2a",
-              display: "inline-block",
-              marginBottom: 24,
-              alignSelf: "center",
-            }}
-          >
-            ⏱ {formatHMS(elapsedSec)}
-          </div>
-        )}
+        {playerName && teamId && <PlayerHud />}
 
-        <div style={{ width: "min(380px, 100%)", margin: "0 auto", flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
-          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            ELEY&nbsp;Quiz — En attente du départ
+        <div
+          style={{
+            position: "relative",
+            zIndex: 3,
+            flex: 1,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            textAlign: "center",
+            minHeight: 0,
+          }}
+        >
+          <h1 style={PLAYER_TITLE_STYLE}>
+            {att.titleLine1}
+            <br />
+            {att.titleLine2}
           </h1>
+        </div>
 
-          <div style={{ width: "min(380px, 100%)", margin: "12px auto 0", textAlign: "center" }}>
-            <p style={{ opacity: 0.85 }}>
-              {playerName ? <>Tu es inscrit comme <b>{playerName}</b>.<br /></> : null}
-              {teamName ? (
-                <>Tu es dans l'équipe <b style={{ color: teamColor || "#fff" }}>{teamName}</b>.<br /></>
-              ) : null}
-              L'Admin n'a pas encore lancé le quiz.
-            </p>
-
-            {(!nameLocked && !isRunning) ? (
-              <>
-                <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                  Envie de changer de nom ?{" "}
+        <div
+          style={{
+            position: "relative",
+            zIndex: 3,
+            width: "min(var(--eley-content-narrow), 100%)",
+            maxWidth: "100%",
+            margin: "0 auto",
+            flexShrink: 0,
+            textAlign: "center",
+          }}
+        >
+          {!nameLocked && !isRunning ? (
+            <>
+              <div style={attenteLinkStyle}>
+                {att.changeNameHint}{" "}
+                <button type="button" onClick={resetAndDeletePlayer} style={attenteLinkBtnStyle}>
+                  <span style={{ textDecoration: "underline" }}>{att.changeNameButton}</span>
+                  <HudPlayerIcon size="var(--eley-icon-inline)" style={{ marginLeft: 5 }} />
+                </button>
+              </div>
+              {teamId && teamName && (
+                <div style={attenteLinkStyle}>
+                  {att.changeTeamHint}{" "}
                   <button
-                    onClick={resetAndDeletePlayer}
-                    style={{
-                      color: "#93c5fd",
-                      background: "transparent",
-                      border: "none",
-                      cursor: "pointer",
-                      textDecoration: "underline",
+                    type="button"
+                    onClick={() => {
+                      setNeedsTeamSelection(true);
+                      setTeamSelectionMode(null);
                     }}
+                    style={attenteLinkBtnStyle}
                   >
-                    Modifier mon nom
+                    <span style={{ textDecoration: "underline" }}>{att.changeTeamButton}</span>
+                    <HudTeamStar size="var(--eley-icon-inline)" style={{ marginLeft: 5 }} />
                   </button>
                 </div>
-                {teamId && teamName && (
-                  <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                    Envie de changer d'équipe ?{" "}
-                    <button
-                      onClick={() => {
-                        setNeedsTeamSelection(true);
-                        setTeamSelectionMode(null);
-                      }}
-                      style={{
-                        color: "#93c5fd",
-                        background: "transparent",
-                        border: "none",
-                        cursor: "pointer",
-                        textDecoration: "underline",
-                      }}
-                    >
-                      Changer d'équipe
-                    </button>
-                  </div>
-                )}
-              </>
-            ) : (
-              nameLocked && (
-                <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-                  Ton nom a été fixé par l'animateur.
-                </div>
-              )
-            )}
-          </div>
+              )}
+            </>
+          ) : (
+            nameLocked && (
+              <div style={{ ...attenteLinkStyle, opacity: 0.75, fontWeight: 500 }}>
+                {att.nameLocked}
+              </div>
+            )
+          )}
         </div>
-      </div>
+
+        <div style={{ flex: 1, minHeight: 0 }} aria-hidden="true" />
+      </BrandShell>
     );
   }
 
@@ -3524,15 +3846,16 @@ export default function Player() {
 
   // 4) Écran principal pendant le quiz
   return (
-    <div
+    <BrandShell
       style={{
-        background: "#0a0a1a",
-        color: "white",
-        padding: "20px",
+        display: "flex",
+        flexDirection: "column",
+        minHeight: "max(100dvh, calc(var(--vh, 1vh) * 100))",
+        padding: "var(--eley-page-pad)",
         paddingTop: isRunning
-          ? `calc(${TOP_GUTTER_RUNNING} + ${SAFE_TOP})`
-          : `calc(${TOP_GUTTER_IDLE} + ${SAFE_TOP})`,
-        minHeight: "calc(var(--vh, 1vh) * 100)",
+          ? `calc(${TOP_GUTTER_RUNNING} + var(--eley-page-pad) + ${SAFE_TOP})`
+          : `calc(${TOP_GUTTER_IDLE} + var(--eley-page-pad) + ${SAFE_TOP})`,
+        paddingBottom: `calc(var(--eley-page-pad) + env(safe-area-inset-bottom, 0px))`,
         textAlign: "center",
         position: "relative",
         overflowX: "hidden",
@@ -3544,7 +3867,7 @@ export default function Player() {
         style={{
           position: "fixed",
           inset: 0,
-          background: "#020617",          // bleu nuit
+          background: "#000000",
           opacity: uiMasked ? 0.96 : 0,
           transition: "opacity 120ms ease",
           pointerEvents: "none",
@@ -3553,144 +3876,109 @@ export default function Player() {
       />
 
       {/* Bandeau joueur en haut */}
-      {playerName && teamId && <PlayerBadge showTimer={true} />}
-      
-      {/* Timer sous le bandeau */}
-      {(isRunning || isBuzzerMode) && (
-        <div
-          style={{
-            position: "absolute",
-            top: `calc(60px + ${SAFE_TOP})`,
-            right: 12,
-            background: "#111",
-            padding: "6px 10px",
-            borderRadius: 8,
-            fontFamily: "monospace",
-            letterSpacing: 1,
-            border: "1px solid #2a2a2a",
-          }}
-        >
-          ⏱ {formatHMS(elapsedSec)}
-        </div>
-      )}
+      {playerName && teamId && <PlayerHud />}
+
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 0,
+          width: "100%",
+          position: "relative",
+          zIndex: 3,
+        }}
+      >
 
       {/* ====================== Branches principales d’affichage ====================== */}
 
       {/* Fin du quiz : message perso + classement */}
       {isQuizEnded ? (
         <>
-          <h2 style={{ fontSize: "2rem", marginTop: 24 }}>Fin du quiz</h2>
-          
-          {/* Bloc Score équipe */}
-          {teamId && (
-            <div
-              style={{
-                marginTop: 8,
-                marginBottom: 20,
-                padding: 16,
-                borderRadius: 12,
-                background: "#0b0f1a",
-                border: "1px solid #1f2a44",
-                textAlign: "center",
-              }}
-            >
-              <div style={{ fontSize: "clamp(1.2rem, 5vw, 1.6rem)", fontWeight: 700, color: teamColor || "#fff" }}>
-                Ton équipe a <b>{teamQuizScore}</b> points
-              </div>
-              {myTeamRank != null && (
-                <div style={{ fontSize: "clamp(1rem, 4vw, 1.3rem)", fontWeight: 600, marginTop: 8, color: teamColor || "#fff" }}>
-                  {myTeamMedal && <span style={{ marginRight: 6, fontSize: "1.2rem" }}>{myTeamMedal}</span>}
-                  Classement : {myTeamRank === 1 ? "1er" : myTeamRank === 2 ? "2ème" : myTeamRank === 3 ? "3ème" : `${myTeamRank}ème`}
-                </div>
-              )}
-            </div>
-          )}
+          <div style={PLAYER_TITLE_HEADER}>
+            <h2 style={{ fontSize: "var(--eley-quiz-end-title)", margin: 0 }}>
+              {playerFinMessages.endOfQuizTitle}
+            </h2>
+          </div>
 
-          {/* Bloc Score personnel */}
-          <div
-            style={{
-              marginTop: teamId ? 0 : 8,
-              padding: 16,
-              borderRadius: 12,
-              background: "#0b0f1a",
-              border: "1px solid #1f2a44",
-              textAlign: "center",
-            }}
-          >
-            <div style={{ fontSize: "clamp(1rem, 4vw, 1.2rem)", fontWeight: 600, marginBottom: 12, opacity: 0.9 }}>
-              Voici ton score personnel
-            </div>
-            <div style={{ fontSize: "clamp(1.1rem, 4.5vw, 1.4rem)", fontWeight: 700 }}>
-              <b>{myScore != null ? myScore : 0}</b> points
-              {myBuzzScore != null && myBuzzScore > 0 && (
-                <span style={{ marginLeft: 8, color: "#facc15" }}>
-                  • ⚡ <b>{myBuzzScore}</b> bonus
-                </span>
-              )}
-            </div>
+          <div style={PLAYER_PODIUM_CENTER}>
+            <PlayerRoundBreakPanel
+              teamsRanking={teamsRanking}
+              ranking={ranking}
+              teamId={teamId}
+              teamName={teamName}
+              teamRank={myTeamRank}
+              teamScore={myTeamScore}
+              playerName={playerName}
+              playerRank={myRank}
+              playerScore={myScore}
+              teamsSectionTitle={playerFinMessages.finalPodiumTeams}
+              playersSectionTitle={playerFinMessages.finalPodiumPlayers}
+              nothingDecidedText=""
+            />
           </div>
         </>
       ) : isRoundBreak ? (
-        // Fin de manche — priorité absolue
-        <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-          <h2 style={{ fontSize: "1.8rem", margin: 0 }}>
-            Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
-          </h2>
-          <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>
-            (pause)
-          </div>
-          {/* Score équipe (plus visible) */}
-          {teamId && myTeamRank != null && (
-            <div style={{ marginTop: 12, fontSize: "1.5rem", fontWeight: 900, color: teamColor || "#fff" }}>
-              {myTeamMedal && <span style={{ marginRight: 8 }}>{myTeamMedal}</span>}
-              <span>Équipe {teamName || ""} : <b>{myTeamScore}</b> pts</span>
-              {myTeamRank <= 3 && (
-                <span style={{ marginLeft: 8, fontSize: "1.1rem" }}>
-                  ({myTeamRank === 1 ? "1ère" : `${myTeamRank}ème`} place)
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-      ) : inRoundBoundaryWindow ? (
-        // Fenêtre morte juste avant la frontière
-        <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-          <h2 style={{ fontSize: "clamp(1.2rem, 5.3vw, 1.8rem)", margin: 0 }}>
-            Fin de la manche {boundaryRoundIndex != null ? boundaryRoundIndex + 1 : ""}
-          </h2>
-          <div style={{ opacity: 0.85, fontSize: 14, marginTop: 8 }}>(transition…)</div>
-        </div>
-      ) : isPaused ? (
-        // Pause manuelle
-        <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-          <h2 style={{ fontSize: "1.8rem", margin: 0 }}>On revient dans un instant…</h2>
-          <div style={{ opacity: 0.75, marginTop: 8, fontSize: 14 }}>
-            Le quiz est momentanément en pause.
+        <>
+          <div style={PLAYER_TITLE_HEADER}>
+            <h2 style={{ fontSize: "var(--eley-round-break-title)", fontWeight: 800, margin: 0 }}>
+              {playerFinMessages.endOfRoundTitle} {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
+            </h2>
           </div>
 
-          {/* Info (pause) : même logique que la bannière question */}
-          {currentQuestion && (hadCorrectEver || showGoodNow) && (
-            <div style={{ marginTop: 10, fontSize: 14, opacity: 0.9 }}>
-              {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
-              {Number.isFinite(gainedPoints) ? <> (+{gainedPoints} pts)</> : null}
-            </div>
-          )}
-        </div>
+          <div style={PLAYER_PODIUM_CENTER}>
+            <PlayerRoundBreakPanel
+              teamsRanking={teamsRanking}
+              ranking={ranking}
+              teamId={teamId}
+              teamName={teamName}
+              teamRank={myTeamRank}
+              teamScore={myTeamScore}
+              playerName={playerName}
+              playerRank={myRank}
+              playerScore={myScore}
+              teamsSectionTitle={playerFinMessages.provisionalPodiumTeams}
+              playersSectionTitle={playerFinMessages.provisionalPodiumPlayers}
+              nothingDecidedText={playerFinMessages.nothingDecided}
+            />
+          </div>
+        </>
+      ) : holdRoundBoundaryCountdown ? (
+        <PlayerCenterStage>
+          <div style={countdownLabelStyle}>{countdownLabel}</div>
+          <div style={countdownNumberStyle}>{displayCountdownSec}</div>
+        </PlayerCenterStage>
+      ) : isPaused ? (
+        <PlayerCenterStage>
+          <h2 style={pauseTitleStyle}>On revient dans un instant…</h2>
+          <div style={pauseSubtitleStyle}>
+            Le quiz est momentanément en pause.
+          </div>
+        </PlayerCenterStage>
       ) : currentQuestion ? (
+        isRoundIntroPhase ? (
+          <PlayerCenterStage>
+            <div style={countdownLabelStyle}>
+              {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
+            </div>
+            <div style={countdownNumberStyle}>
+              {introCountdownSec}
+            </div>
+          </PlayerCenterStage>
+        ) : showCountdownUi ? (
+          <PlayerCenterStage>
+            <div style={countdownLabelStyle}>
+              {countdownLabel}
+            </div>
+            <div style={countdownNumberStyle}>
+              {displayCountdownSec}
+            </div>
+          </PlayerCenterStage>
+        ) : (
         <>
           {/* ======================== Phases de la question ======================== */}
 
-          {/* Intro de manche */}
-          {isRoundIntroPhase ? (
-            <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-              <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
-                {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
-              </div>
-              <div style={{ fontSize: "clamp(2.4rem, 12vw, 4rem)", fontWeight: 800, lineHeight: 1 }}>
-                {introCountdownSec}
-              </div>
-            </div>
-          ) : isQuestionPhase ? (
+          {isQuestionPhase ? (
             <>
               {/* Phase question */}
               <h2 
@@ -3698,18 +3986,23 @@ export default function Player() {
                 dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
               />
 
-              {/* Image question (optionnelle) - Taille réduite de moitié pour éviter que le clavier cache le champ input, ou +200px si imageQuestionLarge */}
+              {/* Image question (optionnelle) — tailles via --eley-img-question-* */}
               {currentQuestion?.imageQuestionUrl ? (
                 <div
                   style={{
-                    width: currentQuestion.imageQuestionLarge ? (PLAYER_IMG_MAX / 2 + 200) : (PLAYER_IMG_MAX / 2),
-                    height: currentQuestion.imageQuestionLarge ? (PLAYER_IMG_MAX / 2 + 200) : (PLAYER_IMG_MAX / 2),
+                    width: currentQuestion.imageQuestionLarge
+                      ? "var(--eley-img-question-lg)"
+                      : "var(--eley-img-question-sm)",
+                    height: currentQuestion.imageQuestionLarge
+                      ? "var(--eley-img-question-lg)"
+                      : "var(--eley-img-question-sm)",
                     maxWidth: "100%",
                     margin: "16px auto",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
-                    background: "#111",
+                    background: IMAGE_FRAME_BG,
+                    border: `1px solid ${BRAND.mauveDark}`,
                     borderRadius: 8,
                     overflow: "hidden",
                   }}
@@ -3733,44 +4026,27 @@ export default function Player() {
 
             // Révélation de la réponse
             <div style={{ marginTop: 8, marginBottom: 4 }}>
-              <div style={{ 
-                opacity: 0.85, 
-                fontSize: 16, 
-                marginBottom: 6,
+              <div style={{
+                ...pageTextSecondary,
+                fontSize: "var(--eley-text-meta)",
+                fontWeight: 600,
+                marginBottom: 8,
                 lineHeight: 1.4,
                 maxWidth: "min(600px, 95%)",
                 marginLeft: "auto",
                 marginRight: "auto",
                 textAlign: "center",
               }}>
-                {revealPhrase}
+                {playerQuizMessages.revealAnswer}
               </div>
               <h2
                 style={{
-                  fontSize: "clamp(1.2rem, 5vw, 1.6rem)",
-                  margin: 0,
-                  lineHeight: 1.5,
-                  maxWidth: "min(600px, 95%)",
-                  marginLeft: "auto",
-                  marginRight: "auto",
-                  overflowWrap: "break-word", // Ne coupe que si nécessaire, préfère couper entre les mots
-                  wordBreak: "normal", // Ne coupe pas les mots au milieu
-                  hyphens: "auto",
-                  textAlign: "center",
-                  letterSpacing: "0.01em",
+                  ...questionTextStyle,
+                  fontSize: "var(--eley-text-reveal)",
+                  color: BRAND.yellow,
                 }}
                 dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(primaryAnswer) }}
               />
-            </div>
-          ) : isCountdownPhase ? (
-            // Décompte avant prochaine échéance
-            <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-              <div style={{ opacity: 0.85, fontSize: 16, marginBottom: 6 }}>
-                {countdownLabel}
-              </div>
-              <div style={{ fontSize: "clamp(2.4rem, 12vw, 4rem)", fontWeight: 800, lineHeight: 1 }}>
-                {countdownSec}
-              </div>
             </div>
           ) : (
             // Fallback conservateur
@@ -3819,14 +4095,15 @@ export default function Player() {
           {isRevealAnswerPhase && !isRoundBreak && preloadedImage ? (
             <div
               style={{
-                width: PLAYER_IMG_MAX,
-                height: PLAYER_IMG_MAX,
+                width: "var(--eley-img-reveal)",
+                height: "var(--eley-img-reveal)",
                 maxWidth: "100%",
                 margin: "16px auto",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                background: "#111",
+                background: IMAGE_FRAME_BG,
+                border: `1px solid ${BRAND.mauveDark}`,
                 borderRadius: 8,
                 overflow: "hidden",
               }}
@@ -3847,19 +4124,16 @@ export default function Player() {
             </div>
           ) : null}
 
-          {/* Score (révélé pour tous pendant le reveal) */}
-          {isRevealAnswerPhase && (
-            <div style={{ marginTop: 8, fontWeight: 700 }}>
-              Ton score actuel est de : <b>{myScore}</b>
-            </div>
-          )}
+          {isRevealAnswerPhase && revealPointsFeedback ? (
+            <div style={{ textAlign: "center" }}>{revealPointsFeedback}</div>
+          ) : null}
 
           {/* -------------------- QCM (4 propositions, ordre mélangé) -------------------- */}
           {showQcmChoices && (
             <div
               style={{
                 marginTop: 16,
-                width: "min(520px, 92vw)",
+                width: "min(var(--eley-content-wide), 92vw)",
                 maxWidth: "100%",
                 marginLeft: "auto",
                 marginRight: "auto",
@@ -3880,12 +4154,13 @@ export default function Player() {
                       onClick={() => handleQcmChoice(origIdx)}
                       style={{
                         width: "100%",
-                        padding: "14px 16px",
+                        padding: "var(--eley-choice-pad-y) var(--eley-choice-pad-x)",
                         borderRadius: 12,
-                        border: `2px solid ${isCorrectPick ? "#86efac" : "#334155"}`,
-                        background: isCorrectPick ? "#14532d" : "#1e293b",
-                        color: "#f8fafc",
-                        fontSize: "clamp(15px, 4vw, 17px)",
+                        border: `2px solid ${isCorrectPick ? BRAND.mauveDark : BRAND.mauveDark}`,
+                        background: isCorrectPick ? BRAND.green : "rgba(255, 251, 245, 0.95)",
+                        color: BRAND.mauveDark,
+                        fontSize: "var(--eley-text-input)",
+                        fontFamily: FONT_FAMILY,
                         fontWeight: 600,
                         textAlign: "left",
                         cursor: disabled ? "not-allowed" : "pointer",
@@ -3907,12 +4182,9 @@ export default function Player() {
               <div
                 style={{
                   display: "inline-block",
-                  padding: "8px 16px",
+                  padding: "var(--eley-btn-compact-y) var(--eley-btn-pad-x)",
                   borderRadius: 10,
-                  border: "1px solid #7f1d1d",
-                  background: "#450a0a",
-                  color: "#fca5a5",
-                  fontWeight: 700,
+                  ...badgeError,
                 }}
               >
                 Mauvaise réponse
@@ -3948,13 +4220,13 @@ export default function Player() {
 
                 placeholder="Votre réponse"
                 style={{
-                  width: "min(520px, 100%)",
+                  ...inputFieldStyle,
+                  width: "min(var(--eley-content-wide), 100%)",
                   maxWidth: "92vw",
-                  boxSizing: "border-box",
-                  padding: "clamp(10px, 2.8vw, 12px)",
+                  padding: "var(--eley-input-pad-y) var(--eley-input-pad-x)",
                   marginTop: "16px",
-                  fontSize: "clamp(14px, 3.9vw, 16px)",
-                  visibility: uiMasked ? "hidden" : "visible", // pas d’autofocus tant que masque actif
+                  fontSize: "var(--eley-text-input)",
+                  visibility: uiMasked ? "hidden" : "visible",
                 }}
                 autoFocus={!uiMasked}
                 inputMode="text"
@@ -3969,9 +4241,9 @@ export default function Player() {
             ) : isLocked && isQuestionPhase ? (
               <p
                 style={{
-                  color: "#f59e0b",
+                  color: BRAND.yellow,
                   fontWeight: 800,
-                  fontSize: "1.2rem",
+                  fontSize: "var(--eley-text-body)",
                   marginTop: 16,
                 }}
               >
@@ -3990,20 +4262,14 @@ export default function Player() {
                 onClick={handleAnswerSubmit}
                 disabled={isLocked || !((answer ?? "").trim().length > 0)}
                 style={{
+                  ...btnPrimaryStyle,
                   width: "auto",
                   minWidth: "120px",
-                  padding: "clamp(10px, 2.8vw, 12px) 24px",
+                  padding: "var(--eley-btn-pad-y) 24px",
                   boxSizing: "border-box",
                   display: "inline-block",
-                  borderRadius: 10,
-                  border: "1px solid #2a2a2a",
-                  background: isLocked ? "#64748b" : "#3b82f6",
-                  color: "white",
-                  fontWeight: 700,
+                  background: isLocked ? BRAND.mauveLight : BRAND.blue,
                   cursor: isLocked ? "not-allowed" : "pointer",
-                  touchAction: "manipulation",
-                  WebkitTapHighlightColor: "transparent",
-                  userSelect: "none",
                 }}
                 aria-disabled={isLocked ? "true" : "false"}
                 title={isLocked ? "En cooldown anti-spam" : "Valider la réponse"}
@@ -4023,39 +4289,18 @@ export default function Player() {
               <div
                 style={{
                   display: "inline-block",
-                  padding: "8px 16px",
+                  padding: "var(--eley-btn-compact-y) var(--eley-btn-pad-x)",
                   borderRadius: 10,
-                  border: "1px solid #2a2a2a",
-                  background: "#0b3a1e",
-                  fontWeight: 700,
+                  ...badgeSuccess,
                 }}
               >
-                {showGoodNow ? "Bonne réponse !" : "Tu as déjà bien répondu à cette question"}
+                {showGoodNow ? playerQuizMessages.correctAnswer : playerQuizMessages.alreadyCorrect}
               </div>
-              {Number.isFinite(gainedPoints) && (
-                <>
-                  {/* Score équipe (plus visible) */}
-                  {teamId && myTeamRank != null && (
-                    <div style={{ marginTop: 8, fontSize: "1.2rem", fontWeight: 900, color: teamColor || "#fff" }}>
-                      {myTeamMedal && <span style={{ marginRight: 6 }}>{myTeamMedal}</span>}
-                      <span>Équipe {teamName || ""} : <b>{myTeamScore}</b> pts</span>
-                      {myTeamRank <= 3 && (
-                        <span style={{ marginLeft: 6, fontSize: "0.9rem" }}>
-                          ({myTeamRank === 1 ? "1ère" : `${myTeamRank}ème`} place)
-                        </span>
-                      )}
-                    </div>
-                  )}
-                  {/* Score individuel (moins visible) */}
-                  <div style={{ marginTop: 4, fontSize: "0.9rem", opacity: 0.8 }}>
-                    Tu as marqué {gainedPoints} point{gainedPoints > 1 ? "s" : ""}
-                    {instantWin?.rank ? (instantWin.rank === 1 ? " 💛" : instantWin.rank === 2 ? " 🤍" : instantWin.rank === 3 ? " 🤎" : "") : ""}
-                  </div>
-                </>
-              )}
+              {questionPointsFeedback}
             </div>
           )}
         </>
+        )
       ) : (
         // ============================== Fallbacks ==============================
         <>
@@ -4075,37 +4320,34 @@ export default function Player() {
         </>
       )}
 
+      </div>
+
       {/* ============================== Styles locaux ============================== */}
       <style jsx>{`
-        /* Lisibilité input : texte & caret blancs, fond sombre, même après animations */
+        /* Input réponse — fond clair, texte mauve foncé */
 .answerInput {
-  color: #fff !important;
-  caret-color: #fff !important;
-  -webkit-text-fill-color: #fff !important; /* WKWebView/iOS */
-
-  /* Contraste garanti (sinon blanc sur blanc) */
-  background: #0b1220 !important;
-  border: 1px solid #334155 !important;
+  color: #0d0525 !important;
+  caret-color: #0d0525 !important;
+  -webkit-text-fill-color: #0d0525 !important;
+  font-family: "Source Sans 3", system-ui, sans-serif !important;
+  background: rgba(255, 251, 245, 0.95) !important;
+  border: 1px solid #0d0525 !important;
   border-radius: 10px;
 }
 
-/* Placeholder plus lisible sur fond sombre */
 .answerInput::placeholder {
-  color: rgba(255, 255, 255, 0.7);
+  color: rgba(93, 24, 60, 0.75);
 }
 
-/* Sécurité : ne jamais altérer la couleur du texte pendant l’animation d’erreur */
 .answerInput.flashWrong {
-  color: #fff !important;
-  -webkit-text-fill-color: #fff !important;
+  color: #0d0525 !important;
+  -webkit-text-fill-color: #0d0525 !important;
 }
 
-/* (Android/iOS) Cas auto-fill : évite un fond blanc injecté par le navigateur */
 .answerInput:-webkit-autofill {
-  -webkit-text-fill-color: #fff !important;
-  caret-color: #fff !important;
-  background: #0b1220 !important;
-  /* évite l’override visuel temporaire de Chrome */
+  -webkit-text-fill-color: #0d0525 !important;
+  caret-color: #0d0525 !important;
+  background: rgba(255, 251, 245, 0.95) !important;
   transition: background-color 99999s ease-out 0s;
 }
 
@@ -4143,6 +4385,6 @@ export default function Player() {
           }
         }
       `}</style>
-    </div>
+    </BrandShell>
   );
 }

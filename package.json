@@ -5,12 +5,16 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "make-brand-icons": "node scripts/make-icons.js && node scripts/make-logo-mark.js && node scripts/make-favicon-ico.js"
   },
   "dependencies": {
     "firebase": "^10.7.1",
     "next": "13.4.19",
     "react": "18.2.0",
     "react-dom": "18.2.0"
+  },
+  "devDependencies": {
+    "sharp": "^0.35.1"
   }
 }

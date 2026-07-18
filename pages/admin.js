@@ -28,6 +28,17 @@ import {
 } from "firebase/firestore";
 import { ref, uploadBytesResumable, getDownloadURL } from "firebase/storage";
 import AuthGate from "../lib/AuthGate";
+import StreamDeckRemotePanel from "../lib/StreamDeckRemotePanel";
+import {
+  sortedQuestionTimes,
+  currentQuestionIndex,
+  buildQuizMarkers,
+  resolveNextMarker,
+  firstMarkerOfRound,
+  planBackSeek,
+  getTransportUi,
+  makeStreamDeckSecret,
+} from "../lib/quiz-seek";
 
 // Imports depuis les fichiers utilitaires
 import {
@@ -41,6 +52,7 @@ import {
   DEFAULT_BUZZER_POINTS,
   BUZZER_CORRECT_MESSAGE_DURATION_MS,
   BUZZER_STATES,
+  ROUND_BOUNDARY_GAP_SEC,
 } from "../lib/constants";
 import { DEFAULT_REVEAL_PHRASES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
 
@@ -55,7 +67,6 @@ import {
   normalizeNameAlpha,
   normalizeTeamName,
   getTimeSec,
-  roundIndexOfTime,
 } from "../lib/utils";
 
 import {
@@ -76,6 +87,7 @@ import {
   openBuzzerForNewRound,
   lockPlayerBuzz,
   resetAllPlayerBuzzLocks,
+  purgeAnswersTree,
 } from "../lib/firebase-helpers";
 
 // ============================================================================
@@ -391,6 +403,23 @@ function AdminInner() {
     return hex;
   }
 
+  /** Assombrit une couleur de manche (bouton statut non cliquable). */
+  function darkenHex(hex, amount = 0.28) {
+    if (typeof hex !== "string" || !hex.startsWith("#")) return hex;
+    const s = hex.trim().slice(1);
+    const full =
+      s.length === 3 || s.length === 4
+        ? s[0] + s[0] + s[1] + s[1] + s[2] + s[2]
+        : s.slice(0, 6);
+    if (full.length < 6) return hex;
+    const f = Math.max(0, Math.min(1, 1 - Number(amount) || 0));
+    const to = (i) => {
+      const n = Math.round(parseInt(full.slice(i, i + 2), 16) * f);
+      return Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
+    };
+    return `#${to(0)}${to(2)}${to(4)}`;
+  }
+
   /* [2.4] États UI/DATA */
 
   // === Quiz (métadonnées + sélection) ===
@@ -453,8 +482,7 @@ function AdminInner() {
   const [quizEndSec, setQuizEndSec] = useState(null);
   const [endOffsetStr, setEndOffsetStr] = useState("");
 
-  // Intro / fin de manche
-  const [isIntro, setIsIntro] = useState(false);
+  // Fin de manche (sentinelle podium Screen/Player — pas utilisée pour Back/Next)
   const [lastAutoPausedRoundIndex, setLastAutoPausedRoundIndex] =
     useState(null);
 
@@ -478,7 +506,16 @@ function AdminInner() {
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerCorrectMessageDurationMs, setBuzzerCorrectMessageDurationMs] = useState(BUZZER_CORRECT_MESSAGE_DURATION_MS);
   const [defaultTimeMusicSec, setDefaultTimeMusicSec] = useState(DEFAULT_TIME_MUSIC_SEC);
-  
+  /** Télécommande Stream Deck (API) — OFF par défaut */
+  const [streamDeckRemoteEnabled, setStreamDeckRemoteEnabled] = useState(false);
+  const [streamDeckSecret, setStreamDeckSecret] = useState("");
+  /** Dernier timecode posé par Back/Next (déjà sur un marqueur → Back = précédent). */
+  const [parkedMarkerSec, setParkedMarkerSec] = useState(null);
+
+  useEffect(() => {
+    if (!isPaused) setParkedMarkerSec(null);
+  }, [isPaused]);
+
   // Messages personnalisables EleyBuzz Screen
   const [screenEleyBuzzMessages, setScreenEleyBuzzMessages] = useState(ELEYBUZZ_SCREEN_MESSAGES);
   
@@ -762,9 +799,15 @@ function AdminInner() {
         setIsPaused(!!d.isPaused);
 
         if (!startMs) {
-          setQuizStartMs(null);
-          setPauseAtMs(null);
-          setElapsedSec(0);
+          // Pendant la résolution des serverTimestamp (seek/pause), ne pas
+          // raz quizStartMs si le quiz tourne encore → évite le flash « Démarrer ».
+          if (!d.isRunning) {
+            setQuizStartMs(null);
+            setPauseAtMs(null);
+            setElapsedSec(0);
+          } else if (Number.isFinite(d.anchorOffsetSec) && d.isPaused) {
+            setElapsedSec(Math.max(0, Math.round(d.anchorOffsetSec)));
+          }
         } else {
           setQuizStartMs(startMs);
           if (d.pauseAt && typeof d.pauseAt.seconds === "number") {
@@ -777,7 +820,6 @@ function AdminInner() {
           }
         }
 
-        setIsIntro(!!d.isIntro);
         setLastAutoPausedRoundIndex(
           Number.isInteger(d.lastAutoPausedRoundIndex)
             ? d.lastAutoPausedRoundIndex
@@ -791,6 +833,8 @@ function AdminInner() {
         setFirstPlayerName(typeof d.firstPlayerName === "string" ? d.firstPlayerName : null);
         setBuzzerPoints(Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS);
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
+        setStreamDeckRemoteEnabled(!!d.streamDeckRemoteEnabled);
+        setStreamDeckSecret(typeof d.streamDeckSecret === "string" ? d.streamDeckSecret : "");
       },
       (e) => console.error("onSnapshot state error:", e)
     );
@@ -863,13 +907,13 @@ function AdminInner() {
     return () => clearInterval(id);
   }, [isRunning, isPaused, quizStartMs, pauseAtMs, quizEndSec, serverDeltaTick]);
 
-  // [3.2] Effect — 5) Auto-pause à la fin de manche (boundary = 1s AVANT la manche suivante)
+  // Auto-pause fin de manche (safety) — frontière = GAP avant début manche suivante.
+  // Ne décide PAS des cibles Back/Next (marqueurs questions uniquement).
   useEffect(() => {
     if (!isRunning || isPaused) return;
     if (!Array.isArray(roundOffsetsSec) || roundOffsetsSec.every((v) => v == null))
       return;
 
-    // Manche courante = dernière dont l’offset ≤ elapsedSec
     let prevIdx = -1;
     for (let i = 0; i < roundOffsetsSec.length; i++) {
       const t = roundOffsetsSec[i];
@@ -885,12 +929,8 @@ function AdminInner() {
         : null;
     if (typeof nextStart !== "number") return;
 
-    // Frontière = 1 seconde AVANT le début de la manche suivante
-    const boundary = Math.max(0, nextStart - 1);
-
+    const boundary = Math.max(0, nextStart - ROUND_BOUNDARY_GAP_SEC);
     if (elapsedSec < boundary) return;
-
-    // Déjà auto-pausé pour cette manche → ne rien refaire
     if (lastAutoPausedRoundIndex === prevIdx) return;
 
     setDoc(
@@ -1169,7 +1209,7 @@ function AdminInner() {
   })();
 
   const nextRoundBoundary = Number.isFinite(_nextRoundStart)
-    ? Math.max(0, _nextRoundStart)
+    ? Math.max(0, _nextRoundStart - ROUND_BOUNDARY_GAP_SEC)
     : null;
 
   const candidates = [];
@@ -2031,6 +2071,7 @@ function AdminInner() {
           startEpochMs: null,
           navSeq: increment(1),
           hbBoost: true,
+          lastAutoPausedRoundIndex: null,
         },
         { merge: true }
       );
@@ -2040,72 +2081,27 @@ function AdminInner() {
     }
   };
 
-  const pauseQuiz = async () => {
+  /** Seek en pause sur un timecode question (Back/Next). Jamais de podium fin de manche. */
+  const seekPaused = async (targetSec) => {
     try {
-      await setDoc(
-        doc(db, "quiz", "state"),
-        {
-          isPaused: true,
-          pauseAt: serverTimestamp(),
-          lastAutoPausedRoundIndex: null,
-        },
-        { merge: true }
-      );
-    } catch (err) {
-      console.error("pauseQuiz error:", err);
-      alert("Impossible de mettre en pause : " + (err?.message || err));
-    }
-  };
-
-  const seekTo = async (targetSec) => {
-    try {
-      const target = Math.max(0, Math.floor(targetSec));
-
-      let prevIdx = -1;
-      for (let i = 0; i < roundOffsetsSec.length; i++) {
-        const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
-      }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
-      const boundary =
-        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-
-      const payload = {
-        isRunning: true,
-        isPaused: false,
-        startAt: serverTimestamp(),
-        pauseAt: null,
-        anchorAt: serverTimestamp(),
-        anchorOffsetSec: target,
-        startEpochMs: null,
-        navSeq: increment(1),
-        hbBoost: true,
-      };
-      if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
-        payload.lastAutoPausedRoundIndex = prevIdx;
-      }
-      await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
-    } catch (err) {
-      console.error("seekTo error:", err);
-      alert("Échec du seek : " + (err?.message || err));
-    }
-  };
-
-  const resumeFromPause = async () => {
-    try {
-      const elapsed = Math.max(0, Math.floor(elapsedSec));
-
+      const target = Math.max(0, Math.round(Number(targetSec) || 0));
+      // Optimistic UI : pas de flash « Démarrer le quiz » pendant le serverTimestamp
+      const now = Date.now();
+      setParkedMarkerSec(target);
+      setIsRunning(true);
+      setIsPaused(true);
+      setElapsedSec(target);
+      setQuizStartMs(now - target * 1000);
+      setPauseAtMs(now);
       await setDoc(
         doc(db, "quiz", "state"),
         {
           isRunning: true,
-          isPaused: false,
+          isPaused: true,
           startAt: serverTimestamp(),
-          pauseAt: null,
+          pauseAt: serverTimestamp(),
           anchorAt: serverTimestamp(),
-          anchorOffsetSec: elapsed,
+          anchorOffsetSec: target,
           startEpochMs: null,
           navSeq: increment(1),
           hbBoost: true,
@@ -2114,21 +2110,15 @@ function AdminInner() {
         { merge: true }
       );
     } catch (err) {
-      console.error("resumeFromPause error:", err);
-      alert("Échec de la reprise : " + (err?.message || err));
+      console.error("seekPaused error:", err);
+      alert("Échec du positionnement (pause) : " + (err?.message || err));
     }
   };
 
-  const jumpToRoundStartAndPlay = async (roundStartSec) => {
+  /** Reprendre la lecture depuis un timecode question (après fin de manche). */
+  const seekAndPlay = async (targetSec) => {
     try {
-      const target = Math.max(0, Math.floor(roundStartSec));
-
-      let prevIdx = -1;
-      for (let i = 0; i < roundOffsetsSec.length; i++) {
-        const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
-      }
-
+      const target = Math.max(0, Math.round(Number(targetSec) || 0));
       await setDoc(
         doc(db, "quiz", "state"),
         {
@@ -2141,56 +2131,43 @@ function AdminInner() {
           startEpochMs: null,
           navSeq: increment(1),
           hbBoost: true,
-          lastAutoPausedRoundIndex: prevIdx,
+          lastAutoPausedRoundIndex: null,
         },
         { merge: true }
       );
     } catch (err) {
-      console.error("jumpToRoundStartAndPlay error:", err);
-      alert("Échec du saut de manche : " + (err?.message || err));
+      console.error("seekAndPlay error:", err);
+      alert("Échec de la reprise : " + (err?.message || err));
     }
   };
 
-  const seekPaused = async (targetSec) => {
-    try {
-      const target = Math.max(0, Math.floor(targetSec));
+  /**
+   * Pause / Reprendre.
+   * Après auto-pause « fin de manche » : Reprendre = 1ère question de la manche
+   * suivante (remplace l’ancien bouton « Manche suivante »), puis lecture.
+   */
+  const handlePauseResume = async () => {
+    if (!(isRunning && quizStartMs) || isQuizEnded || isBuzzerMode) return;
 
-      let prevIdx = -1;
-      for (let i = 0; i < roundOffsetsSec.length; i++) {
-        const t = roundOffsetsSec[i];
-        if (Number.isFinite(t) && target - 1 >= t) prevIdx = i;
+    if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
+      const markers = buildQuizMarkers(plannedTimes, roundOffsetsSec);
+      const nextFirst = firstMarkerOfRound(
+        markers,
+        lastAutoPausedRoundIndex + 1
+      );
+      if (nextFirst) {
+        setParkedMarkerSec(null);
+        await seekAndPlay(nextFirst.sec);
+        return;
       }
-      const nextStart = Number.isFinite(roundOffsetsSec[prevIdx + 1])
-        ? roundOffsetsSec[prevIdx + 1]
-        : null;
-      const boundary =
-        typeof nextStart === "number" ? Math.max(0, nextStart - 1) : null;
-
-      const payload = {
-        isRunning: true,
-        isPaused: true,
-        startAt: serverTimestamp(),
-        pauseAt: serverTimestamp(),
-        anchorAt: serverTimestamp(),
-        anchorOffsetSec: target,
-        startEpochMs: null,
-        navSeq: increment(1),
-        hbBoost: true,
-      };
-      if (typeof boundary === "number" && target >= boundary && prevIdx >= 0) {
-        payload.lastAutoPausedRoundIndex = prevIdx;
-      }
-      await setDoc(doc(db, "quiz", "state"), payload, { merge: true });
-    } catch (err) {
-      console.error("seekPaused error:", err);
-      alert("Échec du positionnement (pause) : " + (err?.message || err));
     }
+
+    await togglePauseResume(db);
   };
 
-    // Sauvegarder automatiquement la config de temps (manches + fin) avant un départ à froid
+  // Sauvegarder automatiquement la config de temps (manches + fin) avant un départ à froid
   const autoSaveTimeConfigBeforeStart = async () => {
     try {
-      // On se base sur ce qui est actuellement saisi dans les champs M1..M8 + Fin du quiz
       await saveRoundOffsets(roundOffsetsStr);
       await saveEndOffset(endOffsetStr);
     } catch (e) {
@@ -2198,60 +2175,19 @@ function AdminInner() {
     }
   };
 
-
-    const startOrNextRound = async () => {
-    const actives = (Array.isArray(roundOffsetsSec) ? roundOffsetsSec : [])
-      .filter((t) => typeof t === "number")
-      .sort((a, b) => a - b);
-
-    if (mainBtnBusy) return;
+  /** Gros bouton / V : uniquement démarrer le quiz depuis le début */
+  const startQuizFromBeginning = async () => {
+    if (mainBtnBusy || isBuzzerMode || isQuizEnded) return;
+    if (isRunning && quizStartMs) {
+      setNotice("Le quiz est déjà démarré — utilise Pause / Back / Next");
+      setTimeout(() => setNotice(null), 2000);
+      return;
+    }
     setMainBtnBusy(true);
     setTimeout(() => setMainBtnBusy(false), 350);
-
-    const isColdStart = !isRunning || !quizStartMs;
-
-    if (!actives.length) {
-      if (isColdStart) {
-        await autoSaveTimeConfigBeforeStart();
-      }
-      await startQuiz();
-      return;
-    }
-
-    if (isColdStart) {
-      await autoSaveTimeConfigBeforeStart();
-      await startQuiz();
-      return;
-    }
-
-    if (isPaused) {
-      let nextRoundStart = null;
-      if (isPaused && Number.isInteger(lastAutoPausedRoundIndex)) {
-        const idx = lastAutoPausedRoundIndex + 1;
-        nextRoundStart = Number.isFinite(roundOffsetsSec[idx])
-          ? roundOffsetsSec[idx]
-          : null;
-      } else {
-        nextRoundStart = actives.find((t) => t >= elapsedSec);
-      }
-      if (typeof nextRoundStart !== "number") {
-        setNotice("Aucune manche suivante");
-        setTimeout(() => setNotice(null), 1800);
-        return;
-      }
-      const boundary = Math.max(0, nextRoundStart);
-
-      await awardCurrentQuestionIfNeeded();
-
-      if (elapsedSec < boundary) {
-        await jumpToRoundStartAndPlay(nextRoundStart);
-      } else {
-        await resumeFromPause();
-      }
-      return;
-    }
+    await autoSaveTimeConfigBeforeStart();
+    await startQuiz();
   };
-
 
   async function awardCurrentQuestionIfNeeded() {
     try {
@@ -2268,78 +2204,39 @@ function AdminInner() {
   }
 
   const handleBack = async () => {
-    if (!isPaused) return;
-
-    if (atRoundBoundary) {
-      setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
+    if (!isPaused || isBuzzerMode) return;
+    const markers = buildQuizMarkers(plannedTimes, roundOffsetsSec);
+    if (!markers.length) {
+      setNotice("Aucun marqueur");
       setTimeout(() => setNotice(null), 1600);
       return;
     }
 
-    const actives = roundOffsetsSec
-      .filter((t) => typeof t === "number")
-      .sort((a, b) => a - b);
-    const firstActive = actives[0] ?? 0;
-    const roundStart =
-      actives.filter((t) => t <= elapsedSec).slice(-1)[0] ?? firstActive;
-    const roundEnd = actives.find((t) => t > roundStart) ?? Infinity;
-
-    if (!plannedTimes.length || elapsedSec < firstActive) {
-      await seekTo(0);
-      return;
-    }
-
-    const inRound = plannedTimes.filter(
-      (t) => t >= roundStart && t < roundEnd
+    const { seekSec } = planBackSeek(
+      elapsedSec,
+      markers,
+      parkedMarkerSec
     );
-    if (!inRound.some((t) => t <= elapsedSec)) {
-      await seekTo(roundStart);
-      return;
-    }
-
-    const past = inRound.filter((t) => t <= elapsedSec);
-    const target = past[past.length - 1] ?? roundStart;
-    await seekTo(target);
+    if (seekSec == null) return;
+    await seekPaused(seekSec);
   };
 
   const handleNext = async () => {
-    if (!isPaused) return;
-    if (atRoundBoundary) {
-      setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
-      setTimeout(() => setNotice(null), 1600);
-      return;
-    }
-    if (!plannedTimes.length) {
-      setNotice("Aucune question suivante");
+    if (!isPaused || isBuzzerMode) return;
+    const markers = buildQuizMarkers(plannedTimes, roundOffsetsSec);
+    if (!markers.length) {
+      setNotice("Aucun marqueur suivant");
       setTimeout(() => setNotice(null), 2000);
       return;
     }
-
-    const first = plannedTimes[0];
-    if (elapsedSec < first) {
-      await seekTo(first);
+    const target = resolveNextMarker(elapsedSec, markers);
+    if (!target) {
+      setNotice("Fin du quiz : plus de marqueur suivant");
+      setTimeout(() => setNotice(null), 1600);
       return;
     }
-
-    const currentRoundStartLocal =
-      roundOffsetsSec
-        .filter((t) => typeof t === "number" && t <= elapsedSec)
-        .slice(-1)[0] ?? 0;
-    const currentRoundEndLocal =
-      roundOffsetsSec.find(
-        (t) => typeof t === "number" && t > currentRoundStartLocal
-      ) ?? Infinity;
-
-    const next = plannedTimes.find(
-      (t) => t > elapsedSec && t < currentRoundEndLocal
-    );
-    if (typeof next === "number") {
-      await awardCurrentQuestionIfNeeded();
-      await seekTo(next);
-    } else {
-      setNotice("Fin de manche atteinte : utilisez « Manche suivante »");
-      setTimeout(() => setNotice(null), 1600);
-    }
+    await awardCurrentQuestionIfNeeded();
+    await seekPaused(target.sec);
   };
 
   /* ------------------------------- Actions: Joueurs & Reset ------------------------------- */
@@ -2605,41 +2502,7 @@ function AdminInner() {
     }
   }
 
-  // [5.6] Purge complète de answers/* (submissions + awards + doc racine)
-  async function purgeAnswersTree() {
-    const answersCol = collection(db, "answers");
-    const answersSnap = await getDocs(answersCol);
-
-    for (const qDoc of answersSnap.docs) {
-      const qid = qDoc.id;
-
-      const subsCol = collection(db, "answers", qid, "submissions");
-      const subsSnap = await getDocs(subsCol);
-      if (!subsSnap.empty) {
-        const ids = subsSnap.docs.map((d) => d.id);
-        while (ids.length) {
-          const chunk = ids.splice(0, 400);
-          const batch = writeBatch(db);
-          chunk.forEach((sid) => batch.delete(doc(subsCol, sid)));
-          await batch.commit();
-        }
-      }
-
-      const awardsCol = collection(db, "answers", qid, "awards");
-      const awardsSnap = await getDocs(awardsCol);
-      if (!awardsSnap.empty) {
-        const ids = awardsSnap.docs.map((d) => d.id);
-        while (ids.length) {
-          const chunk = ids.splice(0, 400);
-          const batch = writeBatch(db);
-          chunk.forEach((aid) => batch.delete(doc(awardsCol, aid)));
-          await batch.commit();
-        }
-      }
-
-      await deleteDoc(doc(answersCol, qid));
-    }
-  }
+  // [5.6] Purge complète de answers/* — voir purgeAnswersTree() dans firebase-helpers.js
 
   // [5.7] Reset complet du quiz + joueurs + answers/*
   async function resetQuizAndPlayers() {
@@ -2673,11 +2536,12 @@ function AdminInner() {
           firstPlayerName: null,
           buzzerMessage: null,
           buzzerMessageType: null,
+          streamDeckRemoteEnabled: false,
         },
         { merge: true }
       );
 
-      await purgeAnswersTree();
+      await purgeAnswersTree(db);
 
       await deleteAllPlayers();
 
@@ -2742,11 +2606,12 @@ function AdminInner() {
           firstPlayerName: null,
           buzzerMessage: null,
           buzzerMessageType: null,
+          streamDeckRemoteEnabled: false,
         },
         { merge: true }
       );
 
-      await purgeAnswersTree();
+      await purgeAnswersTree(db);
       
       // Débloquer tous les joueurs (au cas où certains seraient bloqués)
       await resetAllPlayerBuzzLocks(db, []);
@@ -2915,6 +2780,228 @@ function AdminInner() {
     }
   }
 
+  // Raccourcis EleyBuzz (pavé) toujours.
+  // Transport clavier (V / Espace / Shift+B/N) : désactivé quand télécommande ON —
+  // le Stream Deck envoie souvent HTTP + hotkey Studio One ; si Admin a le focus,
+  // le hotkey doublerait la commande HTTP. Avec télécommande ON → HTTP seul.
+  const transportHotkeysRef = useRef({});
+  transportHotkeysRef.current = {
+    streamDeckRemoteEnabled,
+    isBuzzerMode,
+    canPauseResume: isRunning && !isQuizEnded,
+    isPaused,
+    markersLen: buildQuizMarkers(plannedTimes, roundOffsetsSec).length,
+    mainBtnBusy,
+    isRunning,
+    quizStartMs,
+    isQuizEnded,
+    startQuizFromBeginning,
+    handleBack,
+    handleNext,
+    handlePauseResume,
+  };
+
+  const eleyBuzzHotkeysRef = useRef({});
+  eleyBuzzHotkeysRef.current = {
+    toggleEleyBuzzMode,
+    toggleBuzzerState,
+    handleBuzzerCorrect,
+    handleBuzzerWrong,
+    canActivateEleyBuzz,
+    canDeactivateEleyBuzz,
+    isBuzzerMode,
+    buzzerState,
+    firstPlayerId,
+    buzzerMessage,
+  };
+
+  useEffect(() => {
+    function onKeyDown(e) {
+      const tag = e.target?.tagName;
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        e.target?.isContentEditable
+      ) {
+        return;
+      }
+
+      const t = transportHotkeysRef.current;
+      const h = eleyBuzzHotkeysRef.current;
+
+      // Transport clavier uniquement si télécommande OFF (sinon Stream Deck = HTTP)
+      if (!t.streamDeckRemoteEnabled && !h.isBuzzerMode) {
+        if (e.code === "Space") {
+          e.preventDefault();
+          if (t.canPauseResume) t.handlePauseResume();
+          return;
+        }
+        if (e.code === "KeyV" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+          e.preventDefault();
+          if (!t.mainBtnBusy && !t.isQuizEnded && !(t.isRunning && t.quizStartMs)) {
+            t.startQuizFromBeginning();
+          }
+          return;
+        }
+        if (e.code === "KeyB" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+          e.preventDefault();
+          if (t.isPaused && t.markersLen > 0) t.handleBack();
+          return;
+        }
+        if (e.code === "KeyN" && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+          e.preventDefault();
+          if (t.isPaused && t.markersLen > 0) t.handleNext();
+          return;
+        }
+      }
+
+      // --- EleyBuzz (pavé numérique) ---
+      if (e.code === "Numpad0") {
+        e.preventDefault();
+        if (h.canActivateEleyBuzz || h.canDeactivateEleyBuzz) {
+          h.toggleEleyBuzzMode();
+        }
+        return;
+      }
+      if (e.code === "Numpad1") {
+        e.preventDefault();
+        if (h.isBuzzerMode && h.buzzerState !== "locked") {
+          h.toggleBuzzerState();
+        }
+        return;
+      }
+      if (e.code === "Numpad2") {
+        e.preventDefault();
+        if (
+          h.isBuzzerMode &&
+          h.buzzerState === "locked" &&
+          h.firstPlayerId &&
+          !h.buzzerMessage
+        ) {
+          h.handleBuzzerCorrect();
+        }
+        return;
+      }
+      if (e.code === "Numpad3") {
+        e.preventDefault();
+        if (
+          h.isBuzzerMode &&
+          h.buzzerState === "locked" &&
+          h.firstPlayerId &&
+          !h.buzzerMessage
+        ) {
+          h.handleBuzzerWrong();
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  async function toggleStreamDeckRemote() {
+    try {
+      const stateRef = doc(db, "quiz", "state");
+      if (!streamDeckRemoteEnabled) {
+        const secret = streamDeckSecret || makeStreamDeckSecret();
+        await setDoc(
+          stateRef,
+          {
+            streamDeckRemoteEnabled: true,
+            streamDeckSecret: secret,
+          },
+          { merge: true }
+        );
+        setNotice("Télécommande Stream Deck ON");
+      } else {
+        await setDoc(
+          stateRef,
+          { streamDeckRemoteEnabled: false },
+          { merge: true }
+        );
+        setNotice("Télécommande Stream Deck OFF");
+      }
+      setTimeout(() => setNotice(null), 1800);
+    } catch (e) {
+      console.error("toggleStreamDeckRemote error:", e);
+      setNotice("Erreur télécommande");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
+  // File d'attente Stream Deck → exécutée par Admin (auth admin), même en arrière-plan
+  const remoteExecRef = useRef({});
+  const remoteProcessedIdsRef = useRef(new Set());
+  const remoteActionLockRef = useRef({ action: null, at: 0 });
+  remoteExecRef.current = {
+    secret: streamDeckSecret,
+    enabled: streamDeckRemoteEnabled,
+    isBuzzerMode,
+    canPauseResume: isRunning && !isQuizEnded,
+    startQuizFromBeginning,
+    handleBack,
+    handleNext,
+    handlePauseResume,
+  };
+
+  useEffect(() => {
+    if (!streamDeckRemoteEnabled || !streamDeckSecret) return undefined;
+
+    const inboxCol = collection(db, "quiz", "state", "remoteInbox");
+    const unsub = onSnapshot(
+      inboxCol,
+      async (snap) => {
+        const changes = snap.docChanges().filter((c) => c.type === "added");
+        for (const change of changes) {
+          const refDoc = change.doc;
+          const docId = refDoc.id;
+          if (remoteProcessedIdsRef.current.has(docId)) continue;
+          remoteProcessedIdsRef.current.add(docId);
+          // Évite une fuite mémoire sur une longue session
+          if (remoteProcessedIdsRef.current.size > 80) {
+            remoteProcessedIdsRef.current = new Set(
+              [...remoteProcessedIdsRef.current].slice(-40)
+            );
+          }
+
+          const data = refDoc.data() || {};
+          const exec = remoteExecRef.current;
+          try {
+            if (data.secret !== exec.secret) {
+              await deleteDoc(refDoc.ref);
+              continue;
+            }
+            await deleteDoc(refDoc.ref);
+            if (exec.isBuzzerMode) continue;
+
+            const action = String(data.action || "").toLowerCase();
+            const now = Date.now();
+            const lock = remoteActionLockRef.current;
+            // Anti double-tap Stream Deck / double snapshot (~500 ms)
+            if (lock.action === action && now - lock.at < 500) continue;
+            remoteActionLockRef.current = { action, at: now };
+
+            if (action === "pause" && exec.canPauseResume) {
+              await exec.handlePauseResume();
+            } else if (action === "start") {
+              await exec.startQuizFromBeginning();
+            } else if (action === "back") {
+              await exec.handleBack();
+            } else if (action === "next") {
+              await exec.handleNext();
+            }
+          } catch (err) {
+            console.error("[remoteInbox] exec error:", err);
+          }
+        }
+      },
+      (err) => console.error("[remoteInbox] snapshot error:", err)
+    );
+
+    return () => unsub();
+  }, [streamDeckRemoteEnabled, streamDeckSecret]);
+
   // Sauvegarder un score modifié manuellement
   async function savePlayerScore(playerId, field, value) {
     try {
@@ -3081,26 +3168,44 @@ function AdminInner() {
   // isQuizEnded déjà défini plus haut (avant les fonctions EleyBuzz)
   const currentRoundNumber = currentRoundIndex + 1;
 
+  /** Gros bouton : démarrer, ou statut Manche N (couleur de manche assombrie) */
+  const quizInProgress = isRunning && !isQuizEnded;
   const mainButtonLabel = isQuizEnded
     ? "Fin du quiz"
-    : !isRunning
-      ? "Démarrer le quiz"
-      : isPaused
-        ? "Manche suivante"
-        : `Manche ${currentRoundNumber}`;
+    : quizInProgress
+      ? `Manche ${currentRoundNumber}`
+      : "Démarrer le quiz";
 
-  const mainButtonRoundIdx = isQuizEnded
-    ? null
-    : !isRunning
-      ? null
-      : isPaused
-        ? nextRoundIndex
-        : currentRoundIndex;
-
+  const mainButtonRoundIdx = quizInProgress ? currentRoundIndex : null;
   const mainButtonColor =
-    mainButtonRoundIdx != null && mainButtonRoundIdx >= 0
-      ? roundColors[mainButtonRoundIdx] || "#e5e7eb"
+    mainButtonRoundIdx != null
+      ? darkenHex(roundColors[mainButtonRoundIdx] || "#9ca3af", 0.26)
       : "#e5e7eb";
+
+  const quizMarkers = useMemo(
+    () => buildQuizMarkers(plannedTimes, roundOffsetsSec),
+    [plannedTimes, roundOffsetsSec]
+  );
+
+  const transportUi = useMemo(
+    () =>
+      isPaused ? getTransportUi(elapsedSec, quizMarkers, parkedMarkerSec) : null,
+    [isPaused, elapsedSec, quizMarkers, parkedMarkerSec]
+  );
+
+  const backBtnLabel = transportUi?.backLabel || "Back";
+  const nextBtnLabel = transportUi?.nextLabel || "Next";
+  const backBtnRoundIdx = transportUi?.backRoundIndex ?? null;
+  const nextBtnRoundIdx = transportUi?.nextRoundIndex ?? null;
+
+  const backBtnBg =
+    backBtnRoundIdx != null
+      ? roundColors[backBtnRoundIdx] || "#bfdbfe"
+      : "#bfdbfe";
+  const nextBtnBg =
+    nextBtnRoundIdx != null
+      ? roundColors[nextBtnRoundIdx] || "#c7d2fe"
+      : "#c7d2fe";
 
   // Quand un quiz est en cours ou en mode EleyBuzz, on verrouille la config de temps (manches + fin de quiz)
   const timeConfigLocked = (isRunning && !!activeQuizKey) || isBuzzerMode;
@@ -3121,21 +3226,37 @@ function AdminInner() {
     return quizzes.find((q) => q.key === selectedQuizKey) || null;
   }, [selectedQuizKey, quizzes]);
 
-  // On peut changer le quiz actif uniquement quand le gros bouton affiche "Démarrer le quiz"
-  const canChangeActiveQuiz = mainButtonLabel === "Démarrer le quiz";
+  // On peut changer le quiz actif uniquement avant le départ
+  const canChangeActiveQuiz = !quizInProgress && !isQuizEnded;
 
-
-  // --- Pause/Reprendre (même visuel qu'avant, juste le label qui bascule) ---
-  const canPauseResume = isRunning && !!quizStartMs && !isQuizEnded; // pas avant départ, ni après fin
-  const pauseBtnLabel = isPaused ? "Reprendre" : "Pause";
+  // --- Pause / Play (label = action au clic) ---
+  const canPauseResume = isRunning && !isQuizEnded; // pas avant départ, ni après fin
+  const showPlayLabel = !isRunning || isPaused || isQuizEnded;
+  const pauseBtnLabel = showPlayLabel ? "Play" : "Pause";
   const pauseCursor = canPauseResume ? "pointer" : "not-allowed";
   const pauseBtnTitle = canPauseResume
-    ? (isPaused ? "Reprendre le quiz" : "Mettre en pause le quiz")
-    : "Indisponible avant le départ ou après la fin";
-  // Largeur fixe + couleur pastel différente quand on est en "Reprendre"
-  const PAUSE_BTN_WIDTH = 120; // px, dimensionnée pour "Reprendre"
-  const pauseBtnBg = isPaused ? "#dfd6ff" : "#FECACA"; // Reprendre = pêche pastel, Pause = saumon pastel d'origine
+    ? isPaused
+      ? "Lancer la lecture (Play)"
+      : "Mettre en pause"
+    : "Disponible après le démarrage du quiz";
+  const PAUSE_BTN_WIDTH = 120;
+  const pauseBtnBg = showPlayLabel ? "#dfd6ff" : "#FECACA";
 
+  const canSeekNav = isPaused && quizMarkers.length > 0 && !isBuzzerMode;
+
+  const pauseNavInfo = useMemo(() => {
+    if (!isRunning || !isPaused) return null;
+    const times = sortedQuestionTimes(plannedTimes);
+    const qIdx = currentQuestionIndex(elapsedSec, times);
+    const qNum = qIdx >= 0 ? qIdx + 1 : 0;
+    const roundPart = `Manche ${currentRoundNumber}`;
+    const qPart = times.length
+      ? ` · Question ${qNum || "—"}/${times.length}`
+      : "";
+    return {
+      label: `PAUSE · ${roundPart}${qPart} · ${formatHMS(elapsedSec)}`,
+    };
+  }, [isRunning, isPaused, plannedTimes, elapsedSec, currentRoundNumber]);
 
   // ===== Rangs (égalité) pour l'affichage des médailles et du rang (sans toucher l'ordre du tableau)
   const rankingForAdmin = useMemo(() => {
@@ -3767,18 +3888,19 @@ function AdminInner() {
       </div>
 
       {/* Toolbar */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, margin: "12px 0" }}>
+      {/* Ligne 1 — transport + EleyBuzz + chrono */}
       <div
         style={{
           display: "flex",
           alignItems: "center",
           gap: 12,
-          margin: "12px 0",
           flexWrap: "wrap",
         }}
       >
         <button
-          onClick={startOrNextRound}
-          disabled={(isRunning && !isPaused) || isQuizEnded || mainBtnBusy || isBuzzerMode}
+          onClick={startQuizFromBeginning}
+          disabled={isRunning || isQuizEnded || mainBtnBusy || isBuzzerMode}
           style={{
             display: "inline-flex",
             alignItems: "center",
@@ -3791,7 +3913,7 @@ function AdminInner() {
             color: "#000",
             fontWeight: 600,
             cursor:
-              (isRunning && !isPaused) || isIntro || isQuizEnded || isBuzzerMode
+              isRunning || isQuizEnded || isBuzzerMode
                 ? "not-allowed"
                 : "pointer",
             transition: "background 160ms ease",
@@ -3799,24 +3921,34 @@ function AdminInner() {
             whiteSpace: "nowrap",
             opacity: isBuzzerMode ? 0.6 : 1,
           }}
-          title={isBuzzerMode ? "Indisponible en mode EleyBuzz" : mainButtonLabel}
+          title={
+            isBuzzerMode
+              ? "Indisponible en mode EleyBuzz"
+              : quizInProgress
+                ? `Manche ${currentRoundNumber} en cours`
+                : isQuizEnded
+                  ? "Quiz terminé"
+                  : streamDeckRemoteEnabled
+                    ? "Démarrer le quiz depuis le début (V)"
+                    : "Démarrer le quiz depuis le début"
+          }
         >
           {mainButtonLabel}
         </button>
 
         <button
-          onClick={() => (canPauseResume && !isBuzzerMode ? togglePauseResume(db) : null)}
+          onClick={() => (canPauseResume && !isBuzzerMode ? handlePauseResume() : null)}
           disabled={!canPauseResume || isBuzzerMode}
           aria-disabled={(!canPauseResume || isBuzzerMode) ? "true" : "false"}
           style={{
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
-            width: PAUSE_BTN_WIDTH,          // largeur fixe pour "Reprendre"
+            width: PAUSE_BTN_WIDTH,
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: pauseBtnBg,          // couleur pastel différente en "Reprendre"
+            background: pauseBtnBg,
             color: "#000",
             fontWeight: 600,
             cursor: (canPauseResume && !isBuzzerMode) ? pauseCursor : "not-allowed",
@@ -3825,65 +3957,73 @@ function AdminInner() {
             textAlign: "center",
             transition: "background 160ms ease",
           }}
-          title={isBuzzerMode ? "Indisponible en mode EleyBuzz" : pauseBtnTitle}
+          title={
+            isBuzzerMode
+              ? "Indisponible en mode EleyBuzz"
+              : streamDeckRemoteEnabled
+                ? `${pauseBtnTitle} (Espace)`
+                : pauseBtnTitle
+          }
         >
           {pauseBtnLabel}
         </button>
 
         <button
           onClick={handleBack}
-          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode}
+          disabled={!canSeekNav}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#bfdbfe",
+            background: backBtnBg,
             color: "#000",
             fontWeight: 600,
-            cursor:
-              !isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode
-                ? "not-allowed"
-                : "pointer",
+            minWidth: 100,
+            cursor: !canSeekNav ? "not-allowed" : "pointer",
             transition: "background 160ms ease",
             opacity: isBuzzerMode ? 0.6 : 1,
           }}
           title={
             isBuzzerMode
               ? "Indisponible en mode EleyBuzz"
-              : atRoundBoundary
-                ? "Fin de manche atteinte : utilisez « Manche suivante »"
-                : "Revenir au début de la question en cours (ou au début de la manche)"
+              : !isPaused
+                ? "Disponible uniquement en pause"
+                : streamDeckRemoteEnabled
+                  ? `${backBtnLabel} — seek sans play (Shift+B)`
+                  : `${backBtnLabel} — seek sans play`
           }
         >
-          Back
+          {backBtnLabel}
         </button>
 
         <button
           onClick={handleNext}
-          disabled={!isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode}
+          disabled={!canSeekNav || !transportUi?.nextTarget}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #2a2a2a",
-            background: "#c7d2fe",
+            background: nextBtnBg,
             color: "#000",
             fontWeight: 600,
-            cursor:
-              !isPaused || plannedTimes.length === 0 || atRoundBoundary || isBuzzerMode
-                ? "not-allowed"
-                : "pointer",
+            minWidth: 100,
+            cursor: !canSeekNav || !transportUi?.nextTarget ? "not-allowed" : "pointer",
             transition: "background 160ms ease",
             opacity: isBuzzerMode ? 0.6 : 1,
           }}
           title={
             isBuzzerMode
               ? "Indisponible en mode EleyBuzz"
-              : atRoundBoundary
-                ? "Fin de manche atteinte : utilisez « Manche suivante »"
-                : "Aller au début de la prochaine question (si disponible dans cette manche)"
+              : !isPaused
+                ? "Disponible uniquement en pause"
+                : !transportUi?.nextTarget
+                  ? "Plus de marqueur suivant"
+                  : streamDeckRemoteEnabled
+                    ? `${nextBtnLabel} — seek sans play (Shift+N)`
+                    : `${nextBtnLabel} — seek sans play`
           }
         >
-          Next
+          {nextBtnLabel}
         </button>
 
         <button
@@ -3902,7 +4042,6 @@ function AdminInner() {
           Reset Quiz
         </button>
 
-        {/* EleyBuzz Controls */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: isBuzzerMode ? "#1f2937" : "#111", borderRadius: 8, border: "1px solid #2a2a2a" }}>
           <button
             onClick={toggleEleyBuzzMode}
@@ -3917,9 +4056,9 @@ function AdminInner() {
               cursor: (!canActivateEleyBuzz && !canDeactivateEleyBuzz) ? "not-allowed" : "pointer",
               opacity: (!canActivateEleyBuzz && !canDeactivateEleyBuzz) ? 0.6 : 1,
             }}
-            title={isBuzzerMode ? "Désactiver EleyBuzz" : "Activer EleyBuzz"}
+            title={isBuzzerMode ? "Pavé num. 0 : désactiver EleyBuzz" : "Pavé num. 0 : activer EleyBuzz"}
           >
-            {isBuzzerMode ? "STOP EleyBuzz" : "Go EleyBuzz"}
+            {isBuzzerMode ? "STOP EleyBuzz (0)" : "Go EleyBuzz (0)"}
           </button>
 
           {isBuzzerMode && (
@@ -3937,9 +4076,13 @@ function AdminInner() {
                   cursor: buzzerState === "locked" ? "not-allowed" : "pointer",
                   opacity: buzzerState === "locked" ? 0.6 : 1,
                 }}
-                title="Touche 1 : Ouvrir/Fermer le buzzer"
+                title="Pavé num. 1 : ouvrir / fermer le buzzer"
               >
-                {buzzerState === "open" ? "Buzzer OUVERT" : buzzerState === "locked" ? "Buzzer VERROUILLÉ" : "Buzzer FERMÉ"}
+                {buzzerState === "open"
+                  ? "Buzzer OUVERT (1)"
+                  : buzzerState === "locked"
+                    ? "Buzzer VERROUILLÉ"
+                    : "Buzzer FERMÉ (1)"}
               </button>
 
               {buzzerState === "locked" && buzzerWinnerName && (
@@ -3985,7 +4128,7 @@ function AdminInner() {
                       transition: "transform 100ms ease, box-shadow 100ms ease",
                       userSelect: "none",
                     }}
-                    title={buzzerMessage ? "En attente de la fin du message" : "Touche 2 : Bonne réponse (+15 pts)"}
+                    title={buzzerMessage ? "En attente de la fin du message" : "Pavé num. 2 : bonne réponse"}
                   >
                     ✓ Correct (2)
                   </button>
@@ -4024,7 +4167,7 @@ function AdminInner() {
                       transition: "transform 100ms ease, box-shadow 100ms ease",
                       userSelect: "none",
                     }}
-                    title={buzzerMessage ? "En attente de la fin du message" : "Touche 3 : Mauvaise réponse"}
+                    title={buzzerMessage ? "En attente de la fin du message" : "Pavé num. 3 : mauvaise réponse"}
                   >
                     ✗ Faux (3)
                   </button>
@@ -4103,6 +4246,109 @@ function AdminInner() {
           )}
         </div>
 
+        <button
+          onClick={resetQuizAndPlayers}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #2a2a2a",
+            background: "#e5e7eb",
+            color: "#000",
+            fontWeight: 600,
+            cursor: "pointer",
+            marginLeft: "auto",
+          }}
+          title="Tout remettre à zéro (quiz/state, joueurs, answers/*)"
+        >
+          Réinitialiser
+        </button>
+      </div>
+
+      {/* Ligne 2 — télécommande Stream Deck + notices */}
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 8,
+          padding: streamDeckRemoteEnabled ? "10px 12px" : 0,
+          borderRadius: 8,
+          background: streamDeckRemoteEnabled ? "#0f172a" : "transparent",
+          border: streamDeckRemoteEnabled ? "1px solid #1e293b" : "none",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            flexWrap: "wrap",
+            minHeight: 36,
+          }}
+        >
+          <button
+            onClick={toggleStreamDeckRemote}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #2a2a2a",
+              background: streamDeckRemoteEnabled ? "#16a34a" : "#374151",
+              color: "#fff",
+              fontWeight: 700,
+              cursor: "pointer",
+              fontSize: 13,
+            }}
+            title="API Stream Deck (HTTP). Les raccourcis clavier Admin sont coupés tant que c’est ON (évite le double avec Studio One)."
+          >
+            {streamDeckRemoteEnabled ? "Télécommande ON" : "Télécommande OFF"}
+          </button>
+
+          {pauseNavInfo ? (
+            <span
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                background: "#1f2937",
+                border: "1px solid #f59e0b",
+                color: "#fde68a",
+                fontWeight: 700,
+                fontSize: 13,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {pauseNavInfo.label}
+            </span>
+          ) : null}
+
+          {notice ? (
+            <div
+              style={{
+                padding: "6px 10px",
+                background: "#1f2937",
+                border: "1px solid #374151",
+                borderRadius: 8,
+                color: "#fff",
+                fontSize: 13,
+              }}
+            >
+              {notice}
+            </div>
+          ) : null}
+        </div>
+
+        {streamDeckRemoteEnabled && streamDeckSecret ? (
+          <StreamDeckRemotePanel secret={streamDeckSecret} setNotice={setNotice} />
+        ) : null}
+      </div>
+
+      {/* Ligne 3 — offsets manches + fin de quiz */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+        }}
+      >
         {/* M1..M8 avec couleurs */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
@@ -4190,38 +4436,7 @@ function AdminInner() {
             />
           </label>
         </div>
-
-        {notice && (
-          <div
-            style={{
-              padding: "6px 10px",
-              background: "#1f2937",
-              border: "1px solid #374151",
-              borderRadius: 8,
-              color: "#fff",
-            }}
-          >
-            {notice}
-          </div>
-        )}
-
-        {/* Bouton Réinitialiser tout à droite */}
-        <button
-          onClick={resetQuizAndPlayers}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 8,
-            border: "1px solid #2a2a2a",
-            background: "#e5e7eb",
-            color: "#000",
-            fontWeight: 600,
-            cursor: "pointer",
-            marginLeft: "auto",
-          }}
-          title="Tout remettre à zéro (quiz/state, joueurs, answers/*)"
-        >
-          Réinitialiser
-        </button>
+      </div>
       </div>
 
       {needsOrderInit && (

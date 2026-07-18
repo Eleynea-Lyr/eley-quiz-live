@@ -50,6 +50,17 @@ service cloud.firestore {
       // Mise à jour : admin, OU un joueur connecté mais uniquement pour buzzer
       allow update: if isAdmin() || (isSignedIn() && onlyBuzzerFields());
 
+      // --- File Stream Deck : create public (secret validé côté Admin) ---
+      match /remoteInbox/{cmdId} {
+        allow read: if isAdmin();
+        allow create: if request.resource.data.keys().hasAll(['action', 'secret'])
+          && request.resource.data.action in ['start', 'pause', 'back', 'next']
+          && request.resource.data.secret is string
+          && request.resource.data.secret.size() >= 8;
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
+
       // --- Joueurs : un joueur ne gère QUE son propre document (id == son uid) ---
       match /players/{pid} {
         allow read: if true;

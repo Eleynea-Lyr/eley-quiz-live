@@ -4,9 +4,13 @@ import { useRouter } from "next/router";
 import { auth } from "../lib/firebase";
 import { onAuthStateChanged } from "firebase/auth";
 import { ADMIN_UIDS } from "../lib/constants";
+import { useMobileVH } from "../lib/firebase-helpers";
+import BrandShell from "../lib/BrandShell";
+import { btnPrimaryStyle } from "../lib/brand-theme";
 
 export default function Home() {
   const router = useRouter();
+  useMobileVH();
   // Par défaut : vue "joueur" (la plus restrictive) pour ne JAMAIS exposer
   // les liens d'organisation à un visiteur lambda, même le temps d'un éclair.
   const [adminView, setAdminView] = useState(false);
@@ -57,39 +61,58 @@ export default function Home() {
   // ===== Vue JOUEUR (par défaut, pour le public) =====
   if (!adminView) {
     return (
-      <div
+      <BrandShell
         style={{
-          ...pageStyle,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
-          justifyContent: "flex-start",
-          paddingTop: "clamp(72px, 18vh, 140px)",
-          paddingLeft: 24,
-          paddingRight: 24,
+          justifyContent: "center",
+          textAlign: "center",
+          minHeight: "max(100dvh, calc(var(--vh, 1vh) * 100))",
+          padding: "var(--eley-shell-pad)",
+          paddingTop: `calc(var(--eley-shell-pad) + env(safe-area-inset-top, 0px))`,
+          paddingBottom: `calc(var(--eley-shell-pad) + env(safe-area-inset-bottom, 0px))`,
+          overflowX: "hidden",
         }}
       >
-        <h1 style={{ fontSize: "2rem", marginBottom: "1.5rem", marginTop: 0 }}>
-          Le Quiz d&apos;Eley 🎶
-        </h1>
-        <Link
-          href="/player"
-          prefetch
+        <div
           style={{
-            display: "inline-block",
-            padding: "18px 36px",
-            borderRadius: 14,
-            background: "#3b82f6",
-            color: "#0b1120",
-            fontSize: "1.4rem",
-            fontWeight: 800,
-            textDecoration: "none",
-            boxShadow: "0 12px 30px rgba(59,130,246,0.35)",
+            position: "relative",
+            zIndex: 3,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "var(--eley-gap-stack)",
+            width: "min(var(--eley-content-narrow), 100%)",
           }}
         >
-          Clique ici pour jouer
-        </Link>
-      </div>
+          <h1
+            style={{
+              margin: 0,
+              fontSize: "var(--eley-title-page)",
+              fontWeight: 800,
+              lineHeight: 1.12,
+            }}
+          >
+            Le Quiz d&apos;Eley 🎶
+          </h1>
+          <Link
+            href="/player"
+            prefetch
+            style={{
+              ...btnPrimaryStyle,
+              display: "inline-block",
+              padding: "var(--eley-btn-pad-y) clamp(28px, 8vw, 36px)",
+              fontSize: "var(--eley-btn-home)",
+              textDecoration: "none",
+              textAlign: "center",
+            }}
+          >
+            Clique ici pour jouer
+          </Link>
+        </div>
+      </BrandShell>
     );
   }
 

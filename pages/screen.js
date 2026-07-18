@@ -15,11 +15,9 @@ import {
   REVEAL_DURATION_SEC,
   COUNTDOWN_START_SEC,
   ROUND_START_INTRO_SEC,
+  ROUND_BOUNDARY_GAP_SEC,
   UI_MASK_MS,
   BAR_H,
-  BAR_BLUE,
-  BAR_RED,
-  HANDLE_COLOR,
   SCREEN_IMG_MAX,
   DEFAULT_LEADERBOARD_TOP_N,
   DEFAULT_SCORING_TABLE,
@@ -29,7 +27,6 @@ import {
 import {
   getTimeSec,
   formatHMS,
-  pickRevealPhrase,
   roundIndexOfTime,
   nextRoundStartAfter,
   normalizeNameAlpha,
@@ -43,26 +40,595 @@ import {
 } from "../lib/firebase-helpers";
 import AuthGate from "../lib/AuthGate";
 
-import { SCREEN_MESSAGES, ELEYBUZZ_SCREEN_MESSAGES } from "../lib/messages";
+import {
+  SCREEN_PAGE_ATTENTE,
+  SCREEN_PAGE_QUIZ,
+  SCREEN_PAGE_PODIUM,
+  ELEYBUZZ_SCREEN_MESSAGES,
+  mergePageMessages,
+} from "../lib/messages";
 import { isQcmQuestion, getQcmOptionsForDisplay } from "../lib/qcm";
 import { resolvePlayerJoinUrl, getJoinQrImageUrl } from "../lib/join-url";
+import {
+  BRAND,
+  FONT_FAMILY,
+  PAGE_TEXT,
+  BAR_BLUE,
+  BAR_RED,
+  HANDLE_COLOR,
+  badgeSuccess,
+  badgeError,
+  cardStyle,
+  questionTextStyle,
+  pageTextSecondary,
+  asidePanelStyle,
+  podiumCardStyle,
+  IMAGE_FRAME_BG,
+} from "../lib/brand-theme";
+import BrandShell from "../lib/BrandShell";
+import PodiumPanel from "../lib/PodiumPanel";
+import PlayerRankCircle from "../lib/player-rank-circle";
 
 // Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
 
+const SCREEN_IMAGE_EDGE_LEFT = 0;
+const SCREEN_IMAGE_EDGE_TOP = 0;
+/** Même retrait bas que le logo WelcomeMark (bas droite) */
+const SCREEN_CORNER_BOTTOM = "max(14px, env(safe-area-inset-bottom, 0px))";
+const SCREEN_CORNER_LEFT = "max(14px, env(safe-area-inset-left, 0px))";
+const SCREEN_QR_INSET = 9;
+
+const SCREEN_SHELL_STYLE = {
+  display: "flex",
+  flexDirection: "row",
+  position: "relative",
+  isolation: "isolate",
+  backgroundColor: "#000000",
+};
+
+const SCREEN_STAGE_WRAP = {
+  marginTop: 8,
+  marginBottom: 4,
+  width: "100%",
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  textAlign: "center",
+};
+
+/** Titres fin de manche / quiz — alignés en haut de la colonne */
+const SCREEN_TITLE_HEADER = {
+  width: "100%",
+  textAlign: "center",
+  flexShrink: 0,
+};
+
+/** Podium + note de bas de page — centrés, légèrement remontés */
+const SCREEN_PODIUM_CENTER = {
+  ...SCREEN_STAGE_WRAP,
+  flex: 1,
+  justifyContent: "center",
+  marginTop: 0,
+  marginBottom: 0,
+  width: "100%",
+  minHeight: 0,
+  paddingBottom: "var(--eley-podium-block-lift)",
+};
+
+/** Décale le podium vers la droite pour le centrer visuellement (moitié du panneau classement) */
+const SCREEN_OPTICAL_SHIFT = "min(172px, 17vw)";
+
+const SCREEN_MAIN_COLUMN = {
+  flex: 1,
+  minHeight: 0,
+  minWidth: 0,
+  alignSelf: "stretch",
+  position: "relative",
+  zIndex: 2,
+  padding: "40px 24px",
+  fontFamily: FONT_FAMILY,
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: 12,
+  textAlign: "center",
+};
+
+/** Bloc fin de manche / fin de quiz — titre en haut, podium centré */
+function ScreenPodiumBlock({ opticalShift = false, title, children }) {
+  return (
+    <div
+      style={{
+        width: "100%",
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        minHeight: 0,
+        transform: opticalShift ? `translateX(${SCREEN_OPTICAL_SHIFT})` : undefined,
+      }}
+    >
+      <div style={SCREEN_TITLE_HEADER}>{title}</div>
+      <div style={{ ...SCREEN_PODIUM_CENTER, width: "100%" }}>{children}</div>
+    </div>
+  );
+}
+
+/** Question, révélation, pause — même centrage visuel que fin de manche */
+function ScreenQuizStageBlock({ opticalShift = false, alignTop = false, children }) {
+  const stageStyle = alignTop
+    ? {
+        ...SCREEN_PODIUM_CENTER,
+        justifyContent: "flex-start",
+        paddingTop: 0,
+        paddingBottom: 12,
+        width: "100%",
+      }
+    : { ...SCREEN_PODIUM_CENTER, width: "100%" };
+
+  return (
+    <div
+      style={{
+        width: "100%",
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        minHeight: 0,
+        transform: opticalShift ? `translateX(${SCREEN_OPTICAL_SHIFT})` : undefined,
+      }}
+    >
+      <div style={stageStyle}>{children}</div>
+    </div>
+  );
+}
+
+const SCREEN_ON_DARK_BORDER = "1px solid rgba(255, 251, 245, 0.28)";
+
+/** Compte à rebours / intro — même échelle que « Podium provisoire » */
+const SCREEN_COUNTDOWN_LABEL = {
+  ...pageTextSecondary,
+  fontSize: "var(--eley-screen-countdown-label)",
+  fontWeight: 700,
+  marginBottom: 10,
+  lineHeight: 1.3,
+  textAlign: "center",
+  width: "100%",
+};
+
+const SCREEN_COUNTDOWN_NUMBER = {
+  fontSize: "var(--eley-screen-countdown-number)",
+  fontWeight: 800,
+  lineHeight: 1,
+  color: PAGE_TEXT,
+  textAlign: "center",
+  width: "100%",
+};
+
+const SCREEN_REVEAL_LABEL = {
+  ...pageTextSecondary,
+  fontSize: "var(--eley-screen-text-reveal-label)",
+  fontWeight: 700,
+  marginBottom: 10,
+  lineHeight: 1.3,
+  maxWidth: "min(920px, 95%)",
+  marginLeft: "auto",
+  marginRight: "auto",
+  textAlign: "center",
+  whiteSpace: "nowrap",
+  overflowWrap: "normal",
+  wordBreak: "normal",
+};
+
+const SCREEN_SECONDARY_TEXT = {
+  ...pageTextSecondary,
+  fontSize: "var(--eley-screen-secondary)",
+  lineHeight: 1.45,
+  textAlign: "center",
+};
+
+const SCREEN_LIVE_CAPTION = {
+  ...pageTextSecondary,
+  fontSize: "var(--eley-screen-countdown-label)",
+  fontWeight: 700,
+  marginBottom: 8,
+  textAlign: "center",
+};
+
+const SCREEN_QCM_STAGE_WRAP = {
+  ...SCREEN_STAGE_WRAP,
+  marginTop: 0,
+  marginBottom: 0,
+};
+
+const SCREEN_QCM_QUESTION_STYLE = {
+  fontSize: "var(--eley-screen-qcm-question)",
+  fontWeight: 800,
+  lineHeight: 1.22,
+  maxWidth: "min(860px, 92%)",
+  margin: "0 0 6px",
+};
+
+const SCREEN_QCM_GRID = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: "clamp(6px, 1.1vw, 10px)",
+  maxWidth: "min(720px, 86%)",
+  margin: "6px auto 4px",
+  fontSize: "var(--eley-screen-qcm-option)",
+  fontWeight: 600,
+  lineHeight: 1.28,
+  width: "100%",
+};
+
+const SCREEN_QCM_OPTION = {
+  padding: "clamp(5px, 1vw, 9px) clamp(8px, 1.4vw, 12px)",
+  borderRadius: 8,
+  border: SCREEN_ON_DARK_BORDER,
+  background: "rgba(255, 251, 245, 0.12)",
+  textAlign: "center",
+  color: PAGE_TEXT,
+};
+
+const SCREEN_LIVE_ROW_H = 24;
+
+const SCREEN_LIVE_ROW_W = "min(520px, 92%)";
+
+const SCREEN_LIVE_ROW = {
+  display: "grid",
+  gridTemplateColumns: "36px minmax(0, 1fr) auto",
+  columnGap: 8,
+  alignItems: "center",
+  width: SCREEN_LIVE_ROW_W,
+  margin: "0 auto",
+  padding: "3px 10px",
+  minHeight: SCREEN_LIVE_ROW_H,
+  boxSizing: "border-box",
+};
+
+const SCREEN_LIVE_MEDAL = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  fontSize: "var(--eley-screen-qcm-option)",
+  lineHeight: 1,
+};
+
+const SCREEN_LIVE_NAME = {
+  fontSize: "var(--eley-screen-text-question)",
+  fontWeight: 700,
+  textAlign: "left",
+  minWidth: 0,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const SCREEN_LIVE_PTS = {
+  fontVariantNumeric: "tabular-nums",
+  fontWeight: 800,
+  fontSize: "var(--eley-screen-countdown-label)",
+  textAlign: "right",
+  paddingLeft: 16,
+  flexShrink: 0,
+  whiteSpace: "nowrap",
+};
+
+/** Emplacement fixe sous la barre de temps — évite que la question remonte quand les 3 premiers arrivent */
+const SCREEN_LIVE_SLOT = {
+  width: "100%",
+  minHeight: 28 + 4 + 3 * SCREEN_LIVE_ROW_H + 2 * 4,
+  marginTop: 4,
+  flexShrink: 0,
+};
+
+function ScreenQuestionLiveSlot({ liveFirsts, playersById, scoringTable, captionText }) {
+  return (
+    <div style={SCREEN_LIVE_SLOT} aria-live="polite">
+      <div style={{ minHeight: "1.35em", marginBottom: 4 }}>
+        {liveFirsts.length > 0 ? <div style={SCREEN_LIVE_CAPTION}>{captionText}</div> : null}
+      </div>
+      <div style={{ display: "grid", gap: 4, width: "100%" }}>
+        {[0, 1, 2].map((idx) => {
+          const e = liveFirsts[idx];
+          if (!e) {
+            return (
+              <div
+                key={`live-slot-${idx}`}
+                style={{ ...podiumCardStyle, ...SCREEN_LIVE_ROW, visibility: "hidden" }}
+                aria-hidden="true"
+              >
+                <span style={SCREEN_LIVE_MEDAL}>🥇</span>
+                <span style={SCREEN_LIVE_NAME}>—</span>
+                <span style={SCREEN_LIVE_PTS}>+0 pts</span>
+              </div>
+            );
+          }
+          const rank = idx + 1;
+          const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : "🥉";
+          const pts = scoringTable[idx] ?? 0;
+          const name = playersById[e.playerId]?.name || "(…)";
+
+          return (
+            <div
+              key={e.playerId}
+              style={{
+                ...podiumCardStyle,
+                ...SCREEN_LIVE_ROW,
+              }}
+            >
+              <span style={SCREEN_LIVE_MEDAL}>{medal}</span>
+              <b style={SCREEN_LIVE_NAME}>{name}</b>
+              <span style={SCREEN_LIVE_PTS}>+{pts} pts</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+const SCREEN_TITLE_XL = {
+  fontSize: "var(--eley-screen-title-xl)",
+  fontWeight: 800,
+  marginTop: 6,
+  marginBottom: 8,
+  lineHeight: 1.12,
+  color: PAGE_TEXT,
+};
+
+const SCREEN_TITLE_LG = {
+  fontSize: "var(--eley-screen-title-lg)",
+  fontWeight: 800,
+  margin: 0,
+  lineHeight: 1.15,
+  color: PAGE_TEXT,
+};
+
+const SCREEN_TITLE_MD = {
+  fontSize: "var(--eley-screen-title-md)",
+  fontWeight: 700,
+  marginTop: 10,
+  marginBottom: 8,
+  lineHeight: 1.2,
+  color: PAGE_TEXT,
+};
+
+const SCREEN_PODIUM_WIDTH = "min(460px, 82%)";
+
+const SCREEN_PODIUM_CAPTION = {
+  fontSize: "var(--eley-screen-title-md)",
+  fontWeight: 700,
+  margin: 0,
+  marginBottom: 8,
+  lineHeight: 1.2,
+  color: PAGE_TEXT,
+  width: SCREEN_PODIUM_WIDTH,
+  maxWidth: "100%",
+  alignSelf: "center",
+  display: "flex",
+  justifyContent: "center",
+  boxSizing: "border-box",
+};
+
+/** Préfixe commun + suffixe variable — « Voici… » au même endroit, phrase centrée sur le podium */
+function splitSharedPodiumCaption(teamsText, playersText) {
+  const a = String(teamsText ?? "").trim();
+  const b = String(playersText ?? "").trim();
+  let i = 0;
+  const minLen = Math.min(a.length, b.length);
+  while (i < minLen && a[i] === b[i]) i += 1;
+  const prefix = a.slice(0, i).trimEnd();
+  const teamsSuffix = a.slice(i).trimStart();
+  const playersSuffix = b.slice(i).trimStart();
+  return {
+    prefix,
+    teamsSuffix,
+    playersSuffix,
+    shared: prefix.length >= 3 && (teamsSuffix.length > 0 || playersSuffix.length > 0),
+  };
+}
+
+function ScreenPodiumCaption({ teamsText, playersText, view }) {
+  const parts = useMemo(
+    () => splitSharedPodiumCaption(teamsText, playersText),
+    [teamsText, playersText]
+  );
+  const activeText = view === "teams" ? teamsText : playersText;
+
+  if (!parts.shared) {
+    return (
+      <h2 style={SCREEN_PODIUM_CAPTION}>
+        <span style={{ whiteSpace: "nowrap" }}>{activeText}</span>
+      </h2>
+    );
+  }
+
+  return (
+    <h2 style={SCREEN_PODIUM_CAPTION}>
+      <span
+        style={{
+          whiteSpace: "nowrap",
+          display: "inline-flex",
+          alignItems: "baseline",
+          gap: "0.22em",
+        }}
+      >
+        <span>{parts.prefix}</span>
+        <span style={{ display: "inline-grid" }}>
+          <span style={{ gridArea: "1/1", visibility: view === "teams" ? "visible" : "hidden" }}>
+            {parts.teamsSuffix}
+          </span>
+          <span style={{ gridArea: "1/1", visibility: view === "players" ? "visible" : "hidden" }}>
+            {parts.playersSuffix}
+          </span>
+        </span>
+      </span>
+    </h2>
+  );
+}
+
+const SCREEN_RANKING_TITLE_TEAMS = "Classement des équipes";
+const SCREEN_RANKING_TITLE_PLAYERS = "Classement des joueurs";
+
+function ScreenRankingTeamStarIcon() {
+  return (
+    <svg width={15} height={15} viewBox="0 0 24 24" aria-hidden="true" style={{ flexShrink: 0, display: "block" }}>
+      <path
+        fill={BRAND.orangeLight}
+        d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"
+      />
+    </svg>
+  );
+}
+
+function ScreenRankingPlayerHeadIcon() {
+  return (
+    <svg width={15} height={15} viewBox="0 0 24 24" aria-hidden="true" style={{ flexShrink: 0, display: "block" }}>
+      <path
+        fill={BRAND.yellow}
+        d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"
+      />
+    </svg>
+  );
+}
+
+/** Titre classement latéral — icône + suffixe fixe (équipes / joueurs) */
+function ScreenRankingAsideTitle({ view }) {
+  const parts = useMemo(
+    () => splitSharedPodiumCaption(SCREEN_RANKING_TITLE_TEAMS, SCREEN_RANKING_TITLE_PLAYERS),
+    []
+  );
+
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      {view === "teams" ? <ScreenRankingTeamStarIcon /> : <ScreenRankingPlayerHeadIcon />}
+      <span
+        style={{
+          whiteSpace: "nowrap",
+          display: "inline-flex",
+          alignItems: "baseline",
+          gap: "0.22em",
+        }}
+      >
+        <span>{parts.prefix}</span>
+        <span style={{ display: "inline-grid" }}>
+          <span style={{ gridArea: "1/1", visibility: view === "teams" ? "visible" : "hidden" }}>
+            {parts.teamsSuffix}
+          </span>
+          <span style={{ gridArea: "1/1", visibility: view === "players" ? "visible" : "hidden" }}>
+            {parts.playersSuffix}
+          </span>
+        </span>
+      </span>
+    </span>
+  );
+}
+
+/** Podium central + légende + note — identique fin de manche / fin de quiz */
+function ScreenPodiumContent({
+  view,
+  captionTeamsText,
+  captionPlayersText,
+  podium,
+  scoreKey = "score",
+  emptyMessage,
+  footnote,
+}) {
+  return (
+    <>
+      <ScreenPodiumCaption
+        teamsText={captionTeamsText}
+        playersText={captionPlayersText}
+        view={view}
+      />
+      <PodiumPanel
+        podium={podium}
+        view={view}
+        scoreKey={scoreKey}
+        size="screen"
+        emptyMessage={emptyMessage}
+      />
+      {footnote ? <div style={SCREEN_PODIUM_FOOTNOTE}>{footnote}</div> : null}
+    </>
+  );
+}
+
+const SCREEN_FOOTNOTE = {
+  opacity: 0.85,
+  marginTop: 10,
+  fontSize: "var(--eley-screen-footnote)",
+  lineHeight: 1.45,
+  maxWidth: SCREEN_PODIUM_WIDTH,
+  color: PAGE_TEXT,
+};
+
+/** Note sous le podium — alignée à gauche sur la même largeur que PodiumPanel (screen) */
+const SCREEN_PODIUM_FOOTNOTE = {
+  ...SCREEN_FOOTNOTE,
+  width: SCREEN_PODIUM_WIDTH,
+  maxWidth: "100%",
+  alignSelf: "center",
+  textAlign: "left",
+  boxSizing: "border-box",
+};
+
+/** Classement latéral — même grille équipes / joueurs (réf. vue équipes) */
+const SCREEN_LB_ROW = {
+  gridTemplateColumns: "28px 1fr auto",
+  gap: 8,
+  padding: "8px 10px",
+  minHeight: 40,
+  boxSizing: "border-box",
+};
+const SCREEN_LB_DOT = { width: 10, height: 10, borderRadius: 3, flex: "0 0 auto" };
+const SCREEN_LB_TRAIL_ICON = {
+  width: 28,
+  minWidth: 28,
+  flexShrink: 0,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  fontSize: 20,
+  lineHeight: 1,
+};
+
+function screenRoundTitle(endOfRoundLabel, roundIndex) {
+  const base = String(endOfRoundLabel || "Fin de la manche").trim();
+  const n = roundIndex != null ? roundIndex + 1 : "";
+  return n ? `${base} ${n}` : base;
+}
+
+function ScreenMultiline({ text, as: Tag = "span", style }) {
+  const parts = String(text ?? "").split("\n");
+  return (
+    <Tag style={style}>
+      {parts.map((line, i) => (
+        <span key={i}>
+          {line}
+          {i < parts.length - 1 ? <br /> : null}
+        </span>
+      ))}
+    </Tag>
+  );
+}
 
 // Panneau "Rejoindre" (inline)
 function JoinPanelInline({ size = "md", joinUrl }) {
-  const imgSize = size === "lg" ? 320 : 160;
+  const isScreenTop = size === "screenTop";
+  const isLg = size === "lg";
+  const qrMax = isLg ? 320 : isScreenTop ? 210 : 160;
   const panelStyle = {
-    marginTop: 0, // évite le décalage dans le cadre
-    width: size === "lg" ? "100%" : 320,
+    marginTop: 0,
+    width: isScreenTop ? "max-content" : isLg ? "100%" : 320,
+    maxWidth: isScreenTop ? "100%" : undefined,
     boxSizing: "border-box",
-    padding: 12,
-    borderRadius: 12,
-    background: "rgba(15, 35, 74, 0.92)",
-    boxShadow: "0 2px 12px rgba(0,0,0,0.25)",
-    color: "#e6eeff",
+    padding: isScreenTop ? SCREEN_QR_INSET : 12,
+    ...cardStyle,
+    boxShadow: "0 2px 12px rgba(13, 5, 37, 0.12)",
+    color: BRAND.mauveDark,
+    fontFamily: FONT_FAMILY,
     display: "flex",
     flexDirection: "column",
     alignItems: "center",
@@ -70,8 +636,26 @@ function JoinPanelInline({ size = "md", joinUrl }) {
   };
   return (
     <div style={panelStyle} aria-hidden="true">
-      <div style={{ fontWeight: 700, marginBottom: 6 }}>Rejoindre :</div>
-      <div style={{ fontFamily: "monospace", fontSize: 16, userSelect: "all" }}>
+      <div
+        style={{
+          fontWeight: 700,
+          marginBottom: isScreenTop ? 4 : 6,
+          fontSize: isScreenTop ? 13 : undefined,
+          maxWidth: isScreenTop ? qrMax : undefined,
+        }}
+      >
+        Rejoindre :
+      </div>
+      <div
+        style={{
+          fontFamily: "monospace",
+          fontSize: isScreenTop ? 11 : 16,
+          userSelect: "all",
+          lineHeight: 1.35,
+          wordBreak: "break-all",
+          maxWidth: isScreenTop ? qrMax : undefined,
+        }}
+      >
         {joinUrl}
       </div>
       <img
@@ -79,9 +663,9 @@ function JoinPanelInline({ size = "md", joinUrl }) {
         alt=""
         style={{
           display: "block",
-          marginTop: 10,
-          width: "100%",
-          maxWidth: 320,
+          marginTop: isScreenTop ? 7 : 10,
+          width: isScreenTop ? qrMax : "100%",
+          maxWidth: isScreenTop ? qrMax : qrMax,
           height: "auto",
         }}
       />
@@ -89,18 +673,84 @@ function JoinPanelInline({ size = "md", joinUrl }) {
   );
 }
 
+function ScreenTopImage({ imageUrl }) {
+  if (!imageUrl) return null;
+
+  const imgWidth = "min(58vw, 420px)";
+  const imgHeight = "clamp(230px, 32vh, 400px)";
+
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        position: "fixed",
+        left: SCREEN_IMAGE_EDGE_LEFT,
+        top: SCREEN_IMAGE_EDGE_TOP,
+        zIndex: 0,
+        pointerEvents: "none",
+      }}
+    >
+      <div
+        style={{
+          background: IMAGE_FRAME_BG,
+          padding: 3,
+          boxSizing: "border-box",
+          boxShadow:
+            "0 0 32px 16px rgba(0, 0, 0, 0.62), 0 0 64px 32px rgba(0, 0, 0, 0.38)",
+        }}
+      >
+        <img
+          src={imageUrl}
+          alt=""
+          style={{
+            display: "block",
+            width: imgWidth,
+            maxWidth: "100vw",
+            height: imgHeight,
+            objectFit: "cover",
+            border: "none",
+            borderRadius: 0,
+            verticalAlign: "top",
+          }}
+          loading="lazy"
+          decoding="async"
+        />
+      </div>
+    </div>
+  );
+}
+
+function ScreenBottomQr({ joinUrl }) {
+  return (
+    <aside
+      aria-label="QR code — rejoindre le quiz"
+      style={{
+        position: "fixed",
+        left: SCREEN_CORNER_LEFT,
+        bottom: SCREEN_CORNER_BOTTOM,
+        zIndex: 2,
+        maxWidth: "clamp(240px, 24vw, 320px)",
+        pointerEvents: "auto",
+      }}
+    >
+      <JoinPanelInline size="screenTop" joinUrl={joinUrl} />
+    </aside>
+  );
+}
+
+function ScreenSideDecor({ leftImageUrl, joinUrl }) {
+  return (
+    <>
+      <ScreenTopImage imageUrl={leftImageUrl} />
+      <ScreenBottomQr joinUrl={joinUrl} />
+    </>
+  );
+}
+
 
 // Splash (plein bleu foncé au boot)
 function Splash() {
-  return (
-    <div
-      style={{
-        minHeight: "calc(var(--vh, 1vh) * 100)",
-        background: "#0a0a1a",
-      }}
-      aria-hidden="true"
-    />
-  );
+  return <BrandShell aria-hidden="true" />;
 }
 
 // ============================================================================
@@ -125,7 +775,8 @@ function ScreenInner() {
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
   const lastNavSeqRef = useRef(null);
-  const uiFreezeUntilRef = useRef(0);
+  const uiMaskTimerRef = useRef(null);
+  const [uiMasked, setUiMasked] = useState(false);
 
   // Flags de chargement
   const [stateLoaded, setStateLoaded] = useState(false);
@@ -150,9 +801,10 @@ function ScreenInner() {
   // Image optionnelle au-dessus du QR (config: screenLeftImageUrl)
   const [leftImageUrl, setLeftImageUrl] = useState(null);
 
-  // Messages personnalisables
-  const [podiumTitle, setPodiumTitle] = useState(SCREEN_MESSAGES.podiumTitle);
-  const [finalPodiumTitle, setFinalPodiumTitle] = useState(SCREEN_MESSAGES.finalPodiumTitle);
+  // Messages personnalisables (Firestore /quiz/config → messages)
+  const [screenAttenteMessages, setScreenAttenteMessages] = useState(SCREEN_PAGE_ATTENTE);
+  const [screenQuizMessages, setScreenQuizMessages] = useState(SCREEN_PAGE_QUIZ);
+  const [screenPodiumMessages, setScreenPodiumMessages] = useState(SCREEN_PAGE_PODIUM);
   const [screenEleyBuzzMessages, setScreenEleyBuzzMessages] = useState(ELEYBUZZ_SCREEN_MESSAGES);
 
   // Leaderboard
@@ -354,24 +1006,23 @@ function ScreenInner() {
       );
 
       // Messages personnalisables depuis Firestore
-      const customPodiumTitle = typeof d?.screenQuiz?.podiumTitle === "string" && d.screenQuiz.podiumTitle.trim() !== ""
-        ? d.screenQuiz.podiumTitle
-        : SCREEN_MESSAGES.podiumTitle;
-      setPodiumTitle(customPodiumTitle);
-      const customFinalPodiumTitle = typeof d?.screenQuiz?.finalPodiumTitle === "string" && d.screenQuiz.finalPodiumTitle.trim() !== ""
-        ? d.screenQuiz.finalPodiumTitle
-        : SCREEN_MESSAGES.finalPodiumTitle;
-      setFinalPodiumTitle(customFinalPodiumTitle);
-      
-      // Messages EleyBuzz Screen
-      if (d.screenEleyBuzz) {
-        setScreenEleyBuzzMessages({
-          ...ELEYBUZZ_SCREEN_MESSAGES,
-          ...d.screenEleyBuzz,
-        });
-      } else {
-        setScreenEleyBuzzMessages(ELEYBUZZ_SCREEN_MESSAGES);
-      }
+      setScreenAttenteMessages(mergePageMessages(SCREEN_PAGE_ATTENTE, {
+        ...d.screenAttente,
+        title: d.screenAttente?.title ?? d.screenQuiz?.preStartTitle,
+        message: d.screenAttente?.message ?? d.screenQuiz?.preStartMessage,
+      }));
+      setScreenQuizMessages(mergePageMessages(SCREEN_PAGE_QUIZ, {
+        ...d.screenQuizPage,
+        pauseTitle: d.screenQuizPage?.pauseTitle ?? d.screenQuiz?.pauseTitle,
+        pauseSubtitle: d.screenQuizPage?.pauseSubtitle ?? d.screenQuiz?.pauseSubtitle,
+      }));
+      setScreenPodiumMessages(mergePageMessages(SCREEN_PAGE_PODIUM, {
+        ...d.screenPodium,
+        endOfRound: d.screenPodium?.endOfRound ?? d.screenQuizPage?.endOfRound ?? d.screenQuiz?.endOfRound,
+        podiumTitle: d.screenPodium?.podiumTitle ?? d.screenQuiz?.podiumTitle,
+        finalPodiumTitle: d.screenPodium?.finalPodiumTitle ?? d.screenQuiz?.finalPodiumTitle,
+      }));
+      setScreenEleyBuzzMessages(mergePageMessages(ELEYBUZZ_SCREEN_MESSAGES, d.screenEleyBuzz));
 
       setConfigLoaded(true);
     });
@@ -418,7 +1069,12 @@ function ScreenInner() {
       const nextNavSeq = Number.isFinite(d.navSeq) ? d.navSeq : null;
       if (nextNavSeq != null && nextNavSeq !== lastNavSeqRef.current) {
         lastNavSeqRef.current = nextNavSeq;
-        uiFreezeUntilRef.current = performance.now() + UI_MASK_MS;
+        if (uiMaskTimerRef.current) clearTimeout(uiMaskTimerRef.current);
+        setUiMasked(true);
+        uiMaskTimerRef.current = setTimeout(() => {
+          setUiMasked(false);
+          uiMaskTimerRef.current = null;
+        }, UI_MASK_MS);
       }
 
       // Delta d’horloge locale ← serveur (via heartbeat Admin)
@@ -482,6 +1138,10 @@ function ScreenInner() {
       setStateLoaded(true);
     });
     return () => unsub();
+  }, []);
+
+  useEffect(() => () => {
+    if (uiMaskTimerRef.current) clearTimeout(uiMaskTimerRef.current);
   }, []);
 
   /* ------------------- Timer local (avec clamp fin de quiz) ------------------- */
@@ -631,6 +1291,7 @@ function ScreenInner() {
             id: t.id,
             name: t.name || "",
             score: scoreQuiz,
+            color: t.color || null,
             _nameKey: normalizeNameAlpha(t.name || ""),
           };
         })
@@ -721,6 +1382,7 @@ function ScreenInner() {
             id: t.id,
             name: t.name || "",
             scoreFinal: scoreFinal,
+            color: t.color || null,
             _nameKey: normalizeNameAlpha(t.name || ""),
           };
         })
@@ -846,15 +1508,13 @@ function ScreenInner() {
     }
   }
 
-  const uiMasked = performance.now() < uiFreezeUntilRef.current;
-
   // Prochaine frontière de manche (−GAP pour éviter chevauchement reveal)
   const GAP = 1;
   const nextRoundStart = nextRoundStartAfter(elapsedSec, roundOffsetsSec);
   const nextRoundBoundary = Number.isFinite(nextRoundStart) ? Math.max(0, nextRoundStart - GAP) : null;
 
   // Fenêtre morte à ± ~1s autour de la frontière
-  const ROUND_DEADZONE_SEC = 1;
+  const ROUND_DEADZONE_SEC = ROUND_BOUNDARY_GAP_SEC;
   const secondsToRoundBoundary = Number.isFinite(nextRoundStart) ? nextRoundStart - elapsedSec : null;
   const inRoundBoundaryWindow =
     !uiMasked &&
@@ -1137,14 +1797,23 @@ function ScreenInner() {
     ? Math.max(1, Math.min(countdownStartSec, Math.ceil(secondsToNext)))
     : null;
 
-  let countdownLabel = "Prochaine question dans :";
-  if (nextKind === "end") countdownLabel = "Fin du quiz dans :";
+  let countdownLabel = screenQuizMessages.nextQuestionIn;
+  if (nextKind === "end") countdownLabel = screenQuizMessages.endOfQuizIn;
   if (nextKind === "round") {
     const endingIdx = Number.isFinite(nextEvent)
       ? roundIndexOfTime(Math.max(0, nextEvent - 0.001), roundOffsetsSec)
       : null;
-    countdownLabel = `Fin de la manche ${endingIdx != null ? endingIdx + 1 : ""} dans :`;
+    const base = screenQuizMessages.endOfRoundIn || screenPodiumMessages.endOfRound;
+    countdownLabel = `${base} ${endingIdx != null ? endingIdx + 1 : ""} dans :`;
   }
+
+  /** Évite le flash « Fin de manche + transition » entre le « 1 » et le podium */
+  const holdRoundBoundaryCountdown =
+    !uiMasked && inRoundBoundaryWindow && !isRoundBreak && !isPaused;
+  const showCountdownUi = Boolean(isCountdownPhase || holdRoundBoundaryCountdown);
+  const displayCountdownSec = holdRoundBoundaryCountdown
+    ? 1
+    : countdownSec;
 
   // Barre de progression
   const qEndLocal = nextEvent != null ? nextEvent - revealDurationSec : null;
@@ -1155,11 +1824,7 @@ function ScreenInner() {
     ? Math.min(1, Math.max(0, (elapsedSec - qStartEffective) / (qEndLocal - qStartEffective)))
     : 0;
 
-  // Phrases de révélation & réponse principale
-  const revealPhrase = useMemo(
-    () => (currentQuestion ? pickRevealPhrase(currentQuestion) : ""),
-    [currentQuestionId]
-  );
+  // Réponse principale affichée au reveal
   const primaryAnswer = useMemo(() => {
     const a = currentQuestion?.answers;
     return Array.isArray(a) && a.length ? String(a[0]) : "";
@@ -1396,18 +2061,18 @@ function ScreenInner() {
   // Largeur bornée + retours à la ligne + descente légère
   // Aligné avec Player pour cohérence
   const screenQuestionStyle = {
-    fontSize: "clamp(1.1rem, 4.2vw, 1.45rem)", // Même taille que Player
-    lineHeight: 1.5,
+    ...questionTextStyle,
+    fontSize: "var(--eley-screen-text-question)",
+    fontWeight: 800,
+    lineHeight: 1.25,
+    maxWidth: "min(920px, 95%)",
+  };
+
+  const screenRevealAnswerStyle = {
+    ...screenQuestionStyle,
     margin: 0,
-    marginTop: 6,
-    maxWidth: "min(600px, 95%)", // Même largeur que Player
-    marginLeft: "auto",
-    marginRight: "auto",
-    overflowWrap: "break-word", // Moins agressif que "anywhere"
-    wordBreak: "normal", // Évite de couper les mots au milieu
-    hyphens: "auto",
-    textAlign: "center", // Centré comme demandé
-    letterSpacing: "0.01em", // Légère augmentation pour meilleure lisibilité
+    fontSize: "var(--eley-screen-text-reveal-answer)",
+    color: BRAND.yellow,
   };
 
 
@@ -1434,65 +2099,10 @@ function ScreenInner() {
     );
 
     return (
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "row",
-          background: "#000814",
-          color: "white",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          position: "relative",
-        }}
+      <BrandShell
+        style={SCREEN_SHELL_STYLE}
       >
-        {/* Colonne gauche : image optionnelle + QR */}
-        <aside
-          aria-label="Infos & QR"
-          style={{
-            position: "relative",
-            width: 360,
-            maxWidth: "clamp(280px, 30vw, 400px)",
-            maxHeight: "calc(100vh - 24px)",
-            background: "#081224",
-            border: "1px solid #1f2a44",
-            borderRadius: 12,
-            padding: 12,
-            margin: 12,
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-            alignSelf: "flex-start",
-            overflowY: "auto",
-            overflowX: "hidden",
-          }}
-        >
-          {leftImageUrl && (
-            <div
-              style={{
-                borderRadius: 10,
-                overflow: "hidden",
-                border: "1px solid #1f2a44",
-                background: "#0b0f1a",
-                flexShrink: 0,
-              }}
-            >
-              <img
-                src={leftImageUrl}
-                alt=""
-                style={{
-                  display: "block",
-                  width: "100%",
-                  height: "clamp(200px, 25vh, 300px)",
-                  objectFit: "cover",
-                }}
-                loading="lazy"
-                decoding="async"
-              />
-            </div>
-          )}
-          <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-            <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
-          </div>
-        </aside>
+        <ScreenSideDecor leftImageUrl={leftImageUrl} joinUrl={playerJoinUrl} />
 
         {/* Colonne centrale : Contenu EleyBuzz */}
         <div
@@ -1505,16 +2115,17 @@ function ScreenInner() {
             justifyContent: "center",
             gap: 24,
             textAlign: "center",
+            fontFamily: FONT_FAMILY,
           }}
         >
-          <h1 style={{ fontSize: "3rem", fontWeight: 800, margin: 0 }}>
+          <h1 style={{ fontSize: "clamp(1.5rem, 5vw, 2.2rem)", fontWeight: 800, margin: 0 }}>
             ⚡ EleyBuzz ⚡
           </h1>
 
           {/* État du buzzer — masqué pendant le message « bravo » */}
           {!showingCorrectMessage && buzzerState === BUZZER_STATES.IDLE && (
             <div 
-              style={{ fontSize: "1.5rem", opacity: 0.85, maxWidth: "min(800px, 90%)" }}
+              style={{ fontSize: "clamp(0.95rem, 3.5vw, 1.2rem)", maxWidth: "min(800px, 90%)", ...pageTextSecondary }}
               dangerouslySetInnerHTML={{ 
                 __html: addSmartLineBreaks(screenEleyBuzzMessages.idle)
                   .replace(/\.\s+/g, ".<br>")
@@ -1523,17 +2134,17 @@ function ScreenInner() {
           )}
 
           {!showingCorrectMessage && buzzerState === BUZZER_STATES.OPEN && (
-            <div style={{ fontSize: "1.5rem", opacity: 0.85, color: "#3b82f6", fontWeight: 700 }}>
+            <div style={{ fontSize: "clamp(1rem, 3.5vw, 1.25rem)", color: BRAND.blue, fontWeight: 700 }}>
               Le buzzer est ouvert, préparez-vous à buzzer !
             </div>
           )}
 
           {!showingCorrectMessage && buzzerState === BUZZER_STATES.LOCKED && buzzerWinnerName && (
             <div>
-              <div style={{ fontSize: "2rem", fontWeight: 800, marginBottom: 8, color: "#facc15" }}>
+              <div style={{ fontSize: "clamp(1.2rem, 4vw, 1.6rem)", fontWeight: 800, marginBottom: 8, color: BRAND.yellow, textShadow: `0 0 1px ${BRAND.mauveDark}` }}>
                 {buzzerWinnerName} {screenEleyBuzzMessages.locked}
               </div>
-              <div style={{ fontSize: "1.2rem", opacity: 0.85 }}>
+              <div style={{ fontSize: "clamp(0.95rem, 3vw, 1.1rem)", ...pageTextSecondary }}>
                 {screenEleyBuzzMessages.waitingAnswer}
               </div>
             </div>
@@ -1543,13 +2154,11 @@ function ScreenInner() {
           {showingCorrectMessage && (
             <div
               style={{
-                fontSize: "2.5rem",
+                fontSize: "clamp(1.2rem, 4vw, 1.8rem)",
                 fontWeight: 800,
-                padding: "20px 40px",
+                padding: "16px 28px",
                 borderRadius: 12,
-                background: "#0b3a1e",
-                border: "2px solid #22c55e",
-                color: "#86efac",
+                ...badgeSuccess,
                 animation: "fadeIn 200ms ease-in",
               }}
             >
@@ -1565,9 +2174,7 @@ function ScreenInner() {
             width: 320,
             maxWidth: "clamp(280px, 30vw, 400px)",
             maxHeight: "calc(100vh - 24px)",
-            background: "#0b0f1a",
-            border: "1px solid #1f2a44",
-            borderRadius: 12,
+            ...asidePanelStyle,
             padding: "12px 12px 8px 12px",
             margin: 12,
             overflow: "hidden",
@@ -1579,7 +2186,7 @@ function ScreenInner() {
         >
           <div>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, letterSpacing: 0.2, color: BRAND.mauveDark }}>
                 ⚡ EleyBuzz ⚡
               </h3>
             </div>
@@ -1590,8 +2197,8 @@ function ScreenInner() {
                 marginTop: 6,
                 height: 3,
                 borderRadius: 9999,
-                background: "#0f172a",
-                border: "1px solid #2a488fff",
+                background: BRAND.blue,
+                border: `1px solid ${BRAND.mauveDark}`,
               }}
             />
           </div>
@@ -1619,8 +2226,8 @@ function ScreenInner() {
                       alignItems: "center",
                       gap: 8,
                       padding: "8px 10px",
-                      borderBottom: "1px solid #16233b",
-                      background: rank <= 3 ? "#1f2937" : "transparent",
+                      borderBottom: `1px solid ${BRAND.mauveLight}`,
+                      background: rank <= 3 ? "rgba(254, 237, 106, 0.15)" : "transparent",
                     }}
                   >
                     <div style={{ textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
@@ -1648,7 +2255,7 @@ function ScreenInner() {
                         fontWeight: 800,
                         fontVariantNumeric: "tabular-nums",
                         letterSpacing: 0.2,
-                        color: "#facc15",
+                        color: BRAND.yellow,
                       }}
                       aria-label="score"
                       title={`${p.buzzScore} points`}
@@ -1660,12 +2267,12 @@ function ScreenInner() {
               })
             ) : (
               <div style={{ opacity: 0.7, padding: 12, textAlign: "center" }}>
-                Aucun joueur.
+                {screenPodiumMessages.noPlayers}
               </div>
             )}
           </div>
         </aside>
-      </div>
+      </BrandShell>
     );
   }
 
@@ -1674,146 +2281,32 @@ function ScreenInner() {
   // ============================================================================
   if (showFinalScore) {
     return (
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "row",
-          background: "#000814",
-          color: "white",
-          minHeight: "calc(var(--vh, 1vh) * 100)",
-          position: "relative",
-        }}
+      <BrandShell
+        style={SCREEN_SHELL_STYLE}
       >
-        {/* Colonne gauche : image optionnelle + QR (conservée) */}
-        <aside
-          aria-label="Infos & QR"
-          style={{
-            position: "relative",
-            width: 360,
-            maxWidth: "clamp(280px, 30vw, 400px)",
-            maxHeight: "calc(100vh - 24px)",
-            background: "#081224",
-            border: "1px solid #1f2a44",
-            borderRadius: 12,
-            padding: 12,
-            margin: 12,
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-            alignSelf: "flex-start",
-            overflowY: "auto",
-            overflowX: "hidden",
-          }}
-        >
-          {leftImageUrl && (
-            <div
-              style={{
-                borderRadius: 10,
-                overflow: "hidden",
-                border: "1px solid #1f2a44",
-                background: "#0b0f1a",
-                flexShrink: 0,
-              }}
-            >
-              <img
-                src={leftImageUrl}
-                alt=""
-                style={{
-                  display: "block",
-                  width: "100%",
-                  height: "clamp(200px, 25vh, 300px)",
-                  objectFit: "cover",
-                }}
-                loading="lazy"
-                decoding="async"
-              />
-            </div>
+        <ScreenSideDecor leftImageUrl={leftImageUrl} joinUrl={playerJoinUrl} />
+
+        <div style={SCREEN_MAIN_COLUMN}>
+          <ScreenPodiumBlock opticalShift title={(
+            <ScreenMultiline
+              as="h1"
+              text={screenPodiumMessages.finalEveningTitle}
+              style={SCREEN_TITLE_XL}
+            />
           )}
-          <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-            <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
-          </div>
-        </aside>
-
-        {/* Colonne principale : Podium Final */}
-        <div
-          style={{
-            flex: 1,
-            padding: "40px 24px",
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            gap: 12,
-            textAlign: "center",
-          }}
-        >
-          <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>Fin de la soirée, Voici le podium final :</h1>
-
-          {finalPodium.gold.length + finalPodium.silver.length + finalPodium.bronze.length === 0 ? (
-            <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
-              Aucun point n'a été marqué. Merci à tous pour votre participation !
-            </div>
-          ) : (
-            <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
-              {/* 🥇 Or / ⭐ Or — 2× plus gros */}
-              {finalPodium.gold.length > 0 && (
-                <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>
-                    {leaderboardView === "teams" ? "🥇" : "💛"} Or
-                  </div>
-                  {finalPodium.gold.map((p) => (
-                    <div
-                      key={p.id}
-                      style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
-                    >
-                      <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
-                      <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
-                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>
-                        {p.scoreFinal} pts
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* 🥈 Argent / ⭐ Argent */}
-              {finalPodium.silver.length > 0 && (
-                <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                    {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
-                  </div>
-                  {finalPodium.silver.map((p) => (
-                    <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                      <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                      <span style={{ opacity: 0.85 }}>•</span>
-                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                        {p.scoreFinal} pts
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* 🥉 Bronze / ⭐ Bronze */}
-              {finalPodium.bronze.length > 0 && (
-                <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                    {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
-                  </div>
-                  {finalPodium.bronze.map((p) => (
-                    <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                      <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                      <span style={{ opacity: 0.85 }}>•</span>
-                      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                        {p.scoreFinal} pts
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          >
+            <ScreenPodiumContent
+              view={leaderboardView}
+              captionTeamsText={screenPodiumMessages.finalPodiumTeams}
+              captionPlayersText={screenPodiumMessages.finalPodiumPlayers}
+              podium={finalPodium}
+              scoreKey="scoreFinal"
+              emptyMessage={screenPodiumMessages.noPoints}
+              footnote={screenPodiumMessages.quizEndThanks}
+            />
+          </ScreenPodiumBlock>
         </div>
-      </div>
+      </BrandShell>
     );
   }
 
@@ -1822,565 +2315,307 @@ function ScreenInner() {
   // ============================================================================
   if (showPreStart) {
     return (
-      <div style={{
-        background: "#000814", color: "#fff", minHeight: "calc(var(--vh, 1vh) * 100)",
-        display: "grid", placeItems: "center", padding: "24px", textAlign: "center"
-      }}>
+      <BrandShell
+        style={SCREEN_SHELL_STYLE}
+      >
+        <ScreenSideDecor leftImageUrl={leftImageUrl} joinUrl={playerJoinUrl} />
         <div
           style={{
-            width: 360,
-            maxWidth: "90vw",
+            flex: 1,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
+            justifyContent: "center",
+            padding: "24px",
             textAlign: "center",
           }}
         >
-          <h1 style={{ fontSize: "2rem", fontWeight: 800, margin: 0 }}>
-            EleyBox<br />Écran en attente
-          </h1>
-          <p style={{ opacity: 0.8, marginTop: 12 }}>
-            Le quiz n'a pas encore commencé.<br />Préparez-vous…
-          </p>
-          <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
+          <ScreenMultiline
+            as="h1"
+            text={screenAttenteMessages.title}
+            style={{ ...SCREEN_TITLE_LG, marginBottom: 0 }}
+          />
+          <ScreenMultiline
+            as="p"
+            text={screenAttenteMessages.message}
+            style={{ ...pageTextSecondary, marginTop: 12 }}
+          />
         </div>
-      </div>
+      </BrandShell>
     );
   }
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "row",
-        background: "#000814",
-        color: "white",
-        minHeight: "calc(var(--vh, 1vh) * 100)",
-        position: "relative",
-      }}
-    >
+    <BrandShell style={SCREEN_SHELL_STYLE}>
       {/* Voile anti-flicker */}
       <div
         aria-hidden="true"
         style={{
           position: "fixed",
           inset: 0,
-          background: "#020617",
-          opacity: uiMasked ? 0.96 : 0,
+          background: "#000000",
+          opacity: uiMasked ? 1 : 0,
           transition: "opacity 120ms ease",
           pointerEvents: "none",
           zIndex: 50,
         }}
       />
 
-      {/* Colonne gauche : image optionnelle + QR */}
-      <aside
-        aria-label="Infos & QR"
-        style={{
-          position: "relative",
-          width: 360,
-          maxWidth: "clamp(280px, 30vw, 400px)",
-          maxHeight: "calc(100vh - 24px)",
-          background: "#081224",
-          border: "1px solid #1f2a44",
-          borderRadius: 12,
-          padding: 12,
-          margin: 12,
-          display: "flex",
-          flexDirection: "column",
-          gap: 10,
-          alignSelf: "flex-start",
-          overflowY: "auto",
-          overflowX: "hidden",
-        }}
+      <ScreenSideDecor leftImageUrl={leftImageUrl} joinUrl={playerJoinUrl} />
 
-      >
-        {/* Timecode overlay (haut-gauche) */}
-        <div
-          style={{
-            position: "absolute",
-            top: 10,
-            left: 10,
-            background: "rgba(17,17,17,0.9)",
-            padding: "6px 10px",
-            borderRadius: 8,
-            fontFamily: "monospace",
-            letterSpacing: 1,
-            border: "1px solid #2a2a2a",
-            zIndex: 2,
-          }}
-        >
-          ⏱ {formatHMS(elapsedSec)}
-        </div>
-
-        {leftImageUrl && (
-          <div
-            style={{
-              borderRadius: 10,
-              overflow: "hidden",
-              border: "1px solid #1f2a44",
-              background: "#0b0f1a",
-              flexShrink: 0,
-            }}
-          >
-            <img
-              src={leftImageUrl}
-              alt=""
-              style={{
-                display: "block",
-                width: "100%",
-                height: "clamp(200px, 25vh, 300px)",
-                objectFit: "cover",
-              }}
-              loading="lazy"
-              decoding="async"
-            />
-
-          </div>
-        )}
-        <div style={{ marginTop: "auto", paddingBottom: 0, flexShrink: 0 }}>
-          <JoinPanelInline size="lg" joinUrl={playerJoinUrl} />
-        </div>
-      </aside>
-
-      <div
-        style={{
-          flex: 1,
-          padding: "40px 24px",
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 12,
-          textAlign: "center",
-        }}
-      >
+      <div style={SCREEN_MAIN_COLUMN}>
         {isQuizEnded ? (
-          <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-            <h1 style={{ fontSize: "2.4rem", marginTop: 6, marginBottom: 8 }}>{podiumTitle}</h1>
-
-            {podium.gold.length + podium.silver.length + podium.bronze.length === 0 ? (
-              <div style={{ opacity: 0.85, fontSize: 18, marginTop: 6 }}>
-                Aucun point n’a été marqué. Merci à tous pour votre participation !
-              </div>
-            ) : (
-              <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 10 }}>
-                {/* 🥇 Or / 💛 Or — 2× plus gros */}
-                {podium.gold.length > 0 && (
-                  <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 40, fontWeight: 900, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥇" : "💛"} Or
-                    </div>
-                    {podium.gold.map((p) => (
-                      <div
-                        key={p.id}
-                        style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
-                      >
-                        <span style={{ fontWeight: 900, fontSize: 42 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85, fontSize: 26 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 42 }}>
-                          {p.score}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* 🥈 Argent / 🤍 Argent */}
-                {podium.silver.length > 0 && (
-                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
-                    </div>
-                    {podium.silver.map((p) => (
-                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.score}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* 🥉 Bronze / 🤎 Bronze */}
-                {podium.bronze.length > 0 && (
-                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
-                    </div>
-                    {podium.bronze.map((p) => (
-                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.score}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+          <ScreenPodiumBlock
+            opticalShift
+            title={<h1 style={SCREEN_TITLE_LG}>{screenPodiumMessages.endOfQuiz}</h1>}
+          >
+            <ScreenPodiumContent
+              view={leaderboardView}
+              captionTeamsText={screenPodiumMessages.finalPodiumTeams}
+              captionPlayersText={screenPodiumMessages.finalPodiumPlayers}
+              podium={podium}
+              scoreKey="score"
+              emptyMessage={screenPodiumMessages.noPoints}
+              footnote={screenPodiumMessages.quizEndThanks}
+            />
+          </ScreenPodiumBlock>
         ) : isRoundBreak ? (
-          <div style={{ marginTop: 8, marginBottom: 4, textAlign: "center" }}>
-            <h1 style={{ fontSize: "2rem", margin: 0 }}>
-              Fin de la manche {endedRoundIndex != null ? endedRoundIndex + 1 : ""}
-            </h1>
-
-            <h2 style={{ fontSize: "1.6rem", marginTop: 10, marginBottom: 6 }}>Podium provisoire :</h2>
-
-            {podium.gold.length + podium.silver.length + podium.bronze.length === 0 ? (
-              <div style={{ opacity: 0.85, fontSize: 16, marginTop: 6 }}>
-                Aucun point n’a été marqué pour l’instant.
-              </div>
-            ) : (
-              <div style={{ display: "grid", gap: 10, justifyContent: "center", marginTop: 8 }}>
-                {/* 🥇 Or / 💛 Or — 2× plus gros */}
-                {podium.gold.length > 0 && (
-                  <div style={{ background: "#0b1e3d", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥇" : "💛"} Or
-                    </div>
-                    {podium.gold.map((p) => (
-                      <div
-                        key={p.id}
-                        style={{ display: "flex", gap: 12, justifyContent: "center", alignItems: "baseline" }}
-                      >
-                        <span style={{ fontWeight: 900, fontSize: 28 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85, fontSize: 18 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 900, fontSize: 24 }}>{p.score}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* 🥈 Argent / 🤍 Argent */}
-                {podium.silver.length > 0 && (
-                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥈" : "🤍"} Argent
-                    </div>
-                    {podium.silver.map((p) => (
-                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.score}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* 🥉 Bronze / 🤎 Bronze */}
-                {podium.bronze.length > 0 && (
-                  <div style={{ background: "#0b0f1a", border: "1px solid #1f2a44", borderRadius: 10, padding: "10px 12px" }}>
-                    <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 6 }}>
-                      {leaderboardView === "teams" ? "🥉" : "🤎"} Bronze
-                    </div>
-                    {podium.bronze.map((p) => (
-                      <div key={p.id} style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-                        <span style={{ fontWeight: 800, fontSize: 14 }}>{p.name || "(sans nom)"}</span>
-                        <span style={{ opacity: 0.85 }}>•</span>
-                        <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 14 }}>
-                          {p.score}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+          <ScreenPodiumBlock
+            opticalShift
+            title={(
+              <h1 style={SCREEN_TITLE_LG}>
+                {screenRoundTitle(screenPodiumMessages.endOfRound, endedRoundIndex)}
+              </h1>
             )}
-
-            <div style={{ opacity: 0.8, marginTop: 10, fontSize: 14 }}>
-              … mais rien n’est joué encore.
-            </div>
-          </div>
-        ) : inRoundBoundaryWindow ? (
-          <div style={{ marginTop: 8, marginBottom: 4 }}>
-            <h1 style={{ fontSize: "2rem", margin: 0 }}>
-              Fin de la manche {boundaryRoundIndex != null ? boundaryRoundIndex + 1 : ""}
-            </h1>
-            <div style={{ opacity: 0.85, fontSize: 18, marginTop: 8 }}>(transition…)</div>
-          </div>
-        ) : isPaused ? (
-          <div style={{ marginTop: 8, marginBottom: 4 }}>
-            <h1 style={{ fontSize: "2rem", margin: 0 }}>On revient dans un instant…</h1>
-            <div style={{ opacity: 0.75, marginTop: 8, fontSize: 16 }}>
-              Le quiz est momentanément en pause.
-            </div>
-          </div>
-        ) : currentQuestion ? (
-          <>
-            {isRoundIntroPhase ? (
-              <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 6 }}>
-                  {roundNumberForIntro ? `La manche ${roundNumberForIntro} commence dans :` : "La manche commence dans :"}
-                </div>
-                <div style={{ fontSize: "5rem", fontWeight: 800, lineHeight: 1 }}>
-                  {introCountdownSec}
-                </div>
-              </div>
-            ) : isQuestionPhase ? (
-              <>
-              <h1 
-                style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}
-                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
-              />
-              {isQcmQuestion(currentQuestion) ? (
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "1fr 1fr",
-                    gap: "clamp(12px, 2vw, 20px)",
-                    maxWidth: "min(920px, 92%)",
-                    margin: "16px auto 8px",
-                    fontSize: "clamp(1rem, 2.5vw, 1.25rem)",
-                    lineHeight: 1.4,
-                  }}
-                >
-                  {getQcmOptionsForDisplay(currentQuestion).map((opt, idx) =>
-                    opt ? (
-                      <div
-                        key={idx}
-                        style={{
-                          padding: "clamp(12px, 2vw, 18px)",
-                          borderRadius: 10,
-                          border: "1px solid rgba(148, 163, 184, 0.35)",
-                          background: "rgba(15, 35, 74, 0.55)",
-                          textAlign: "center",
-                          opacity: 0.95,
-                        }}
-                      >
-                        {opt}
-                      </div>
-                    ) : null
-                  )}
-                </div>
-              ) : null}
-              </>
-            ) : isRevealAnswerPhase ? (
-              <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ 
-                  opacity: 0.85, 
-                  fontSize: 18, 
-                  marginBottom: 8,
-                  lineHeight: 1.4,
-                  maxWidth: "min(800px, 95%)",
-                  marginLeft: "auto",
-                  marginRight: "auto",
-                  textAlign: "center",
-                  whiteSpace: "nowrap", // Force une seule ligne pour les phrases de révélation
-                  overflowWrap: "normal", // Ne coupe jamais les mots
-                  wordBreak: "normal", // Ne coupe pas les mots au milieu
-                }}>
-                  {revealPhrase}
-                </div>
-                <h1 
-                  style={{ 
-                    fontSize: "clamp(1.2rem, 5vw, 1.6rem)", // Même taille que Player
-                    margin: 0,
-                    lineHeight: 1.5,
-                    whiteSpace: isShortAnswer ? "nowrap" : "normal", // Force une seule ligne pour les réponses courtes (sans ponctuation)
-                    maxWidth: isShortAnswer ? "none" : "min(1600px, 95%)", // Pas de limite pour les réponses courtes
-                    marginLeft: "auto",
-                    marginRight: "auto",
-                    overflowWrap: isShortAnswer ? "normal" : "break-word", // Ne coupe jamais pour les réponses courtes
-                    wordBreak: "normal", // Ne coupe pas les mots au milieu
-                    hyphens: "none", // Pas de césure automatique
-                    textAlign: "center",
-                    letterSpacing: "0.01em",
-                  }}
-                  dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(primaryAnswer) }}
-                />
-              </div>
-            ) : isCountdownPhase ? (
-              <div style={{ marginTop: 8, marginBottom: 4 }}>
-                <div style={{ opacity: 0.85, fontSize: 18, marginBottom: 6 }}>
-                  {countdownLabel}
-                </div>
-                <div style={{ fontSize: "5rem", fontWeight: 800, lineHeight: 1 }}>
-                  {countdownSec}
-                </div>
-              </div>
-            ) : (
-              <h1 
-                style={{ ...screenQuestionStyle, fontSize: "clamp(1.6rem, 3.8vw, 2.1rem)" }}
-                dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
-              />
-            )}
-
-            {/* Image pendant la PHASE QUESTION (champs dédiés) */}
-            {isQuestionPhase && questionImgUrl ? (
-              <div
-                style={{
-                  width: SCREEN_IMG_MAX,
-                  height: SCREEN_IMG_MAX,
-                  maxWidth: "100%",
-                  margin: "16px auto 8px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: "#111",
-                  borderRadius: 8,
-                  overflow: "hidden",
-                }}
-              >
-                <img
-                  src={questionImgUrl}
-                  alt="Indice visuel — question"
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    objectFit: "contain",
-                    imageRendering: "auto",
-                  }}
-                  loading="eager"
-                  decoding="async"
-                />
-              </div>
-            ) : null}
-
-
-            {/* Barre de temps sous la question */}
-            {canShowTimeBar && (
-              <div
-                style={{
-                  width: "min(700px, 92%)",
-                  height: BAR_H,
-                  margin: "12px auto 10px",
-                  background: BAR_BLUE,
-                  borderRadius: 9999,
-                  overflow: "hidden",
-                  position: "relative",
-                  // 👇 cache la barre tant que le masque est actif
-                  visibility: uiMasked ? "hidden" : "visible",
-                }}
-
-              >
-                <div
-                  style={{
-                    width: `${(progress * 100).toFixed(2)}%`,
-                    height: "100%",
-                    background: BAR_RED,
-                  }}
-                />
-                <div
-                  style={{
-                    position: "absolute",
-                    left: `calc(${(progress * 100).toFixed(2)}% - 1px)`,
-                    top: -2,
-                    bottom: -2,
-                    width: 2,
-                    background: HANDLE_COLOR,
-                    opacity: 0.9,
-                  }}
-                />
-              </div>
-            )}
-
-            {/* Podium live : s’affiche au fil de l’eau pendant la phase "question" */}
-            {isQuestionPhase && liveFirsts.length > 0 && (
-              <div style={{ marginTop: 8 }}>
-                <div style={{ opacity: 0.85, fontSize: 14, marginBottom: 6 }}>
-                  Bravo à :
-                </div>
-                <div style={{ display: "grid", gap: 6, justifyContent: "center" }}>
-                  {liveFirsts.map((e, idx) => {
-                    const rank = idx + 1;
-                    const medal = rank === 1 ? "🥇" : rank === 2 ? "🥈" : "🥉";
-                    const pts = scoringTable[idx] ?? 0;
-                    const name = (playersById[e.playerId]?.name || "(…)");
-                    const big = rank === 1;
-
-                    return (
-                      <div
-                        key={e.playerId}
-                        style={{
-                          display: "flex",
-                          gap: 8,
-                          alignItems: "baseline",
-                          justifyContent: "center",
-                          background: "#0b0f1a",
-                          border: "1px solid #1f2a44",
-                          borderRadius: 10,
-                          padding: "6px 10px",
-                        }}
-                      >
-                        <span style={{ fontSize: big ? 22 : 18 }}>{medal}</span>
-                        <b style={{ fontSize: big ? 20 : 16 }}>
-                          {name}
-                        </b>
-                        <span style={{ opacity: 0.85 }}>•</span>
-                        <span
-                          style={{
-                            fontVariantNumeric: "tabular-nums",
-                            fontWeight: 800,
-                          }}
-                        >
-                          +{pts} pts
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-
-
-            {/* Image pendant la RÉVÉLATION (réponse) */}
-            {isRevealAnswerPhase && answerImgUrl ? (
-              <div
-                style={{
-                  width: SCREEN_IMG_MAX,
-                  height: SCREEN_IMG_MAX,
-                  maxWidth: "100%",
-                  margin: "16px auto",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: "#111",
-                  borderRadius: 8,
-                  overflow: "hidden",
-                }}
-              >
-                <img
-                  src={answerImgUrl}
-                  alt="Révélation — œuvre"
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    objectFit: "contain",
-                    imageRendering: "auto",
-                  }}
-                  loading="lazy"
-                  decoding="async"
-                />
-
-              </div>
-            ) : null}
-
-          </>
+          >
+            <ScreenPodiumContent
+              view={leaderboardView}
+              captionTeamsText={screenPodiumMessages.provisionalPodiumTeams}
+              captionPlayersText={screenPodiumMessages.provisionalPodiumPlayers}
+              podium={podium}
+              scoreKey="score"
+              emptyMessage={screenPodiumMessages.noPointsYet}
+              footnote={screenPodiumMessages.nothingDecided}
+            />
+          </ScreenPodiumBlock>
         ) : (
-          <>
-            {!isRunning && <p>En attente du démarrage…</p>}
-            {isRunning && earliestTimeSec != null && elapsedSec < earliestTimeSec && (
-              <p>En attente de la première question (à {formatHMS(earliestTimeSec)})…</p>
-            )}
-            {isRunning && earliestTimeSec == null && (
-              <p>Aucune question planifiée (ajoute des timecodes dans l’admin).</p>
-            )}
-            {isRunning && earliestTimeSec != null && elapsedSec >= earliestTimeSec && !currentQuestion && (
-              <p>Patiente… (synchronisation)</p>
-            )}
-          </>
-        )}
+          <ScreenQuizStageBlock
+            opticalShift
+            alignTop={Boolean(currentQuestion && isQuestionPhase)}
+          >
+            {holdRoundBoundaryCountdown ? (
+              <div style={SCREEN_STAGE_WRAP}>
+                <div style={SCREEN_COUNTDOWN_LABEL}>{countdownLabel}</div>
+                <div style={SCREEN_COUNTDOWN_NUMBER}>{displayCountdownSec}</div>
+              </div>
+            ) : isPaused ? (
+              <div style={SCREEN_STAGE_WRAP}>
+                <ScreenMultiline
+                  as="h1"
+                  text={screenQuizMessages.pauseTitle}
+                  style={SCREEN_TITLE_LG}
+                />
+                <ScreenMultiline
+                  as="div"
+                  text={screenQuizMessages.pauseSubtitle}
+                  style={{ ...pageTextSecondary, ...SCREEN_FOOTNOTE, marginTop: 8 }}
+                />
+              </div>
+            ) : currentQuestion ? (
+              <>
+                {isRoundIntroPhase ? (
+                  <div style={SCREEN_STAGE_WRAP}>
+                    <div style={SCREEN_COUNTDOWN_LABEL}>
+                      {roundNumberForIntro
+                        ? `${screenQuizMessages.roundStarts} ${roundNumberForIntro} ${screenQuizMessages.roundStartsIn}`
+                        : `${screenQuizMessages.roundStarts} ${screenQuizMessages.roundStartsIn}`}
+                    </div>
+                    <div style={SCREEN_COUNTDOWN_NUMBER}>
+                      {introCountdownSec}
+                    </div>
+                  </div>
+                ) : isQuestionPhase ? (
+                  <div style={isQcmQuestion(currentQuestion) ? SCREEN_QCM_STAGE_WRAP : SCREEN_STAGE_WRAP}>
+                    <h1
+                      style={isQcmQuestion(currentQuestion) ? SCREEN_QCM_QUESTION_STYLE : screenQuestionStyle}
+                      dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+                    />
+                    {isQcmQuestion(currentQuestion) ? (
+                      <div style={SCREEN_QCM_GRID}>
+                        {getQcmOptionsForDisplay(currentQuestion).map((opt, idx) =>
+                          opt ? (
+                            <div key={idx} style={SCREEN_QCM_OPTION}>
+                              {opt}
+                            </div>
+                          ) : null
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : isRevealAnswerPhase ? (
+                  <div style={SCREEN_STAGE_WRAP}>
+                    <div style={SCREEN_REVEAL_LABEL}>
+                      {screenQuizMessages.revealAnswer}
+                    </div>
+                    <h1
+                      style={{
+                        ...screenRevealAnswerStyle,
+                        whiteSpace: isShortAnswer ? "nowrap" : "normal",
+                        maxWidth: isShortAnswer ? "none" : "min(1600px, 95%)",
+                        marginLeft: "auto",
+                        marginRight: "auto",
+                        overflowWrap: isShortAnswer ? "normal" : "break-word",
+                        wordBreak: "normal",
+                        hyphens: "none",
+                        textAlign: "center",
+                        letterSpacing: "0.01em",
+                      }}
+                      dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(primaryAnswer) }}
+                    />
+                  </div>
+                ) : showCountdownUi ? (
+                  <div style={SCREEN_STAGE_WRAP}>
+                    <div style={SCREEN_COUNTDOWN_LABEL}>
+                      {countdownLabel}
+                    </div>
+                    <div style={SCREEN_COUNTDOWN_NUMBER}>
+                      {displayCountdownSec}
+                    </div>
+                  </div>
+                ) : (
+                  <div style={SCREEN_STAGE_WRAP}>
+                    <h1
+                      style={screenQuestionStyle}
+                      dangerouslySetInnerHTML={{ __html: addSmartLineBreaks(currentQuestion.text) }}
+                    />
+                  </div>
+                )}
 
-        {/* QR — écran d’attente : juste sous le texte d’attente */}
-        {!isRunning && <JoinPanelInline size="md" joinUrl={playerJoinUrl} />}
+                {isQuestionPhase && questionImgUrl ? (
+                  <div
+                    style={{
+                      width: SCREEN_IMG_MAX,
+                      height: SCREEN_IMG_MAX,
+                      maxWidth: "100%",
+                      margin: isQcmQuestion(currentQuestion) ? "8px auto 4px" : "16px auto 8px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      background: IMAGE_FRAME_BG,
+                      border: SCREEN_ON_DARK_BORDER,
+                      borderRadius: 8,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <img
+                      src={questionImgUrl}
+                      alt="Indice visuel — question"
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        imageRendering: "auto",
+                      }}
+                      loading="eager"
+                      decoding="async"
+                    />
+                  </div>
+                ) : null}
+
+                {canShowTimeBar && (
+                  <div
+                    style={{
+                      width: "min(700px, 92%)",
+                      height: BAR_H,
+                      margin: (isQuestionPhase && isQcmQuestion(currentQuestion))
+                        ? "8px auto 6px"
+                        : "12px auto 10px",
+                      background: BAR_BLUE,
+                      borderRadius: 9999,
+                      overflow: "hidden",
+                      position: "relative",
+                      visibility: uiMasked ? "hidden" : "visible",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${(progress * 100).toFixed(2)}%`,
+                        height: "100%",
+                        background: BAR_RED,
+                      }}
+                    />
+                    <div
+                      style={{
+                        position: "absolute",
+                        left: `calc(${(progress * 100).toFixed(2)}% - 1px)`,
+                        top: -2,
+                        bottom: -2,
+                        width: 2,
+                        background: HANDLE_COLOR,
+                        opacity: 0.9,
+                      }}
+                    />
+                  </div>
+                )}
+
+                {isQuestionPhase && (
+                  <ScreenQuestionLiveSlot
+                    liveFirsts={liveFirsts}
+                    playersById={playersById}
+                    scoringTable={scoringTable}
+                    captionText={screenQuizMessages.congratsTo}
+                  />
+                )}
+
+                {isRevealAnswerPhase && answerImgUrl ? (
+                  <div
+                    style={{
+                      width: SCREEN_IMG_MAX,
+                      height: SCREEN_IMG_MAX,
+                      maxWidth: "100%",
+                      margin: "16px auto",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      background: IMAGE_FRAME_BG,
+                      border: SCREEN_ON_DARK_BORDER,
+                      borderRadius: 8,
+                      overflow: "hidden",
+                    }}
+                  >
+                    <img
+                      src={answerImgUrl}
+                      alt="Révélation — œuvre"
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        imageRendering: "auto",
+                      }}
+                      loading="lazy"
+                      decoding="async"
+                    />
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <div style={SCREEN_STAGE_WRAP}>
+                {!isRunning && <p style={SCREEN_SECONDARY_TEXT}>{screenQuizMessages.waiting}</p>}
+                {isRunning && earliestTimeSec != null && elapsedSec < earliestTimeSec && (
+                  <p style={SCREEN_SECONDARY_TEXT}>
+                    {screenQuizMessages.waitingFirstQuestion} {formatHMS(earliestTimeSec)})…
+                  </p>
+                )}
+                {isRunning && earliestTimeSec == null && (
+                  <p style={SCREEN_SECONDARY_TEXT}>{screenQuizMessages.noQuestions}</p>
+                )}
+                {isRunning && earliestTimeSec != null && elapsedSec >= earliestTimeSec && !currentQuestion && (
+                  <p style={SCREEN_SECONDARY_TEXT}>{screenQuizMessages.syncing}</p>
+                )}
+              </div>
+            )}
+          </ScreenQuizStageBlock>
+        )}
       </div>
 
       {/* ===== Colonne scores (droite) ===== */}
@@ -2392,10 +2627,11 @@ function ScreenInner() {
           width: 320,
           maxWidth: "clamp(280px, 30vw, 400px)",
           maxHeight: "calc(100vh - 24px)",
-          background: "#0b0f1a",
-          border: "1px solid #1f2a44",
-          borderRadius: 12,
-          padding: "12px 12px 8px 12px", // bas plus fin → QR visuellement plus bas
+          position: "relative",
+          zIndex: 3,
+          flexShrink: 0,
+          ...asidePanelStyle,
+          padding: "12px 12px 8px 12px",
           margin: 12,
           overflow: "hidden",
           display: "flex",
@@ -2407,11 +2643,11 @@ function ScreenInner() {
 
         <div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 0.2 }}>
-              {leaderboardView === "teams" ? "⭐ Score des équipes" : "👤 Classement des joueurs"}
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, letterSpacing: 0.2, color: BRAND.mauveDark }}>
+              <ScreenRankingAsideTitle view={leaderboardView} />
             </h3>
             <div style={{ opacity: 0.7, fontSize: 12 }}>
-              Top {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
+              {screenPodiumMessages.topN} {Number.isFinite(leaderboardTopN) ? leaderboardTopN : DEFAULT_LEADERBOARD_TOP_N}
             </div>
           </div>
 
@@ -2421,8 +2657,8 @@ function ScreenInner() {
               marginTop: 6,
               height: 3,
               borderRadius: 9999,
-              background: "#0f172a",       // bleu nuit un peu plus clair que #0b0f1a
-              border: "1px solid #2a488fff", // même bleu que le cadre du QR
+              background: BRAND.blue,
+              border: `1px solid ${BRAND.mauveDark}`,
             }}
           />
         </div>
@@ -2439,21 +2675,10 @@ function ScreenInner() {
           {leaderboard.map((p, idx) => {
             const rank = Number(p._rank ?? (idx + 1));
             const s = Number(p.score || 0);
-            // Utiliser des médailles pour les équipes (or/argent/bronze), des cœurs colorés pour les joueurs
-            let medal = "";
-            let medalColor = null;
-            if (s > 0) {
-              if (rank === 1) {
-                medal = leaderboardView === "teams" ? "🥇" : "💛"; // Médailles pour équipes, cœurs pour joueurs
-                medalColor = null;
-              } else if (rank === 2) {
-                medal = leaderboardView === "teams" ? "🥈" : "🤍";
-                medalColor = null;
-              } else if (rank === 3) {
-                medal = leaderboardView === "teams" ? "🥉" : "🤎";
-                medalColor = null;
-              }
-            }
+            const teamMedal = s > 0 && rank <= 3 && leaderboardView === "teams"
+              ? (rank === 1 ? "🥇" : rank === 2 ? "🥈" : "🥉")
+              : "";
+            const showPlayerRankCircle = s > 0 && rank <= 3 && leaderboardView === "players";
             const showDelta = Boolean(
               inRevealWindowForLB &&
               currentQuestionIdForLB &&
@@ -2461,66 +2686,64 @@ function ScreenInner() {
               Number(p.lastDelta) > 0
             );
 
+            const dotColor = (() => {
+              if (leaderboardView === "teams") {
+                const team = teamsLB.find((t) => t.id === p.id);
+                return team?.color || "#64748b";
+              }
+              const player = playersLB.find((pl) => pl.id === p.id);
+              if (player?.teamId) {
+                const team = teamsLB.find((t) => t.id === player.teamId);
+                return team?.color || player.color || "#64748b";
+              }
+              return player?.color || "#64748b";
+            })();
+            const nameColor = leaderboardView === "teams"
+              ? (teamsLB.find((t) => t.id === p.id)?.color || BRAND.mauveDark)
+              : BRAND.mauveDark;
+
             return (
               <div
                 key={p.id}
                 role="listitem"
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "28px 1fr auto",
+                  ...SCREEN_LB_ROW,
                   alignItems: "center",
-                  gap: 8,
-                  padding: "8px 10px",
-                  borderBottom: "1px solid #16233b",
+                  borderBottom: `1px solid ${BRAND.mauveLight}`,
                 }}
               >
-                <div style={{ textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums" }}>
+                <div style={{ textAlign: "right", opacity: 0.85, fontVariantNumeric: "tabular-nums", color: BRAND.mauveDark }}>
                   {rank}.
                 </div>
 
                 <div style={{ minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, minHeight: 24 }}>
                     <span
                       aria-hidden="true"
                       style={{
-                        width: 10,
-                        height: 10,
-                        borderRadius: 3,
-                        background: (() => {
-                          if (leaderboardView === "teams") {
-                            const team = teamsLB.find((t) => t.id === p.id);
-                            return team?.color || "#64748b";
-                          } else {
-                            const player = playersLB.find((pl) => pl.id === p.id);
-                            if (player?.teamId) {
-                              const team = teamsLB.find((t) => t.id === player.teamId);
-                              return team?.color || player.color || "#64748b";
-                            }
-                            return player?.color || "#64748b";
-                          }
-                        })(),
-                        border: "1px solid rgba(255,255,255,0.25)",
-                        flex: "0 0 auto",
+                        ...SCREEN_LB_DOT,
+                        background: dotColor,
+                        border: `1px solid ${BRAND.mauveDark}`,
                       }}
                     />
                     <span
                       title={p.name}
                       style={{
+                        flex: 1,
+                        minWidth: 0,
                         fontWeight: 700,
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
-                        color: leaderboardView === "teams" ? (() => {
-                          const team = teamsLB.find((t) => t.id === p.id);
-                          return team?.color || "#e5e7eb";
-                        })() : undefined,
+                        color: nameColor,
                       }}
                     >
-                      {p.name || "(sans nom)"} {medal && (
-                        <span style={{ color: medalColor || undefined }}>
-                          {medal}
-                        </span>
-                      )}
+                      {p.name || "(sans nom)"}
+                    </span>
+                    <span aria-hidden="true" style={SCREEN_LB_TRAIL_ICON}>
+                      {leaderboardView === "teams" && teamMedal ? teamMedal : null}
+                      {showPlayerRankCircle ? <PlayerRankCircle rank={rank} size={20} /> : null}
                     </span>
                   </div>
 
@@ -2531,9 +2754,9 @@ function ScreenInner() {
                         marginTop: 4,
                         padding: "2px 6px",
                         borderRadius: 9999,
-                        background: "#0b3a1e",
-                        border: "1px solid #14532d",
-                        color: "#86efac",
+                        background: BRAND.green,
+                        border: `1px solid ${BRAND.mauveDark}`,
+                        color: BRAND.mauveDark,
                         fontSize: 12,
                         fontWeight: 800,
                       }}
@@ -2548,10 +2771,7 @@ function ScreenInner() {
                     fontWeight: 800,
                     fontVariantNumeric: "tabular-nums",
                     letterSpacing: 0.2,
-                    color: leaderboardView === "teams" ? (() => {
-                      const team = teamsLB.find((t) => t.id === p.id);
-                      return team?.color || "#e5e7eb";
-                    })() : undefined,
+                    color: nameColor,
                   }}
                   aria-label="score"
                   title={`${p.score} points`}
@@ -2564,13 +2784,13 @@ function ScreenInner() {
 
           {leaderboard.length === 0 && (
             <div style={{ opacity: 0.7, padding: 12, textAlign: "center" }}>
-              Aucun joueur.
+              {screenPodiumMessages.noPlayers}
             </div>
           )}
         </div>
       </aside>
       )}
-    </div>
+    </BrandShell>
   );
 }
 
@@ -2579,7 +2799,7 @@ export default function Screen() {
     <AuthGate
       title="Accès écran scène"
       subtitle="Réservé à l'écran de projection du quiz."
-      accent="#3b82f6"
+      accent={BRAND.blue}
     >
       <ScreenInner />
     </AuthGate>

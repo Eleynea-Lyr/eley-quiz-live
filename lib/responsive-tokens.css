@@ -1,0 +1,278 @@
+/**
+ * Tokens responsive EleyBox — mobile-first (valeurs actuelles par défaut).
+ * Tablette ≥768px et desktop ≥1024px : plafonds et largeurs un peu plus généreux.
+ * Le bloc :root seul = rendu téléphone inchangé.
+ */
+
+:root {
+  --eley-content-narrow: 360px;
+  --eley-content-wide: 520px;
+  --eley-content-score: 400px;
+  --eley-center-stage-max: 520px;
+
+  --eley-shell-pad: 24px;
+  --eley-page-pad: 20px;
+
+  --eley-title-page: clamp(2rem, 7vw, 2.75rem);
+  --eley-title-md: clamp(1.4rem, 5vw, 2rem);
+  --eley-title-lg: clamp(1.2rem, 5vw, 2rem);
+  --eley-transition-title: clamp(1rem, 4.5vw, 1.4rem);
+
+  --eley-text-hint: clamp(1.05rem, 3.8vw, 1.22rem);
+  --eley-text-question: clamp(0.95rem, 3.5vw, 1.2rem);
+  --eley-text-body-sm: clamp(0.82rem, 3.2vw, 0.95rem);
+  --eley-text-section: clamp(0.88rem, 3.2vw, 1rem);
+  --eley-text-summary: clamp(0.82rem, 3.2vw, 0.95rem);
+  --eley-text-attente-link: clamp(0.95rem, 3.5vw, 1.15rem);
+  --eley-text-input: clamp(14px, 3.9vw, 16px);
+  --eley-text-caption: 12px;
+  --eley-text-error: 14px;
+  --eley-text-meta: clamp(0.9rem, 3.5vw, 1.05rem);
+  --eley-text-eleybuzz: clamp(1rem, 3.5vw, 1.35rem);
+  --eley-text-body: 16px;
+  --eley-text-reveal: clamp(0.95rem, 3.8vw, 1.15rem);
+
+  --eley-countdown-label: clamp(1.12rem, 4.1vw, 1.38rem);
+  --eley-countdown-number: clamp(2.2rem, 12vw, 3.75rem);
+  --eley-pause-title: clamp(1.15rem, 4.8vw, 1.55rem);
+  --eley-pause-subtitle: clamp(0.95rem, 3.5vw, 1.1rem);
+  --eley-round-break-title: clamp(1.45rem, 5.5vw, 1.9rem);
+  --eley-quiz-end-title: clamp(1.3rem, 5vw, 1.8rem);
+
+  --eley-btn-home: clamp(1.1rem, 4vw, 1.35rem);
+  --eley-btn-pad-y: clamp(10px, 2.8vw, 12px);
+  --eley-btn-pad-x: 12px;
+  --eley-btn-compact-y: 8px;
+  --eley-btn-compact-x: 12px;
+  --eley-gap-stack: clamp(1.25rem, 4vw, 1.75rem);
+
+  --eley-input-pad-y: 10px;
+  --eley-input-pad-x: 12px;
+  --eley-choice-pad-y: 14px;
+  --eley-choice-pad-x: 16px;
+  --eley-buzz-pad-y: 16px;
+  --eley-buzz-pad-x: 22px;
+  --eley-text-label-sm: 11px;
+  --eley-card-pad-y: 12px;
+  --eley-card-pad-x: 14px;
+  --eley-gutter-running: clamp(40px, 8vh, 72px);
+  --eley-gutter-idle: clamp(28px, 6vh, 56px);
+  --eley-hud-max-offset: 24px;
+
+  --eley-hud-top: 12px;
+  --eley-hud-side: 12px;
+  --eley-hud-font-team: 13px;
+  --eley-hud-font-player: 12px;
+  --eley-hud-font-player-inner: 13px;
+  --eley-hud-pad-team-y: 6px;
+  --eley-hud-pad-team-x: 12px;
+  --eley-hud-pad-player-y: 6px;
+  --eley-hud-pad-player-x: 10px;
+  --eley-hud-radius: 14px;
+  --eley-hud-icon: 14px;
+  --eley-hud-gap: 6px;
+  --eley-icon-label: 18px;
+  --eley-icon-inline: 15px;
+
+  --eley-section-gap-md: 32px;
+  --eley-section-gap-lg: 48px;
+  --eley-round-panel-top: 28px;
+  --eley-podium-block-lift: clamp(56px, 10vh, 120px);
+
+  --eley-screen-title-xl: clamp(1.55rem, 5.5vw, 2.45rem);
+  --eley-screen-title-lg: clamp(1.35rem, 4.8vw, 2rem);
+  --eley-screen-title-md: clamp(1.2rem, 4.2vw, 1.75rem);
+  --eley-screen-footnote: clamp(0.95rem, 3.2vw, 1.12rem);
+
+  /** Quiz — aligné sur title-md (podium) et title-lg (fin de manche) */
+  --eley-screen-countdown-label: var(--eley-screen-title-md);
+  --eley-screen-text-reveal-label: var(--eley-screen-title-md);
+  --eley-screen-text-question: var(--eley-screen-title-lg);
+  --eley-screen-text-reveal-answer: var(--eley-screen-title-lg);
+  --eley-screen-countdown-number: clamp(2.75rem, 14vw, 5rem);
+  --eley-screen-qcm-question: clamp(1.08rem, 3.6vw, 1.48rem);
+  --eley-screen-qcm-option: clamp(0.86rem, 2.9vw, 1.18rem);
+  --eley-screen-qcm-live: clamp(0.82rem, 2.6vw, 1.05rem);
+  --eley-screen-secondary: var(--eley-screen-footnote);
+
+  /* Images question / réponse (vue joueur) */
+  --eley-img-question-sm: 110px;
+  --eley-img-question-lg: 310px;
+  --eley-img-reveal: 220px;
+}
+
+@media (min-width: 768px) {
+  :root {
+    --eley-content-narrow: 400px;
+    --eley-content-wide: 560px;
+    --eley-content-score: 440px;
+    --eley-center-stage-max: 560px;
+
+    --eley-shell-pad: 28px;
+    --eley-page-pad: 24px;
+
+    --eley-title-page: clamp(2rem, 7vw, 3.05rem);
+    --eley-title-md: clamp(1.4rem, 5vw, 2.25rem);
+    --eley-title-lg: clamp(1.2rem, 5vw, 2.25rem);
+    --eley-transition-title: clamp(1rem, 4.5vw, 1.55rem);
+
+    --eley-text-hint: clamp(1.05rem, 3.8vw, 1.32rem);
+    --eley-text-question: clamp(0.95rem, 3.5vw, 1.32rem);
+    --eley-text-body-sm: clamp(0.82rem, 3.2vw, 1.05rem);
+    --eley-text-section: clamp(0.88rem, 3.2vw, 1.1rem);
+    --eley-text-summary: clamp(0.82rem, 3.2vw, 1.05rem);
+    --eley-text-attente-link: clamp(0.95rem, 3.5vw, 1.25rem);
+    --eley-text-input: clamp(14px, 3.9vw, 17px);
+    --eley-text-caption: 13px;
+    --eley-text-error: 15px;
+    --eley-text-meta: clamp(0.9rem, 3.5vw, 1.12rem);
+    --eley-text-eleybuzz: clamp(1rem, 3.5vw, 1.45rem);
+    --eley-text-body: 17px;
+    --eley-text-reveal: clamp(0.95rem, 3.8vw, 1.22rem);
+
+    --eley-countdown-label: clamp(1.12rem, 4.1vw, 1.48rem);
+    --eley-countdown-number: clamp(2.2rem, 12vw, 4rem);
+    --eley-pause-title: clamp(1.15rem, 4.8vw, 1.72rem);
+    --eley-pause-subtitle: clamp(0.95rem, 3.5vw, 1.2rem);
+    --eley-round-break-title: clamp(1.45rem, 5.5vw, 2.15rem);
+    --eley-quiz-end-title: clamp(1.3rem, 5vw, 2rem);
+
+    --eley-btn-home: clamp(1.1rem, 4vw, 1.45rem);
+    --eley-btn-pad-y: clamp(10px, 2.8vw, 13px);
+    --eley-btn-pad-x: 14px;
+    --eley-btn-compact-y: 9px;
+    --eley-btn-compact-x: 14px;
+    --eley-gap-stack: clamp(1.25rem, 4vw, 2rem);
+
+    --eley-input-pad-y: 11px;
+    --eley-input-pad-x: 14px;
+    --eley-choice-pad-y: 15px;
+    --eley-choice-pad-x: 18px;
+    --eley-buzz-pad-y: 18px;
+    --eley-buzz-pad-x: 24px;
+    --eley-text-label-sm: 12px;
+    --eley-card-pad-y: 14px;
+    --eley-card-pad-x: 16px;
+    --eley-gutter-running: clamp(44px, 8vh, 80px);
+    --eley-gutter-idle: clamp(32px, 6vh, 64px);
+    --eley-hud-max-offset: 28px;
+
+    --eley-hud-top: 14px;
+    --eley-hud-side: 16px;
+    --eley-hud-font-team: 16px;
+    --eley-hud-font-player: 14px;
+    --eley-hud-font-player-inner: 16px;
+    --eley-hud-pad-team-y: 8px;
+    --eley-hud-pad-team-x: 14px;
+    --eley-hud-pad-player-y: 8px;
+    --eley-hud-pad-player-x: 12px;
+    --eley-hud-radius: 16px;
+    --eley-hud-icon: 17px;
+    --eley-hud-gap: 8px;
+    --eley-icon-label: 20px;
+    --eley-icon-inline: 17px;
+
+    --eley-section-gap-md: 40px;
+    --eley-section-gap-lg: 56px;
+    --eley-round-panel-top: 36px;
+    --eley-podium-block-lift: clamp(64px, 11vh, 132px);
+
+    --eley-screen-title-xl: clamp(1.75rem, 5.8vw, 2.85rem);
+    --eley-screen-title-lg: clamp(1.5rem, 5.2vw, 2.35rem);
+    --eley-screen-title-md: clamp(1.3rem, 4.6vw, 2rem);
+    --eley-screen-footnote: clamp(1rem, 3.4vw, 1.22rem);
+    --eley-screen-countdown-number: clamp(2.9rem, 14vw, 5.35rem);
+
+    --eley-img-question-sm: 150px;
+    --eley-img-question-lg: 390px;
+    --eley-img-reveal: 275px;
+  }
+}
+
+@media (min-width: 1024px) {
+  :root {
+    --eley-content-narrow: 440px;
+    --eley-content-wide: 600px;
+    --eley-content-score: 480px;
+    --eley-center-stage-max: 600px;
+
+    --eley-shell-pad: 32px;
+    --eley-page-pad: 28px;
+
+    --eley-title-page: clamp(2rem, 7vw, 3.25rem);
+    --eley-title-md: clamp(1.4rem, 5vw, 2.4rem);
+    --eley-title-lg: clamp(1.2rem, 5vw, 2.35rem);
+    --eley-transition-title: clamp(1rem, 4.5vw, 1.62rem);
+
+    --eley-text-hint: clamp(1.05rem, 3.8vw, 1.38rem);
+    --eley-text-question: clamp(0.95rem, 3.5vw, 1.38rem);
+    --eley-text-body-sm: clamp(0.82rem, 3.2vw, 1.08rem);
+    --eley-text-section: clamp(0.88rem, 3.2vw, 1.14rem);
+    --eley-text-summary: clamp(0.82rem, 3.2vw, 1.08rem);
+    --eley-text-attente-link: clamp(0.95rem, 3.5vw, 1.28rem);
+    --eley-text-input: clamp(14px, 3.9vw, 18px);
+    --eley-text-caption: 14px;
+    --eley-text-error: 16px;
+    --eley-text-meta: clamp(0.9rem, 3.5vw, 1.15rem);
+    --eley-text-eleybuzz: clamp(1rem, 3.5vw, 1.5rem);
+    --eley-text-body: 18px;
+    --eley-text-reveal: clamp(0.95rem, 3.8vw, 1.28rem);
+
+    --eley-countdown-label: clamp(1.12rem, 4.1vw, 1.55rem);
+    --eley-countdown-number: clamp(2.2rem, 12vw, 4.25rem);
+    --eley-pause-title: clamp(1.15rem, 4.8vw, 1.82rem);
+    --eley-pause-subtitle: clamp(0.95rem, 3.5vw, 1.24rem);
+    --eley-round-break-title: clamp(1.45rem, 5.5vw, 2.3rem);
+    --eley-quiz-end-title: clamp(1.3rem, 5vw, 2.1rem);
+
+    --eley-btn-home: clamp(1.1rem, 4vw, 1.5rem);
+    --eley-btn-pad-y: clamp(10px, 2.8vw, 14px);
+    --eley-btn-pad-x: 16px;
+    --eley-btn-compact-y: 10px;
+    --eley-btn-compact-x: 16px;
+    --eley-gap-stack: clamp(1.25rem, 4vw, 2.1rem);
+
+    --eley-input-pad-y: 12px;
+    --eley-input-pad-x: 16px;
+    --eley-choice-pad-y: 16px;
+    --eley-choice-pad-x: 20px;
+    --eley-buzz-pad-y: 20px;
+    --eley-buzz-pad-x: 26px;
+    --eley-text-label-sm: 13px;
+    --eley-card-pad-y: 15px;
+    --eley-card-pad-x: 18px;
+    --eley-gutter-running: clamp(48px, 8vh, 88px);
+    --eley-gutter-idle: clamp(36px, 6vh, 72px);
+    --eley-hud-max-offset: 32px;
+
+    --eley-hud-top: 16px;
+    --eley-hud-side: 20px;
+    --eley-hud-font-team: 17px;
+    --eley-hud-font-player: 15px;
+    --eley-hud-font-player-inner: 17px;
+    --eley-hud-pad-team-y: 9px;
+    --eley-hud-pad-team-x: 16px;
+    --eley-hud-pad-player-y: 9px;
+    --eley-hud-pad-player-x: 14px;
+    --eley-hud-radius: 16px;
+    --eley-hud-icon: 18px;
+    --eley-hud-gap: 8px;
+    --eley-icon-label: 22px;
+    --eley-icon-inline: 18px;
+
+    --eley-section-gap-md: 44px;
+    --eley-section-gap-lg: 64px;
+    --eley-round-panel-top: 40px;
+    --eley-podium-block-lift: clamp(72px, 12vh, 144px);
+
+    --eley-screen-title-xl: clamp(1.9rem, 6vw, 3.15rem);
+    --eley-screen-title-lg: clamp(1.65rem, 5.5vw, 2.55rem);
+    --eley-screen-title-md: clamp(1.4rem, 4.8vw, 2.15rem);
+    --eley-screen-footnote: clamp(1.05rem, 3.5vw, 1.28rem);
+    --eley-screen-countdown-number: clamp(3.1rem, 15vw, 5.75rem);
+
+    --eley-img-question-sm: 175px;
+    --eley-img-question-lg: 440px;
+    --eley-img-reveal: 300px;
+  }
+}
