@@ -562,8 +562,6 @@ export default function Player() {
   const buzzerOpenSeqRef = useRef(0);
   const buzzerStateRef = useRef("idle");
   const fairBuzzTimerRef = useRef(null);
-  const playerIdRef = useRef(null);
-  playerIdRef.current = playerId;
 
   // Score Final state
   const [showFinalScore, setShowFinalScore] = useState(false);
