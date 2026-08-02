@@ -557,14 +557,13 @@ export default function Player() {
   const [buzzerMessage, setBuzzerMessage] = useState(null);
   const [buzzerMessageType, setBuzzerMessageType] = useState(null);
   const [lastWrongPenalty, setLastWrongPenalty] = useState(null);
-  // État optimiste pour le buzzer (affichage immédiat sans attendre Firestore)
-  const [optimisticBuzzerState, setOptimisticBuzzerState] = useState(null);
-  const [optimisticFirstPlayerId, setOptimisticFirstPlayerId] = useState(null);
-  // État local pour empêcher les doubles buzz (désactive le bouton immédiatement)
+  // En attente locale après un tap (bleu) — le gagnant jaune vient UNIQUEMENT de Firestore
   const [isBuzzing, setIsBuzzing] = useState(false);
   const buzzerOpenSeqRef = useRef(0);
   const buzzerStateRef = useRef("idle");
   const fairBuzzTimerRef = useRef(null);
+  const playerIdRef = useRef(null);
+  playerIdRef.current = playerId;
 
   // Score Final state
   const [showFinalScore, setShowFinalScore] = useState(false);
@@ -903,15 +902,13 @@ export default function Player() {
         
         buzzerStateRef.current = newBuzzerState;
 
-        // Nouvelle session d'ouverture → invalider tout état optimiste / tap en retard
+        // Nouvelle session d'ouverture → invalider tap en retard / timer d'équité
         if (newOpenSeq !== buzzerOpenSeqRef.current) {
           buzzerOpenSeqRef.current = newOpenSeq;
           if (fairBuzzTimerRef.current != null) {
             clearTimeout(fairBuzzTimerRef.current);
             fairBuzzTimerRef.current = null;
           }
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
           setIsBuzzing(false);
         }
         
@@ -923,42 +920,11 @@ export default function Player() {
           setCanBuzz(true);
         }
         
-        // Réinitialiser l'état optimiste dans plusieurs cas :
-        // 1. Si le buzzer revient à idle (nouvelle question) → réinitialiser
-        // 2. Si Firestore confirme l'état optimiste → réinitialiser (synchronisation)
-        // 3. Si l'état Firestore change (par exemple, un autre joueur a buzzé) → réinitialiser
-        // Note: pendant la fenêtre d'équité (OPEN + pas encore de gagnant),
-        // ne pas couper isBuzzing — le joueur attend le tirage.
-        if (newBuzzerState === BUZZER_STATES.IDLE) {
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
-          setIsBuzzing(false);
-        } else if (newBuzzerState === BUZZER_STATES.OPEN && !newFirstPlayerId) {
-          // Fenêtre d'équité en cours : garder isBuzzing si déjà en attente
-        } else if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
-          // Firestore confirme l'état optimiste : réinitialiser (synchronisation)
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
-          // Si Firestore confirme que ce joueur est le premier, garder isBuzzing à true
-          // Sinon, réactiver le bouton
-          if (newFirstPlayerId !== playerId) {
-            setIsBuzzing(false);
-          }
-        } else if (optimisticBuzzerState && (optimisticBuzzerState !== newBuzzerState || optimisticFirstPlayerId !== newFirstPlayerId)) {
-          // L'état Firestore change : réinitialiser l'optimiste
-          setOptimisticBuzzerState(null);
-          setOptimisticFirstPlayerId(null);
-          // Si un autre joueur a buzzé, réactiver le bouton
-          if (newFirstPlayerId !== playerId) {
-            setIsBuzzing(false);
-          }
-        } else if (newBuzzerState === BUZZER_STATES.LOCKED && newFirstPlayerId === playerId) {
-          // Firestore confirme que ce joueur est le premier : garder isBuzzing à true
-          // (le bouton reste désactivé car le joueur peut maintenant répondre)
-        } else if (newBuzzerState === BUZZER_STATES.LOCKED && newFirstPlayerId !== playerId) {
-          // Un autre joueur a buzzé : réactiver le bouton
+        // Fin de l'attente locale dès qu'un gagnant Firestore est connu, ou IDLE
+        if (newBuzzerState === BUZZER_STATES.IDLE || newFirstPlayerId) {
           setIsBuzzing(false);
         }
+        // Sinon OPEN sans gagnant : garder isBuzzing si déjà en attente (fenêtre d'équité)
         
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
@@ -1996,12 +1962,10 @@ export default function Player() {
   // GESTION DE LA PUNITION : Le joueur est puni si canBuzz est false (source de vérité Firestore)
   // Une fois puni, on reste puni jusqu'à ce que le buzzer revienne à IDLE (nouvelle question)
 
-  // Réinitialiser tous les états EleyBuzz locaux quand le mode est désactivé
+  // Réinitialiser les états EleyBuzz locaux quand le mode est désactivé
   useEffect(() => {
     if (!isBuzzerMode) {
       startTransition(() => {
-        setOptimisticBuzzerState(null);
-        setOptimisticFirstPlayerId(null);
         setIsBuzzing(false);
         setCanBuzz(true);
       });
@@ -2196,21 +2160,13 @@ export default function Player() {
 
     const attemptOpenSeq = buzzerOpenSeqRef.current;
 
-    const clearBuzzOptimistic = () => {
-      startTransition(() => {
-        setOptimisticBuzzerState(null);
-        setOptimisticFirstPlayerId(null);
-      });
+    const clearBuzzPending = () => {
       setIsBuzzing(false);
     };
 
-    // Mise à jour optimiste immédiate (bleu « en attente » jusqu'à confirmation Firestore)
+    // Attente locale immédiate (reste bleu — le jaune attend Firestore)
     if (!isBuzzing) {
       setIsBuzzing(true);
-      startTransition(() => {
-        setOptimisticBuzzerState(BUZZER_STATES.LOCKED);
-        setOptimisticFirstPlayerId(playerId);
-      });
     }
 
     try {
@@ -2222,7 +2178,7 @@ export default function Player() {
         (buzzerStateRef.current !== BUZZER_STATES.OPEN &&
           buzzerStateRef.current !== BUZZER_STATES.LOCKED)
       ) {
-        clearBuzzOptimistic();
+        clearBuzzPending();
         return;
       }
 
@@ -2248,14 +2204,14 @@ export default function Player() {
         result.reason === "stale-open-seq" ||
         result.reason === "buzzer-not-open"
       ) {
-        clearBuzzOptimistic();
+        clearBuzzPending();
         return;
       }
 
-      clearBuzzOptimistic();
+      clearBuzzPending();
     } catch (e) {
       console.error("[Player] handleBuzzerPress error:", e);
-      clearBuzzOptimistic();
+      clearBuzzPending();
     }
   };
 
@@ -3373,36 +3329,16 @@ export default function Player() {
   // Permet d'accéder à EleyBuzz même si le quiz n'a pas encore démarré
   // ============================================================================
   if (isBuzzerMode && playerId) {
-    // VÉRIFICATION DE PUNITION : 
-    // Le joueur est puni seulement si canBuzz est false ET que le buzzer n'est pas en IDLE
-    // Quand le buzzer est en IDLE, tous les joueurs sont débloqués (nouvelle question)
-    // IMPORTANT : Ne pas considérer comme puni si le joueur vient juste de buzzer (firstPlayerId === playerId)
-    // car dans ce cas, le buzzer est jaune (en attente de réponse de l'admin)
-    const effectiveBuzzerState = optimisticBuzzerState || buzzerState || BUZZER_STATES.IDLE;
-    const effectiveFirstPlayerId = optimisticFirstPlayerId || firstPlayerId || null;
+    // Jaune / gris / rouge : uniquement l'état Firestore (pas d'optimiste « je suis gagnant »)
+    const effectiveBuzzerState = buzzerState || BUZZER_STATES.IDLE;
     
-    // Un joueur est puni seulement s'il a donné une mauvaise réponse confirmée par l'admin
-    // La source de vérité est canBuzz : si canBuzz est false, le joueur est puni
-    // MAIS on ne considère pas comme puni si le joueur vient juste de buzzer (firstPlayerId === playerId) car dans ce cas c'est jaune
-    const isCurrentlyBuzzing = effectiveFirstPlayerId && playerId && effectiveFirstPlayerId === playerId;
+    // Punition = canBuzz false tant que ce n'est pas une nouvelle question (IDLE)
+    // Ne jamais masquer la punition avec un état local « pending »
+    const isPunished = !canBuzz && effectiveBuzzerState !== BUZZER_STATES.IDLE;
     
-    // Un joueur est puni seulement si :
-    // 1. canBuzz est false (verrouillé par l'admin après mauvaise réponse)
-    // 2. Le buzzer n'est pas en IDLE (nouvelle question - tous débloqués)
-    // 3. Le joueur n'est PAS en train de buzzer (sinon c'est jaune, pas rouge)
-    const isPunished = !canBuzz &&
-                       effectiveBuzzerState !== BUZZER_STATES.IDLE &&
-                       !isCurrentlyBuzzing;
-    
-    // Utiliser l'état optimiste pour firstPlayerId (affichage immédiat)
-    // Cela permet d'afficher immédiatement "À toi de répondre !" pour le joueur qui buzz
-    // et "Le buzzer est verrouillé..." pour les autres, sans attendre Firestore
-    // Utiliser optimisticFirstPlayerId pour l'affichage immédiat (UX améliorée)
-    // Firestore confirmera ensuite qui peut vraiment répondre (sécurité)
-    // effectiveFirstPlayerId est déjà déclaré plus haut
-    
-    // Permettre les clics si le buzzer est ouvert et que le joueur peut buzzer
-    const canPressBuzzer = effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz;
+    // Clics si ouvert, autorisé, et pas déjà en attente locale
+    const canPressBuzzer =
+      effectiveBuzzerState === BUZZER_STATES.OPEN && canBuzz && !isBuzzing;
 
     return (
       <BrandShell
@@ -3552,20 +3488,8 @@ export default function Player() {
               };
             }
             
-            // Si LOCKED : déterminer selon qui a buzzé
+            // Si LOCKED : déterminer selon qui a buzzé (Firestore uniquement)
             if (effectiveBuzzerState === BUZZER_STATES.LOCKED) {
-              const isWaitingVerification = (!firstPlayerId || firstPlayerId === null) && (isBuzzing || optimisticFirstPlayerId === playerId);
-              
-              if (isWaitingVerification) {
-                return {
-                  background: BRAND.blue,
-                  border: BRAND.mauveDark,
-                  shadow: "0 8px 24px rgba(16, 170, 209, 0.4)",
-                  isClickable: false,
-                  isAnimating: false,
-                };
-              }
-              
               if (firstPlayerId && playerId && firstPlayerId === playerId) {
                 return {
                   background: BRAND.yellow,
@@ -3596,9 +3520,11 @@ export default function Player() {
           };
           
           const buzzerStyle = getBuzzerStyle();
-          // isWaitingVerification : le serveur n'a pas encore confirmé qui est le premier
-          // Garde-fou pour la production : vérifier que les valeurs sont valides
-          const isWaitingVerification = (!firstPlayerId || firstPlayerId === null) && (isBuzzing || optimisticFirstPlayerId === playerId);
+          // Tap envoyé, gagnant pas encore connu (fenêtre d'équité)
+          const isWaitingVerification =
+            isBuzzing &&
+            !firstPlayerId &&
+            effectiveBuzzerState === BUZZER_STATES.OPEN;
           
           return (
             <>

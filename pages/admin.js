@@ -86,7 +86,6 @@ import {
   resetBuzzerState,
   openBuzzerForNewRound,
   recoverEleyBuzzPlayers,
-  lockPlayerBuzz,
   resetAllPlayerBuzzLocks,
   purgeAnswersTree,
 } from "../lib/firebase-helpers";
@@ -2765,29 +2764,42 @@ function AdminInner() {
       // Retirer les points de pénalité du score EleyBuzz (peut aller en négatif)
       await awardBuzzerPoints(db, wrongPlayerId, -penalty);
       
-      // Stocker la pénalité appliquée dans le document du joueur pour l'affichage
-      const playerRef = doc(db, "quiz", "state", "players", wrongPlayerId);
-      await updateDoc(playerRef, {
-        lastWrongPenalty: penalty,
-      }, { merge: true });
+      // Snapshot joueurs AVANT lock : ceux déjà éliminés restent hors jeu
+      const playersCol = collection(db, "quiz", "state", "players");
+      const playersSnap = await getDocs(playersCol);
+      const stayLocked = new Set(
+        playersSnap.docs
+          .filter((d) => d.data()?.canBuzz === false)
+          .map((d) => d.id)
+      );
+      stayLocked.add(wrongPlayerId);
+
+      // Une seule passe : un seul faux → canBuzz false ; les autres éligibles → true
+      let batch = writeBatch(db);
+      let n = 0;
+      for (const d of playersSnap.docs) {
+        const locked = stayLocked.has(d.id);
+        batch.update(doc(playersCol, d.id), {
+          canBuzz: !locked,
+          buzzerCooldownUntil: null,
+          lastWrongPenalty: d.id === wrongPlayerId ? penalty : null,
+        });
+        n++;
+        if (n >= 400) {
+          await batch.commit();
+          batch = writeBatch(db);
+          n = 0;
+        }
+      }
+      if (n > 0) await batch.commit();
       
       // Incrémenter le compteur de mauvaises réponses pour cette question
       await updateDoc(stateRef, {
         wrongAnswerCount: wrongAnswerCount + 1,
       }, { merge: true });
       
-      // Lock le joueur qui s'est trompé jusqu'à la prochaine question (pas de cooldown)
-      // Le joueur ne pourra plus buzzer jusqu'à ce que le buzzer revienne à IDLE (nouvelle question)
-      await lockPlayerBuzz(db, wrongPlayerId);
-
-      // DÉBLOQUER les autres joueurs et réouvrir le buzzer
-      // On réinitialise les locks de tous les joueurs SAUF celui qui vient de se tromper
-      await resetAllPlayerBuzzLocks(db, [wrongPlayerId]);
-      
-      // Réouvrir le buzzer (sans afficher de message "mauvaise réponse" pour éviter le clignotement)
+      // Réouvrir le buzzer (sans message « mauvaise réponse » pour éviter le clignotement)
       await resetBuzzerState(db, "open");
-      
-      // Note : Le joueur qui s'est trompé reste verrouillé (canBuzz: false) jusqu'à la prochaine question
     } catch (e) {
       console.error("handleBuzzerWrong error:", e);
       setNotice("Erreur lors du traitement de la mauvaise réponse");
