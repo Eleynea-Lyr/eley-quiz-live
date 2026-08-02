@@ -2529,6 +2529,7 @@ function AdminInner() {
           introRoundIndex: null,
           lastAutoPausedRoundIndex: null,
           showFinalScore: false,
+          buzzMergedIntoScore: false,
           // Réinitialiser complètement EleyBuzz
           isBuzzerMode: false,
           buzzerState: "idle",
@@ -2599,6 +2600,7 @@ function AdminInner() {
           introRoundIndex: null,
           lastAutoPausedRoundIndex: null,
           showFinalScore: false,
+          buzzMergedIntoScore: false,
           // Réinitialiser complètement EleyBuzz
           isBuzzerMode: false,
           buzzerState: "idle",
@@ -3094,6 +3096,11 @@ function AdminInner() {
         await batch.commit();
       }
 
+      await updateDoc(doc(db, "quiz", "state"), {
+        showFinalScore: false,
+        buzzMergedIntoScore: false,
+      }, { merge: true });
+
       setNotice("Tous les scores (joueurs et équipes) ont été remis à 0 ✔");
       setTimeout(() => setNotice(null), 1800);
     } catch (e) {
@@ -3103,63 +3110,48 @@ function AdminInner() {
     }
   }
 
-  // Afficher le score final (podium combiné)
+  // Afficher le score final : buzz → score joueur perso (équipes inchangées)
   async function showFinalScore() {
     try {
       const stateRef = doc(db, "quiz", "state");
-      const playersCol = collection(stateRef, "players");
-      const teamsCol = collection(stateRef, "teams");
-      
-      // Lire tous les joueurs
-      const playersSnap = await getDocs(playersCol);
-      const players = playersSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-      
-      // Lire toutes les équipes
-      const teamsSnap = await getDocs(teamsCol);
-      const teams = teamsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-      
-      // Créer un batch pour toutes les mises à jour
-      const batch = writeBatch(db);
-      
-      // Pour chaque joueur : additionner buzzScore au score
-      for (const player of players) {
-        const buzzScore = Number(player.buzzScore || 0);
-        if (buzzScore > 0) {
-          const playerRef = doc(playersCol, player.id);
-          batch.update(playerRef, {
+      const stateSnap = await getDoc(stateRef);
+      const stateData = stateSnap.exists() ? stateSnap.data() : {};
+
+      if (!stateData.buzzMergedIntoScore) {
+        const playersCol = collection(stateRef, "players");
+        const playersSnap = await getDocs(playersCol);
+        let batch = writeBatch(db);
+        let n = 0;
+
+        for (const d of playersSnap.docs) {
+          const buzzScore = Number(d.data()?.buzzScore || 0);
+          if (buzzScore === 0) continue;
+          // Bonus ou malus EleyBuzz → score perso uniquement
+          batch.update(doc(playersCol, d.id), {
             score: increment(buzzScore),
+            buzzScore: 0,
           });
-        }
-      }
-      
-      // Pour chaque équipe : additionner le buzzScore de tous ses membres au teamQuizScore
-      for (const team of teams) {
-        const memberIds = team.memberIds || [];
-        let totalBuzzScore = 0;
-        
-        // Calculer la somme des buzzScore de tous les membres de l'équipe
-        for (const memberId of memberIds) {
-          const member = players.find(p => p.id === memberId);
-          if (member) {
-            totalBuzzScore += Number(member.buzzScore || 0);
+          n++;
+          if (n >= 400) {
+            await batch.commit();
+            batch = writeBatch(db);
+            n = 0;
           }
         }
-        
-        if (totalBuzzScore > 0) {
-          const teamRef = doc(teamsCol, team.id);
-          batch.update(teamRef, {
-            teamQuizScore: increment(totalBuzzScore),
-          });
+        if (n > 0) {
+          await batch.commit();
         }
+
+        await updateDoc(stateRef, {
+          showFinalScore: true,
+          buzzMergedIntoScore: true,
+        });
+      } else {
+        await updateDoc(stateRef, { showFinalScore: true });
       }
-      
-      // Appliquer toutes les mises à jour
-      await batch.commit();
-      
-      // Afficher le score final
-      await updateDoc(stateRef, { showFinalScore: true });
-      setNotice("Score final affiché sur Screen et Player (scores EleyBuzz ajoutés)");
-      setTimeout(() => setNotice(null), 2000);
+
+      setNotice("Score final : points ⚡ ajoutés aux scores joueurs (équipes inchangées)");
+      setTimeout(() => setNotice(null), 2500);
     } catch (e) {
       console.error("showFinalScore error:", e);
       setNotice("Erreur lors de l'affichage du score final");
@@ -4623,7 +4615,7 @@ function AdminInner() {
                 fontWeight: 600,
                 cursor: "pointer",
               }}
-              title="Afficher le podium final (score quiz + EleyBuzz)"
+              title="Fusionne les points ⚡ dans le score joueur (équipes inchangées) et affiche le score final"
             >
               Score final
             </button>

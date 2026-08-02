@@ -3710,6 +3710,7 @@ export default function Player() {
           playerName={playerName}
           playerScore={myFinalScore}
           buzzScore={myBuzzScore}
+          showBuzz={Number(myBuzzScore) !== 0}
           showTeam={Boolean(teamId)}
         />
         {myFinalRank != null && (

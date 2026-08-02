@@ -1370,10 +1370,11 @@ function ScreenInner() {
     }
   }, [playersLB, teamsLB, leaderboardView]);
 
-  // Podium final (Score Final de la soirée) : Quiz + EleyBuzz (joueurs) ou Score Équipe Quiz (équipes)
+  // Podium final (Score Final) : équipes = teamQuizScore ; joueurs = score
+  // (après « Score final » Admin, buzz déjà fusionné dans score et remis à 0)
   const finalPodium = useMemo(() => {
     if (leaderboardView === "teams") {
-      // Podium final par équipes (score équipe quiz uniquement, pas de bonus)
+      // Podium final par équipes (jamais de bonus buzz)
       const rows = (teamsLB || [])
         .filter((t) => !t.isKicked)
         .map((t) => {
