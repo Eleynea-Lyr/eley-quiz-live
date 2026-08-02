@@ -85,6 +85,7 @@ import {
   awardBuzzerPoints,
   resetBuzzerState,
   openBuzzerForNewRound,
+  recoverEleyBuzzPlayers,
   lockPlayerBuzz,
   resetAllPlayerBuzzLocks,
   purgeAnswersTree,
@@ -2697,6 +2698,20 @@ function AdminInner() {
     }
   }
 
+  /** Recovery live : tous bleus + buzzer OPEN + reload des Player figés */
+  async function handleRecoverEleyBuzz() {
+    if (!isBuzzerMode) return;
+    try {
+      await recoverEleyBuzzPlayers(db);
+      setNotice("Buzzers reset — tous bleus + refresh joueurs");
+      setTimeout(() => setNotice(null), 2000);
+    } catch (e) {
+      console.error("handleRecoverEleyBuzz error:", e);
+      setNotice("Erreur reset buzzers");
+      setTimeout(() => setNotice(null), 2000);
+    }
+  }
+
   // Gérer bonne réponse (touche 2)
   async function handleBuzzerCorrect() {
     if (!isBuzzerMode || buzzerState !== "locked" || !firstPlayerId) return;
@@ -4083,6 +4098,22 @@ function AdminInner() {
                   : buzzerState === "locked"
                     ? "Buzzer VERROUILLÉ"
                     : "Buzzer FERMÉ (1)"}
+              </button>
+
+              <button
+                onClick={handleRecoverEleyBuzz}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: "1px solid #2a2a2a",
+                  background: "#38bdf8",
+                  color: "#0f172a",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+                title="Débloque tous les joueurs (bleus), rouvre le buzzer et force un refresh des pages Player figées"
+              >
+                Reset buzzers
               </button>
 
               {buzzerState === "locked" && buzzerWinnerName && (

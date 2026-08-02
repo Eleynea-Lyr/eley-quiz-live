@@ -276,3 +276,18 @@
     --eley-img-reveal: 300px;
   }
 }
+
+/* Player only — anti-sélection / anti long-press (sauf champs de saisie) */
+body.eley-player-page {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+body.eley-player-page input,
+body.eley-player-page textarea,
+body.eley-player-page [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}

@@ -376,10 +376,17 @@ function resetRuntimeForPlayer({
 export default function Player() {
   useMobileVH();
 
+  // Anti-sélection / anti long-press sur toute la page Player (sauf inputs)
+  useEffect(() => {
+    document.body.classList.add("eley-player-page");
+    return () => document.body.classList.remove("eley-player-page");
+  }, []);
+
   /* ======================= ÉTATS & RÉFS (TOP-LEVEL) ======================= */
 
   const lastNavSeqRef = useRef(null);
   const uiFreezeUntilRef = useRef(0);
+  const playerReloadSeqRef = useRef(null);
 
   // Mémo: ce joueur a répondu pour la 1ʳᵉ fois *après* le dernier Back sur ce qid
   const answeredAfterBackRef = useRef({}); // { [qid]: boolean }
@@ -864,7 +871,23 @@ export default function Player() {
         setServerDeltaTick((t) => (t + 1) & 0xfff);
       }
 
-      startTransition(() => {
+        // Kick admin « Reset buzzers » : reload une fois si playerReloadSeq augmente
+        const newReloadSeq = Number.isFinite(d.playerReloadSeq)
+          ? Number(d.playerReloadSeq)
+          : 0;
+        if (playerReloadSeqRef.current === null) {
+          playerReloadSeqRef.current = newReloadSeq;
+        } else if (newReloadSeq > playerReloadSeqRef.current) {
+          playerReloadSeqRef.current = newReloadSeq;
+          try {
+            window.location.reload();
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+
+        startTransition(() => {
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
         
@@ -3440,6 +3463,7 @@ export default function Player() {
                     cursor: "default",
                     touchAction: "manipulation",
                     WebkitTapHighlightColor: "transparent",
+                    WebkitTouchCallout: "none",
                     userSelect: "none",
                     boxShadow: `0 8px 24px rgba(13, 5, 37, 0.35)`,
                     marginBottom: 24,
@@ -3609,6 +3633,7 @@ export default function Player() {
                   cursor: effectiveBuzzerState === BUZZER_STATES.OPEN ? "pointer" : "default",
                   touchAction: "manipulation",
                   WebkitTapHighlightColor: "transparent",
+                  WebkitTouchCallout: "none",
                   userSelect: "none",
                   transition: "transform 100ms ease, background 100ms ease, color 100ms ease",
                   boxShadow: buzzerStyle.shadow,
