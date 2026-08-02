@@ -1,10 +1,11 @@
 {
+  "id": "/",
   "name": "Quiz d'Eley",
   "short_name": "Quiz d'Eley",
   "description": "Quiz musical live d'Eley — rejoins la partie depuis ton téléphone.",
   "lang": "fr",
-  "start_url": "/player",
-  "scope": "/player",
+  "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#000000",

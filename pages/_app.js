@@ -7,14 +7,23 @@ export default function MyApp({ Component, pageProps }) {
     if (typeof window === "undefined") return;
     if (!("serviceWorker" in navigator)) return;
 
+    const host = window.location.hostname;
+    const isLocalhost =
+      host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+    // Secure context requis pour une vraie install PWA (pas d'IP type 192.168.x.x).
+    const isSecure =
+      window.isSecureContext || isLocalhost;
     const isProd = process.env.NODE_ENV === "production";
 
-    if (isProd) {
-      // En production uniquement : activer la PWA (cache hors-ligne / installable).
+    // Install standalone = SW actif. En `next dev` on laisse le SW OFF (HMR).
+    // En prod (Vercel) ou `npm start` local → SW ON.
+    if (isProd && isSecure) {
       const register = () => {
         navigator.serviceWorker
           .register("/sw.js")
-          .catch((err) => console.error("[PWA] Service worker registration failed:", err));
+          .catch((err) =>
+            console.error("[PWA] Service worker registration failed:", err)
+          );
       };
       if (document.readyState === "complete") {
         register();
@@ -23,14 +32,14 @@ export default function MyApp({ Component, pageProps }) {
         return () => window.removeEventListener("load", register);
       }
     } else {
-      // En développement : NE PAS utiliser de service worker (évite tout cache
-      // parasite avec le hot-reload). On nettoie aussi un éventuel SW déjà
-      // enregistré lors d'une session précédente, ainsi que ses caches.
+      // Dev / contexte non sécurisé : retirer un éventuel vieux SW
       navigator.serviceWorker.getRegistrations?.().then((regs) => {
         regs.forEach((reg) => reg.unregister());
       }).catch(() => {});
       if (typeof caches !== "undefined" && caches.keys) {
-        caches.keys().then((keys) => keys.forEach((k) => caches.delete(k))).catch(() => {});
+        caches.keys()
+          .then((keys) => keys.forEach((k) => caches.delete(k)))
+          .catch(() => {});
       }
     }
   }, []);

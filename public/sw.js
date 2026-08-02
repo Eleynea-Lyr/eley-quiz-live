@@ -8,7 +8,7 @@
  * - Le cache ne sert que de filet de secours si le réseau est indisponible.
  */
 
-const CACHE = "eley-quiz-shell-v1";
+const CACHE = "eley-quiz-shell-v2";
 
 self.addEventListener("install", () => {
   // Activer immédiatement la nouvelle version du SW

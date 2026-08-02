@@ -50,3 +50,13 @@ Pour chaque touche : action **HTTP Request** / **Web Requests** → Method **GET
 - `secret invalide` → recolle le secret / les URLs depuis Admin (un nouveau ON régénère le secret si besoin).
 - Rien ne se passe → Admin fermé ou onglet tué ; rouvre Admin + Télécommande ON.
 - Chrome passe au premier plan → tu as utilisé **Website** au lieu de **Web Requests**.
+
+### PWA (install plein écran, sans barre Chrome)
+
+Le manifest démarre sur l’**accueil** (`/`), pas `/player`.
+
+- **Prod Vercel (HTTPS)** : Chrome ⋮ → **Installer l’application** (pas seulement « Créer un raccourci »).
+- **Local** : `npm run build && npm start`, puis `http://localhost:3000` — **pas** `http://192.168.x.x` (pas de contexte sécurisé → pas de vraie PWA).
+- `npm run dev` : service worker OFF → Chrome propose souvent un simple raccourci (barre d’adresse + badge Chrome).
+
+Supprime les vieux raccourcis, réinstalle, ouvre depuis l’**icône** d’écran d’accueil.
