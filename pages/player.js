@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, startTransition } from "react";
 import { db, auth } from "../lib/firebase";
-import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
+import { signInAnonymously, signOut, onAuthStateChanged } from "firebase/auth";
 import {
   collection,
   doc,
@@ -444,6 +444,26 @@ export default function Player() {
     authUidRef.current = cred.user.uid;
     return cred.user.uid;
   };
+
+  /**
+   * Nouvelle identité Firebase anonyme.
+   * Important : vider les cookies ne déconnecte PAS Firebase (IndexedDB).
+   * Sans signOut, « nouveau joueur » réutilise le même uid et écrase le doc
+   * encore ouvert sur un autre device.
+   */
+  const ensureFreshAnonymousAuth = async () => {
+    try {
+      await signOut(auth);
+    } catch {
+      /* ignore */
+    }
+    authUidRef.current = null;
+    authReadyRef.current = null;
+    const cred = await signInAnonymously(auth);
+    authUidRef.current = cred.user.uid;
+    return cred.user.uid;
+  };
+
   useEffect(() => {
     ensureAuth().catch((e) =>
       console.error("[Player] Connexion anonyme échouée :", e)
@@ -2445,8 +2465,8 @@ export default function Player() {
       const playersCol = collection(doc(db, "quiz", "state"), "players");
 
       if (!playerId) {
-        // Identité fiable : on crée le document joueur sous l'uid Firebase.
-        const uid = await ensureAuth();
+        // Identité neuve à chaque inscription (pas la session IndexedDB résiduelle)
+        const uid = await ensureFreshAnonymousAuth();
         await setDoc(doc(playersCol, uid), {
           name: v.value,
           nameNorm,
@@ -2667,27 +2687,32 @@ export default function Player() {
   async function resetAndDeletePlayer() {
     try {
       selfRenameRef.current = true;
-      const pid = playerId || localStorage.getItem("playerId");
-      if (pid) {
-        const playersCol = collection(doc(db, "quiz", "state"), "players");
-        // Ne pas supprimer le joueur, juste réinitialiser le nom
-        // L'équipe est conservée
-        await updateDoc(doc(playersCol, pid), {
-          name: null,
-          nameNorm: null,
-          nameStatus: null,
-        });
+      // Couper la session Firebase : sinon un « nouveau nom » réutilise le même uid
+      try {
+        await signOut(auth);
+      } catch {
+        /* ignore */
       }
+      authUidRef.current = null;
+      authReadyRef.current = null;
     } catch (e) {
-      console.error("Réinitialisation du nom échouée :", e);
+      console.error("Réinitialisation joueur échouée :", e);
     } finally {
+      localStorage.removeItem("playerId");
       localStorage.removeItem("playerName");
       startTransition(() => {
+        setPlayerId(null);
         setPlayerName("");
         setInputName("");
         setError("");
-        // Ne pas réinitialiser teamId et teamName - l'équipe est conservée
-        // Ne pas mettre needsTeamSelection à false pour permettre la modification du nom
+        setTeamId(null);
+        setTeamName("");
+        setTeamColor(null);
+        setTeamMemberCount(0);
+        setNeedsTeamSelection(false);
+        setTeamSelectionMode(null);
+        setIsBuzzing(false);
+        setFirstPlayerId(null);
       });
       if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
         document.activeElement.blur();
