@@ -38,6 +38,7 @@ import {
   BUZZER_STATES,
   DEFAULT_BUZZER_POINTS,
   DEFAULT_SCORING_TABLE,
+  FAIR_BUZZ_WINDOW_MS,
 } from "../lib/constants";
 
 import {
@@ -61,6 +62,7 @@ import {
   useMobileVH,
   recordFirstCorrectAndPredict,
   registerBuzzerPress,
+  resolveBuzzFairWindow,
   recordQcmWrongChoice,
   createTeamTx,
   joinTeamTx,
@@ -562,6 +564,7 @@ export default function Player() {
   const [isBuzzing, setIsBuzzing] = useState(false);
   const buzzerOpenSeqRef = useRef(0);
   const buzzerStateRef = useRef("idle");
+  const fairBuzzTimerRef = useRef(null);
 
   // Score Final state
   const [showFinalScore, setShowFinalScore] = useState(false);
@@ -903,6 +906,10 @@ export default function Player() {
         // Nouvelle session d'ouverture → invalider tout état optimiste / tap en retard
         if (newOpenSeq !== buzzerOpenSeqRef.current) {
           buzzerOpenSeqRef.current = newOpenSeq;
+          if (fairBuzzTimerRef.current != null) {
+            clearTimeout(fairBuzzTimerRef.current);
+            fairBuzzTimerRef.current = null;
+          }
           setOptimisticBuzzerState(null);
           setOptimisticFirstPlayerId(null);
           setIsBuzzing(false);
@@ -918,14 +925,16 @@ export default function Player() {
         
         // Réinitialiser l'état optimiste dans plusieurs cas :
         // 1. Si le buzzer revient à idle (nouvelle question) → réinitialiser
-        // 2. Si firstPlayerId devient null (réinitialisation) → réinitialiser
-        // 3. Si Firestore confirme l'état optimiste → réinitialiser (synchronisation)
-        // 4. Si l'état Firestore change (par exemple, un autre joueur a buzzé) → réinitialiser
-        if (newBuzzerState === BUZZER_STATES.IDLE || newFirstPlayerId === null) {
-          // Nouvelle question ou réinitialisation : toujours réinitialiser l'optimiste
+        // 2. Si Firestore confirme l'état optimiste → réinitialiser (synchronisation)
+        // 3. Si l'état Firestore change (par exemple, un autre joueur a buzzé) → réinitialiser
+        // Note: pendant la fenêtre d'équité (OPEN + pas encore de gagnant),
+        // ne pas couper isBuzzing — le joueur attend le tirage.
+        if (newBuzzerState === BUZZER_STATES.IDLE) {
           setOptimisticBuzzerState(null);
           setOptimisticFirstPlayerId(null);
-          setIsBuzzing(false); // Réactiver le bouton
+          setIsBuzzing(false);
+        } else if (newBuzzerState === BUZZER_STATES.OPEN && !newFirstPlayerId) {
+          // Fenêtre d'équité en cours : garder isBuzzing si déjà en attente
         } else if (optimisticBuzzerState && optimisticBuzzerState === newBuzzerState && optimisticFirstPlayerId === newFirstPlayerId) {
           // Firestore confirme l'état optimiste : réinitialiser (synchronisation)
           setOptimisticBuzzerState(null);
@@ -2178,7 +2187,7 @@ export default function Player() {
     }
   };
 
-  // Handler EleyBuzz - premier qui buzz = gagnant
+  // Handler EleyBuzz — fenêtre d'équité (~80 ms) puis tirage parmi les candidats
   const handleBuzzerPress = async () => {
     if (!playerId || !isBuzzerMode || buzzerStateRef.current !== BUZZER_STATES.OPEN) return;
     
@@ -2195,7 +2204,7 @@ export default function Player() {
       setIsBuzzing(false);
     };
 
-    // Mise à jour optimiste immédiate
+    // Mise à jour optimiste immédiate (bleu « en attente » jusqu'à confirmation Firestore)
     if (!isBuzzing) {
       setIsBuzzing(true);
       startTransition(() => {
@@ -2210,13 +2219,27 @@ export default function Player() {
       // Réponse arrivée trop tard (buzzer refermé, rouvert, ou autre session)
       if (
         buzzerOpenSeqRef.current !== attemptOpenSeq ||
-        buzzerStateRef.current !== BUZZER_STATES.OPEN
+        (buzzerStateRef.current !== BUZZER_STATES.OPEN &&
+          buzzerStateRef.current !== BUZZER_STATES.LOCKED)
       ) {
         clearBuzzOptimistic();
         return;
       }
 
       if (result.ok) {
+        const windowSeq = Number(result.windowSeq);
+        const openSeq = Number(result.openSeq);
+        if (Number.isFinite(windowSeq) && Number.isFinite(openSeq)) {
+          if (fairBuzzTimerRef.current != null) {
+            clearTimeout(fairBuzzTimerRef.current);
+          }
+          fairBuzzTimerRef.current = setTimeout(() => {
+            fairBuzzTimerRef.current = null;
+            resolveBuzzFairWindow(db, openSeq, windowSeq).catch((e) =>
+              console.error("[Player] resolveBuzzFairWindow:", e)
+            );
+          }, FAIR_BUZZ_WINDOW_MS);
+        }
         return;
       }
 

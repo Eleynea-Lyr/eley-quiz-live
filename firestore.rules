@@ -25,9 +25,17 @@ service cloud.firestore {
     }
 
     // Un joueur ne peut toucher au buzzer que via ces champs précis
+    // (fenêtre d'équité + résolution du gagnant)
     function onlyBuzzerFields() {
       return request.resource.data.diff(resource.data).affectedKeys()
-        .hasOnly(['buzzerState', 'firstPlayerId', 'buzzerPressedAt']);
+        .hasOnly([
+          'buzzerState',
+          'firstPlayerId',
+          'buzzerPressedAt',
+          'buzzWindowSeq',
+          'buzzWindowOpenSeq',
+          'buzzCandidateIds'
+        ]);
     }
 
     // ===== Banque de questions : lecture libre, écriture admin =====
