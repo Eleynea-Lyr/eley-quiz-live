@@ -890,17 +890,19 @@ export default function Player() {
         startTransition(() => {
         setIsRunning(!!d.isRunning);
         setIsPaused(!!d.isPaused);
-        
-        // EleyBuzz state
+        setShowFinalScore(!!d.showFinalScore);
+      });
+
+      // EleyBuzz : setState synchrone (pas dans startTransition).
+      // Sinon un snapshot périmé peut réappliquer un faux firstPlayerId → double jaune.
+      {
         const newIsBuzzerMode = !!d.isBuzzerMode;
-        setIsBuzzerMode(newIsBuzzerMode);
         const newBuzzerState = typeof d.buzzerState === "string" ? d.buzzerState : "idle";
         const newFirstPlayerId = typeof d.firstPlayerId === "string" ? d.firstPlayerId : null;
         const newOpenSeq = Number.isFinite(d.buzzerOpenSeq) ? Number(d.buzzerOpenSeq) : 0;
-        
+
         buzzerStateRef.current = newBuzzerState;
 
-        // Nouvelle session d'ouverture → invalider tap en retard / timer d'équité
         if (newOpenSeq !== buzzerOpenSeqRef.current) {
           buzzerOpenSeqRef.current = newOpenSeq;
           if (fairBuzzTimerRef.current != null) {
@@ -909,29 +911,25 @@ export default function Player() {
           }
           setIsBuzzing(false);
         }
-        
+
+        setIsBuzzerMode(newIsBuzzerMode);
         setBuzzerState(newBuzzerState);
         setFirstPlayerId(newFirstPlayerId);
-        
-        // Si EleyBuzz est désactivé, forcer canBuzz à true (débloquer tous les joueurs)
+
         if (!newIsBuzzerMode) {
           setCanBuzz(true);
         }
-        
-        // Fin de l'attente locale dès qu'un gagnant Firestore est connu, ou IDLE
+
         if (newBuzzerState === BUZZER_STATES.IDLE || newFirstPlayerId) {
           setIsBuzzing(false);
         }
-        // Sinon OPEN sans gagnant : garder isBuzzing si déjà en attente (fenêtre d'équité)
-        
+
         setBuzzerMessage(typeof d.buzzerMessage === "string" ? d.buzzerMessage : null);
         setBuzzerMessageType(typeof d.buzzerMessageType === "string" ? d.buzzerMessageType : null);
-        setShowFinalScore(!!d.showFinalScore);
-        
-        // Lire buzzerPoints depuis quiz/state
+
         const bp = Number.isFinite(d.buzzerPoints) ? d.buzzerPoints : DEFAULT_BUZZER_POINTS;
         setBuzzerPoints(bp);
-      });
+      }
 
       if (!startMs) {
         startTransition(() => {
@@ -2187,12 +2185,16 @@ export default function Player() {
           if (fairBuzzTimerRef.current != null) {
             clearTimeout(fairBuzzTimerRef.current);
           }
+          // 1er candidat : résout à 80ms. Les autres : filet de secours +200ms si le 1er a crashé.
+          const delay = result.shouldResolve
+            ? FAIR_BUZZ_WINDOW_MS
+            : FAIR_BUZZ_WINDOW_MS + 200;
           fairBuzzTimerRef.current = setTimeout(() => {
             fairBuzzTimerRef.current = null;
             resolveBuzzFairWindow(db, openSeq, windowSeq).catch((e) =>
               console.error("[Player] resolveBuzzFairWindow:", e)
             );
-          }, FAIR_BUZZ_WINDOW_MS);
+          }, delay);
         }
         return;
       }

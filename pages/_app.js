@@ -20,7 +20,7 @@ export default function MyApp({ Component, pageProps }) {
     if (isProd && isSecure) {
       const register = () => {
         navigator.serviceWorker
-          .register("/sw.js")
+          .register("/sw.js?v=3")
           .catch((err) =>
             console.error("[PWA] Service worker registration failed:", err)
           );
