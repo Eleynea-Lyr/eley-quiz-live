@@ -68,6 +68,7 @@ import {
 import BrandShell from "../lib/BrandShell";
 import PodiumPanel from "../lib/PodiumPanel";
 import PlayerRankCircle from "../lib/player-rank-circle";
+import TeamTrophyIcon from "../lib/TeamTrophyIcon";
 
 // Colonne gauche (image générique)
 const LEFT_GENERIC_IMG_SRC = "/Chibi_Eley.png";
@@ -2676,9 +2677,7 @@ function ScreenInner() {
           {leaderboard.map((p, idx) => {
             const rank = Number(p._rank ?? (idx + 1));
             const s = Number(p.score || 0);
-            const teamMedal = s > 0 && rank <= 3 && leaderboardView === "teams"
-              ? (rank === 1 ? "🥇" : rank === 2 ? "🥈" : "🥉")
-              : "";
+            const showTeamTrophy = s > 0 && rank <= 3 && leaderboardView === "teams";
             const showPlayerRankCircle = s > 0 && rank <= 3 && leaderboardView === "players";
             const showDelta = Boolean(
               inRevealWindowForLB &&
@@ -2743,7 +2742,7 @@ function ScreenInner() {
                       {p.name || "(sans nom)"}
                     </span>
                     <span aria-hidden="true" style={SCREEN_LB_TRAIL_ICON}>
-                      {leaderboardView === "teams" && teamMedal ? teamMedal : null}
+                      {showTeamTrophy ? <TeamTrophyIcon rank={rank} size={20} /> : null}
                       {showPlayerRankCircle ? <PlayerRankCircle rank={rank} size={20} /> : null}
                     </span>
                   </div>

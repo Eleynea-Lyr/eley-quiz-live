@@ -2382,14 +2382,9 @@ export default function Player() {
     return teamsRanking.find((t) => t.id === teamId) || null;
   }, [teamId, teamsRanking]);
 
+  // Rang équipe (1–3 → coupe SVG côté PlayerScorePanel)
   const myTeamRank = useMemo(() => (myTeamRow ? myTeamRow._rank : null), [myTeamRow]);
   const myTeamScore = useMemo(() => (myTeamRow ? myTeamRow.score : 0), [myTeamRow]);
-  // Médailles pour les équipes (pas de cœurs)
-  const myTeamMedal = useMemo(() => {
-    if (!myTeamRank || myTeamScore <= 0) return "";
-    return myTeamRank === 1 ? "🥇" : myTeamRank === 2 ? "🥈" : myTeamRank === 3 ? "🥉" : "";
-  }, [myTeamRank, myTeamScore]);
-
   // Classement final (Quiz + EleyBuzz) pour le Score Final
   const finalRanking = useMemo(() => {
     const rows = (playersLB || [])
@@ -3742,7 +3737,6 @@ export default function Player() {
           teamColor={teamColor}
           teamScore={teamQuizScore}
           teamRank={myTeamRank}
-          teamMedal={myTeamMedal}
           playerName={playerName}
           playerScore={myFinalScore}
           buzzScore={myBuzzScore}
@@ -3891,7 +3885,7 @@ export default function Player() {
         paddingTop: isRunning
           ? `calc(${TOP_GUTTER_RUNNING} + var(--eley-page-pad) + ${SAFE_TOP})`
           : `calc(${TOP_GUTTER_IDLE} + var(--eley-page-pad) + ${SAFE_TOP})`,
-        paddingBottom: `calc(var(--eley-page-pad) + env(safe-area-inset-bottom, 0px))`,
+        paddingBottom: `calc(var(--eley-page-pad) + env(safe-area-inset-bottom, 0px) + 72px)`,
         textAlign: "center",
         position: "relative",
         overflowX: "hidden",
@@ -4175,7 +4169,7 @@ export default function Player() {
                 marginRight: "auto",
               }}
             >
-              <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ display: "grid", gap: 8 }}>
                 {qcmShuffledIndices.map((origIdx) => {
                   const label = qcmOptions[origIdx] || "";
                   const isCorrectPick =
@@ -4195,7 +4189,7 @@ export default function Player() {
                         border: `2px solid ${isCorrectPick ? BRAND.mauveDark : BRAND.mauveDark}`,
                         background: isCorrectPick ? BRAND.green : "rgba(255, 251, 245, 0.95)",
                         color: BRAND.mauveDark,
-                        fontSize: "var(--eley-text-input)",
+                        fontSize: "var(--eley-text-choice)",
                         fontFamily: FONT_FAMILY,
                         fontWeight: 600,
                         textAlign: "left",

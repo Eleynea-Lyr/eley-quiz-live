@@ -25,6 +25,7 @@
   --eley-text-summary: clamp(0.82rem, 3.2vw, 0.95rem);
   --eley-text-attente-link: clamp(0.95rem, 3.5vw, 1.15rem);
   --eley-text-input: clamp(14px, 3.9vw, 16px);
+  --eley-text-choice: clamp(13px, 3.5vw, 15px);
   --eley-text-caption: 12px;
   --eley-text-error: 14px;
   --eley-text-meta: clamp(0.9rem, 3.5vw, 1.05rem);
@@ -48,8 +49,8 @@
 
   --eley-input-pad-y: 10px;
   --eley-input-pad-x: 12px;
-  --eley-choice-pad-y: 14px;
-  --eley-choice-pad-x: 16px;
+  --eley-choice-pad-y: 10px;
+  --eley-choice-pad-x: 13px;
   --eley-buzz-pad-y: 16px;
   --eley-buzz-pad-x: 22px;
   --eley-text-label-sm: 11px;
@@ -146,8 +147,8 @@
 
     --eley-input-pad-y: 11px;
     --eley-input-pad-x: 14px;
-    --eley-choice-pad-y: 15px;
-    --eley-choice-pad-x: 18px;
+    --eley-choice-pad-y: 12px;
+    --eley-choice-pad-x: 15px;
     --eley-buzz-pad-y: 18px;
     --eley-buzz-pad-x: 24px;
     --eley-text-label-sm: 12px;
@@ -234,8 +235,8 @@
 
     --eley-input-pad-y: 12px;
     --eley-input-pad-x: 16px;
-    --eley-choice-pad-y: 16px;
-    --eley-choice-pad-x: 20px;
+    --eley-choice-pad-y: 13px;
+    --eley-choice-pad-x: 16px;
     --eley-buzz-pad-y: 20px;
     --eley-buzz-pad-x: 26px;
     --eley-text-label-sm: 13px;
