@@ -110,7 +110,12 @@ import {
   btnGhostDangerStyle,
   inputFieldStyle,
 } from "../lib/brand-theme";
-import BrandShell from "../lib/BrandShell";
+import BrandShellBase from "../lib/BrandShell";
+
+/** Shell Player : aide scores (i) activée */
+function BrandShell(props) {
+  return <BrandShellBase scoreHelp {...props} />;
+}
 import { getTeamBadgeStyle } from "../lib/team-color";
 import PlayerScorePanel from "../lib/PlayerScorePanel";
 import PlayerRoundBreakPanel from "../lib/PlayerRoundBreakPanel";
