@@ -2933,10 +2933,20 @@ export default function Player() {
               • {myScore != null ? myScore : 0}
             </span>
             <span
+              aria-hidden="true"
+              style={{
+                width: 1,
+                alignSelf: "stretch",
+                minHeight: "0.9em",
+                background: "rgba(255, 251, 245, 0.16)",
+                flexShrink: 0,
+                margin: "0 2px",
+              }}
+            />
+            <span
               style={{
                 fontVariantNumeric: "tabular-nums",
                 flexShrink: 0,
-                marginLeft: 4,
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 3,
