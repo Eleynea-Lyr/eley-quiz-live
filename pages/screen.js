@@ -2742,7 +2742,7 @@ function ScreenInner() {
                       {p.name || "(sans nom)"}
                     </span>
                     <span aria-hidden="true" style={SCREEN_LB_TRAIL_ICON}>
-                      {showTeamTrophy ? <TeamTrophyIcon rank={rank} size={20} /> : null}
+                      {showTeamTrophy ? <TeamTrophyIcon rank={rank} size={20} teamColor={dotColor} /> : null}
                       {showPlayerRankCircle ? <PlayerRankCircle rank={rank} size={20} /> : null}
                     </span>
                   </div>
