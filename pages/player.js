@@ -2893,7 +2893,7 @@ export default function Player() {
             right: "var(--eley-hud-side)",
             maxWidth: "calc(45vw - var(--eley-hud-max-offset))",
             background: BRAND_PAGE_BOTTOM,
-            border: "1px solid rgba(255, 251, 245, 0.16)",
+            border: "2px solid rgba(255, 251, 245, 0.22)",
             borderRadius: hudBadgeRadius,
             padding: "var(--eley-hud-pad-player-y) var(--eley-hud-pad-player-x)",
             fontFamily: FONT_FAMILY,
@@ -2935,12 +2935,12 @@ export default function Player() {
             <span
               aria-hidden="true"
               style={{
-                width: 1,
+                width: 2,
                 alignSelf: "stretch",
                 minHeight: "0.9em",
-                background: "rgba(255, 251, 245, 0.16)",
+                background: "rgba(255, 251, 245, 0.22)",
                 flexShrink: 0,
-                margin: "0 2px",
+                margin: "0 1px 0 5px",
               }}
             />
             <span
