@@ -661,7 +661,21 @@ export default function Player() {
           setInputName("");
           setError("");
           setIsKicked(false);
+          setTeamId(null);
+          setTeamName("");
+          setTeamColor(null);
+          setTeamMemberCount(0);
+          setTeamQuizScore(0);
+          setNeedsTeamSelection(false);
+          setCanBuzz(true);
+          setIsBuzzing(false);
+          setBuzzerState("idle");
+          setFirstPlayerId(null);
         });
+        if (fairBuzzTimerRef.current != null) {
+          clearTimeout(fairBuzzTimerRef.current);
+          fairBuzzTimerRef.current = null;
+        }
         if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
           document.activeElement.blur();
         }
@@ -1024,10 +1038,22 @@ export default function Player() {
           // 4) Réinitialiser les états EleyBuzz locaux (débloquer le joueur)
           startTransition(() => {
             setCanBuzz(true);
-            setOptimisticBuzzerState(null);
-            setOptimisticFirstPlayerId(null);
             setIsBuzzing(false);
+            setBuzzerState("idle");
+            setFirstPlayerId(null);
+            setBuzzerMessage(null);
+            setBuzzerMessageType(null);
+            setLastWrongPenalty(null);
+            setTeamId(null);
+            setTeamName("");
+            setTeamColor(null);
+            setTeamMemberCount(0);
+            setNeedsTeamSelection(false);
           });
+          if (fairBuzzTimerRef.current != null) {
+            clearTimeout(fairBuzzTimerRef.current);
+            fairBuzzTimerRef.current = null;
+          }
         }
       }
     });
